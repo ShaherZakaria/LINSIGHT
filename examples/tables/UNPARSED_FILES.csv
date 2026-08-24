@@ -1,0 +1,297 @@
+﻿path,size_bytes,size_human,reason,preview
+/etc/alternatives/README,102,102 B,distribution reference data,Please read the update-alternatives(1) man page for information on this / directory and its contents.
+/etc/apparmor.d/abstractions/X,1965,1.9 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/apache2-common,903,903 B,distribution reference data,# vim:syntax=apparmor /  / # This file contains basic permissions for Apache and every vHost
+/etc/apparmor.d/abstractions/apparmor_api/change_profile,404,404 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/abstractions/apparmor_api/examine,488,488 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/abstractions/apparmor_api/find_mountpoint,516,516 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/abstractions/apparmor_api/introspect,487,487 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/abstractions/apparmor_api/is_enabled,642,642 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/abstractions/aspell,321,321 B,distribution reference data,# vim:syntax=apparmor / # aspell permissions /
+/etc/apparmor.d/abstractions/audio,1842,1.8 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/authentication,1637,1.6 KB,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2009 Novell/SUSE
+/etc/apparmor.d/abstractions/base,6519,6.4 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/bash,1556,1.5 KB,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/consoles,821,821 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/cups-client,732,732 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/dbus,609,609 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/dbus-accessibility,646,646 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/dbus-accessibility-strict,654,654 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/dbus-session,655,655 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/dbus-session-strict,948,948 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/dbus-strict,696,696 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/dconf,254,254 B,distribution reference data,# vim:syntax=apparmor /  / # permissions for querying dconf settings; granting write access should
+/etc/apparmor.d/abstractions/dovecot-common,591,591 B,distribution reference data,"# ------------------------------------------------------------------ / # / #    Copyright (C) 2014 Canonical, Ltd."
+/etc/apparmor.d/abstractions/enchant,2063,2.0 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/fcitx,469,469 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/fcitx-strict,733,733 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/fonts,2038,2.0 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/freedesktop.org,2481,2.4 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/gnome,3487,3.4 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/gnupg,367,367 B,distribution reference data,# vim:syntax=apparmor / # gnupg sub-process running permissions /
+/etc/apparmor.d/abstractions/ibus,659,659 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/kde,2129,2.1 KB,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/kerberosclient,1135,1.1 KB,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2009 Novell/SUSE
+/etc/apparmor.d/abstractions/launchpad-integration,852,852 B,distribution reference data,# vim:syntax=apparmor / # launchpad-integration /
+/etc/apparmor.d/abstractions/ldapclient,707,707 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2011 Novell/SUSE
+/etc/apparmor.d/abstractions/libpam-systemd,678,678 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/likewise,502,502 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/lxc/container-base,8409,8.2 KB,distribution reference data,"network, /   capability, /   file,"
+/etc/apparmor.d/abstractions/lxc/start-container,1566,1.5 KB,distribution reference data,"network, /   capability, /   file,"
+/etc/apparmor.d/abstractions/mdns,449,449 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/mir,610,610 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/mozc,483,483 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/mysql,656,656 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/nameservice,3958,3.9 KB,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2009 Novell/SUSE
+/etc/apparmor.d/abstractions/nis,539,539 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/nvidia,542,542 B,distribution reference data,# vim:syntax=apparmor / # nvidia access requirements /
+/etc/apparmor.d/abstractions/openssl,484,484 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2011 Novell/SUSE
+/etc/apparmor.d/abstractions/orbit2,98,98 B,distribution reference data,# vim:syntax=apparmor / # orbit2 permissions /
+/etc/apparmor.d/abstractions/p11-kit,926,926 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2012 Canonical Ltd.
+/etc/apparmor.d/abstractions/perl,895,895 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2009 Novell/SUSE
+/etc/apparmor.d/abstractions/php,1010,1010 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/php5,108,108 B,distribution reference data,"#backwards compatibility include, actual abstraction moved from php5 to php /  / #include <abstractions/php>"
+/etc/apparmor.d/abstractions/postfix-common,1141,1.1 KB,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2005 Novell/SUSE
+/etc/apparmor.d/abstractions/private-files,1565,1.5 KB,distribution reference data,# vim:syntax=apparmor / # privacy-violations contains rules for common files that you want to / # explicitly deny access
+/etc/apparmor.d/abstractions/private-files-strict,1030,1.0 KB,distribution reference data,# vim:syntax=apparmor / # privacy-violations-strict contains additional rules for sensitive / # files that you want to explicitly deny access
+/etc/apparmor.d/abstractions/python,1578,1.5 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/ruby,927,927 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/samba,861,861 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/smbpass,489,489 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/ssl_certs,953,953 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2005 Novell/SUSE
+/etc/apparmor.d/abstractions/ssl_keys,672,672 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/svn-repositories,1698,1.7 KB,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/ubuntu-bittorrent-clients,715,715 B,distribution reference data,# vim:syntax=apparmor / # / # abstraction for allowing graphical bittorrent clients in Ubuntu
+/etc/apparmor.d/abstractions/ubuntu-browsers,1699,1.7 KB,distribution reference data,# vim:syntax=apparmor / # / # abstraction for allowing access to graphical browsers in Ubuntu
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/java,3997,3.9 KB,distribution reference data,# vim:syntax=apparmor /  /   # Java plugin
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/kde,255,255 B,distribution reference data,# vim:syntax=apparmor / # Users of this abstraction need to #include the ubuntu-helpers abstraction / # in the toplevel profile. Eg:
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/mailto,333,333 B,distribution reference data,# vim:syntax=apparmor /  /   # for mailto:
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/multimedia,1836,1.8 KB,distribution reference data,# vim:syntax=apparmor / # Users of this abstraction need to #include the ubuntu-helpers abstraction / # in the toplevel profile. Eg:
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/plugins-common,350,350 B,distribution reference data,# vim:syntax=apparmor /  /   #
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/productivity,1021,1021 B,distribution reference data,# vim:syntax=apparmor / # Users of this abstraction need to #include the ubuntu-helpers abstraction / # in the toplevel profile. Eg:
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/text-editors,668,668 B,distribution reference data,# vim:syntax=apparmor / # Users of this abstraction need to #include the ubuntu-helpers abstraction / # in the toplevel profile. Eg:
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/ubuntu-integration,1471,1.4 KB,distribution reference data,# vim:syntax=apparmor / # Users of this abstraction need to #include the ubuntu-helpers abstraction / # in the toplevel profile. Eg:
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/ubuntu-integration-xul,174,174 B,distribution reference data,# vim:syntax=apparmor /  /   # firefox-notify
+/etc/apparmor.d/abstractions/ubuntu-browsers.d/user-files,890,890 B,distribution reference data,# vim:syntax=apparmor /  /   # Allow read to all files user has DAC access to and write access to all
+/etc/apparmor.d/abstractions/ubuntu-console-browsers,629,629 B,distribution reference data,# vim:syntax=apparmor / # / # abstraction for allowing access to text-only browsers in Ubuntu. These will
+/etc/apparmor.d/abstractions/ubuntu-console-email,619,619 B,distribution reference data,# vim:syntax=apparmor / # / # abstraction for allowing console email clients in Ubuntu. These will
+/etc/apparmor.d/abstractions/ubuntu-email,926,926 B,distribution reference data,# vim:syntax=apparmor / # / # abstraction for allowing graphical email clients in Ubuntu
+/etc/apparmor.d/abstractions/ubuntu-feed-readers,349,349 B,distribution reference data,# vim:syntax=apparmor / # / # abstraction for allowing graphical news feed readers in Ubuntu
+/etc/apparmor.d/abstractions/ubuntu-gnome-terminal,192,192 B,distribution reference data,# vim:syntax=apparmor / # / # for allowing access to gnome-terminal
+/etc/apparmor.d/abstractions/ubuntu-helpers,3513,3.4 KB,distribution reference data,# Lenient profile that is intended to be used when 'Ux' is desired but / # does not provide enough environment sanitizing. This effectively is an / # open profile that blacklists certain known dangerous files and also
+/etc/apparmor.d/abstractions/ubuntu-konsole,360,360 B,distribution reference data,# vim:syntax=apparmor / # / # for allowing access to konsole
+/etc/apparmor.d/abstractions/ubuntu-media-players,2294,2.2 KB,distribution reference data,# vim:syntax=apparmor / # / # abstraction for allowing access to media players in Ubuntu
+/etc/apparmor.d/abstractions/ubuntu-unity7-base,2545,2.5 KB,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/ubuntu-unity7-launcher,198,198 B,distribution reference data,# /   # Access required for connecting to/communicating with the Unity Launcher /   #
+/etc/apparmor.d/abstractions/ubuntu-unity7-messaging,199,199 B,distribution reference data,# /   # Access required for connecting to/communicating with the Unity messaging /   # indicator
+/etc/apparmor.d/abstractions/ubuntu-xterm,250,250 B,distribution reference data,# vim:syntax=apparmor / # / # for allowing access to xterm
+/etc/apparmor.d/abstractions/user-download,900,900 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/user-mail,860,860 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/user-manpages,913,913 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/user-tmp,674,674 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2009 Novell/SUSE
+/etc/apparmor.d/abstractions/user-write,885,885 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/video,129,129 B,distribution reference data,# vim:syntax=apparmor / # video device access /
+/etc/apparmor.d/abstractions/wayland,594,594 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/abstractions/web-data,730,730 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2006 Novell/SUSE
+/etc/apparmor.d/abstractions/winbind,760,760 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2009 Novell/SUSE
+/etc/apparmor.d/abstractions/wutmp,601,601 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2002-2009 Novell/SUSE
+/etc/apparmor.d/abstractions/xad,908,908 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2007 Novell/SUSE
+/etc/apparmor.d/abstractions/xdg-desktop,697,697 B,distribution reference data,# vim:syntax=apparmor / # ------------------------------------------------------------------ / #
+/etc/apparmor.d/cache/.features,1991,1.9 KB,distribution reference data,query {label {multi_transaction {yes / } / data {yes
+/etc/apparmor.d/cache/lxc-containers,123268,120.4 KB,binary content,
+/etc/apparmor.d/cache/sbin.dhclient,118596,115.8 KB,binary content,
+/etc/apparmor.d/cache/usr.bin.lxc-start,8769,8.6 KB,binary content,
+/etc/apparmor.d/cache/usr.bin.man,43828,42.8 KB,binary content,
+/etc/apparmor.d/cache/usr.lib.snapd.snap-confine.real,79770,77.9 KB,binary content,
+/etc/apparmor.d/cache/usr.sbin.tcpdump,60857,59.4 KB,binary content,
+/etc/apparmor.d/tunables/alias,640,640 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2010 Canonical Ltd.
+/etc/apparmor.d/tunables/apparmorfs,387,387 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/tunables/dovecot,824,824 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2013 Christian Boltz
+/etc/apparmor.d/tunables/global,714,714 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2006-2009 Novell/SUSE
+/etc/apparmor.d/tunables/home,1008,1008 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2006-2009 Novell/SUSE
+/etc/apparmor.d/tunables/home.d/site.local,647,647 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2010 Canonical Ltd.
+/etc/apparmor.d/tunables/home.d/ubuntu,344,344 B,distribution reference data,# This file is auto-generated. It is recommended you update it using: / # $ sudo dpkg-reconfigure apparmor / #
+/etc/apparmor.d/tunables/kernelvars,850,850 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/tunables/multiarch,648,648 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2010 Canonical Ltd.
+/etc/apparmor.d/tunables/multiarch.d/site.local,659,659 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2011 Canonical Ltd.
+/etc/apparmor.d/tunables/proc,452,452 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2006 Novell/SUSE
+/etc/apparmor.d/tunables/securityfs,442,442 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/tunables/sys,378,378 B,distribution reference data,#    Copyright (C) 2012 Canonical Ltd. / # / #    This program is free software; you can redistribute it and/or
+/etc/apparmor.d/tunables/xdg-user-dirs,892,892 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2014 Canonical Ltd.
+/etc/apparmor.d/tunables/xdg-user-dirs.d/site.local,751,751 B,distribution reference data,# ------------------------------------------------------------------ / # / #    Copyright (C) 2014 Canonical Ltd.
+/etc/apport/blacklist.d/README.blacklist,221,221 B,distribution reference data,"# Blacklist for apport / # If an executable path appears on any line in any file in / # /etc/apport/blacklist.d/, apport will not generate a crash report"
+/etc/apport/blacklist.d/apport,25,25 B,distribution reference data,/usr/bin/wine-preloader
+/etc/apport/crashdb.conf,1254,1.2 KB,distribution reference data,# map crash database names to CrashDatabase implementations and URLs /  / default = 'ubuntu'
+/etc/apt/trusted.gpg,1220,1.2 KB,binary content,
+/etc/apt/trusted.gpg.d/ubuntu-keyring-2012-archive.gpg,2796,2.7 KB,binary content,
+/etc/apt/trusted.gpg.d/ubuntu-keyring-2012-cdimage.gpg,2794,2.7 KB,binary content,
+/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg,1733,1.7 KB,binary content,
+/etc/bindresvport.blacklist,382,382 B,distribution reference data,"# / # This file contains a list of port numbers between 600 and 1024, / # which should not be used by bindresvport. bindresvport is mostly"
+/etc/byobu/backend,228,228 B,distribution reference data,"# BYOBU_BACKEND can currently be ""screen"" or ""tmux"" / # Override this on a per-user basis by editing ""$BYOBU_CONFIG_DIR/backend"" / # or by launching either ""byobu-screen"" or ""byobu-tmux"" instead of ""byobu""."
+/etc/byobu/socketdir,467,467 B,distribution reference data,"# Set the location of the socket directory that byobu will use. / # On Debian/Ubuntu systems, this is in /var/run/screen, but on / # other distros, it might be elsewhere, such as /tmp/screens"
+/etc/ca-certificates.conf,7009,6.8 KB,distribution reference data,# This file lists certificates that you wish to use or to ignore to be / # installed in /etc/ssl/certs. / # update-ca-certificates(8) will update /etc/ssl/certs by reading this file.
+/etc/ca-certificates.conf.dpkg-old,6042,5.9 KB,distribution reference data,# This file lists certificates that you wish to use or to ignore to be / # installed in /etc/ssl/certs. / # update-ca-certificates(8) will update /etc/ssl/certs by reading this file.
+/etc/calendar/default,627,627 B,distribution reference data,"/* This is the system-wide default calendar file, used if calendar(1) /  * is invoked by a user without a ~/calendar or ~/.calendar/calendar file. /  * It may be edited or even deleted to reflect local policy."
+/etc/cloud/templates/chef_client.rb.tmpl,1731,1.7 KB,distribution reference data,## template:jinja / {# / This file is only utilized if the module 'cc_chef' is enabled in
+/etc/cloud/templates/chrony.conf.alpine.tmpl,1151,1.1 KB,distribution reference data,## template:jinja / # Welcome to the chrony configuration file. See chrony.conf(5) for more / # information about usable directives.
+/etc/cloud/templates/chrony.conf.debian.tmpl,1150,1.1 KB,distribution reference data,## template:jinja / # Welcome to the chrony configuration file. See chrony.conf(5) for more / # information about usuable directives.
+/etc/cloud/templates/chrony.conf.fedora.tmpl,1317,1.3 KB,distribution reference data,## template:jinja / # Use public servers from the pool.ntp.org project. / # Please consider joining the pool (http://www.pool.ntp.org/join.html).
+/etc/cloud/templates/chrony.conf.opensuse.tmpl,1029,1.0 KB,distribution reference data,## template:jinja / # Use public servers from the pool.ntp.org project. / # Please consider joining the pool (http://www.pool.ntp.org/join.html).
+/etc/cloud/templates/chrony.conf.photon.tmpl,1317,1.3 KB,distribution reference data,## template:jinja / # Use public servers from the pool.ntp.org project. / # Please consider joining the pool (http://www.pool.ntp.org/join.html).
+/etc/cloud/templates/chrony.conf.rhel.tmpl,1226,1.2 KB,distribution reference data,## template:jinja / # Use public servers from the pool.ntp.org project. / # Please consider joining the pool (http://www.pool.ntp.org/join.html).
+/etc/cloud/templates/chrony.conf.sles.tmpl,1029,1.0 KB,distribution reference data,## template:jinja / # Use public servers from the pool.ntp.org project. / # Please consider joining the pool (http://www.pool.ntp.org/join.html).
+/etc/cloud/templates/chrony.conf.ubuntu.tmpl,1322,1.3 KB,distribution reference data,## template:jinja / # Welcome to the chrony configuration file. See chrony.conf(5) for more / # information about usuable directives.
+/etc/cloud/templates/hosts.alpine.tmpl,1013,1013 B,distribution reference data,## template:jinja / {# / This file /etc/cloud/templates/hosts.alpine.tmpl is only utilized
+/etc/cloud/templates/hosts.debian.tmpl,927,927 B,distribution reference data,## template:jinja / {# / This file (/etc/cloud/templates/hosts.debian.tmpl) is only utilized
+/etc/cloud/templates/hosts.freebsd.tmpl,934,934 B,distribution reference data,## template:jinja / {# / This file /etc/cloud/templates/hosts.freebsd.tmpl is only utilized
+/etc/cloud/templates/hosts.photon.tmpl,896,896 B,distribution reference data,## template:jinja / {# / This file /etc/cloud/templates/hosts.photon.tmpl is only utilized
+/etc/cloud/templates/hosts.redhat.tmpl,936,936 B,distribution reference data,## template:jinja / {# / This file /etc/cloud/templates/hosts.redhat.tmpl is only utilized
+/etc/cloud/templates/hosts.suse.tmpl,1099,1.1 KB,distribution reference data,## template:jinja / {# / This file /etc/cloud/templates/hosts.suse.tmpl is only utilized
+/etc/cloud/templates/ntp.conf.alpine.tmpl,213,213 B,distribution reference data,## template:jinja / # /etc/ntp.conf / #
+/etc/cloud/templates/ntp.conf.debian.tmpl,2214,2.2 KB,distribution reference data,"## template:jinja /  / # /etc/ntp.conf, configuration for ntpd; see ntp.conf(5) for help"
+/etc/cloud/templates/ntp.conf.fedora.tmpl,2140,2.1 KB,distribution reference data,"## template:jinja /  / # For more information about this file, see the man pages"
+/etc/cloud/templates/ntp.conf.opensuse.tmpl,2843,2.8 KB,distribution reference data,## template:jinja /  / ##
+/etc/cloud/templates/ntp.conf.photon.tmpl,1911,1.9 KB,distribution reference data,"## template:jinja /  / # For more information about this file, see the man pages"
+/etc/cloud/templates/ntp.conf.rhel.tmpl,1913,1.9 KB,distribution reference data,"## template:jinja /  / # For more information about this file, see the man pages"
+/etc/cloud/templates/ntp.conf.sles.tmpl,2843,2.8 KB,distribution reference data,## template:jinja /  / ##
+/etc/cloud/templates/ntp.conf.ubuntu.tmpl,2584,2.5 KB,distribution reference data,"## template:jinja /  / # /etc/ntp.conf, configuration for ntpd; see ntp.conf(5) for help"
+/etc/cloud/templates/resolv.conf.tmpl,959,959 B,distribution reference data,"## template:jinja / # Your system has been configured with 'manage-resolv-conf' set to true. / # As a result, cloud-init has written this file with configuration data"
+/etc/cloud/templates/sources.list.debian.tmpl,1325,1.3 KB,distribution reference data,"## template:jinja / ## Note, this file is written by cloud-init on first boot of an instance / ## modifications made here will not survive a re-bundle."
+/etc/cloud/templates/sources.list.ubuntu.tmpl,2916,2.8 KB,distribution reference data,"## template:jinja / ## Note, this file is written by cloud-init on first boot of an instance / ## modifications made here will not survive a re-bundle."
+/etc/cloud/templates/systemd.resolved.conf.tmpl,519,519 B,distribution reference data,"## template:jinja / # Your system has been configured with 'manage-resolv-conf' set to true. / # As a result, cloud-init has written this file with configuration data"
+/etc/cloud/templates/timesyncd.conf.tmpl,211,211 B,distribution reference data,## template:jinja / # cloud-init generated file / # See timesyncd.conf(5) for details.
+/etc/console-setup/ISO-8859-1.acm,1584,1.5 KB,distribution reference data,# generated from UTF-tmpl.8bit.in by: / # { / #   while read a b; do
+/etc/console-setup/Uni2-Fixed16.psf.gz,4147,4.0 KB,compressed or binary,
+/etc/console-setup/cached_ISO-8859-1.acm.gz,658,658 B,compressed or binary,
+/etc/console-setup/cached_ISO-8859-1_del.kmap.gz,3402,3.3 KB,compressed or binary,
+/etc/console-setup/cached_UTF-8_del.kmap.gz,4024,3.9 KB,compressed or binary,
+/etc/console-setup/cached_Uni2-Fixed16.psf.gz,4147,4.0 KB,compressed or binary,
+/etc/console-setup/cached_setup_font.sh,476,476 B,distribution reference data,#!/bin/sh /  / setfont '/etc/console-setup/Uni2-Fixed16.psf.gz'
+/etc/console-setup/cached_setup_keyboard.sh,207,207 B,distribution reference data,#!/bin/sh /  / if [ -f /run/console-setup/keymap_loaded ]; then
+/etc/console-setup/cached_setup_terminal.sh,78,78 B,distribution reference data,#!/bin/sh /  / { :
+/etc/console-setup/compose.ARMSCII-8.inc,35,35 B,distribution reference data,# Compose sequences for ARMSCII-8
+/etc/console-setup/compose.CP1251.inc,32,32 B,distribution reference data,# Compose sequences for CP1251
+/etc/console-setup/compose.CP1255.inc,32,32 B,distribution reference data,# Compose sequences for CP1255
+/etc/console-setup/compose.CP1256.inc,32,32 B,distribution reference data,# Compose sequences for CP1256
+/etc/console-setup/compose.GEORGIAN-ACADEMY.inc,42,42 B,distribution reference data,# Compose sequences for GEORGIAN-ACADEMY
+/etc/console-setup/compose.GEORGIAN-PS.inc,37,37 B,distribution reference data,# Compose sequences for GEORGIAN-PS
+/etc/console-setup/compose.IBM1133.inc,33,33 B,distribution reference data,# Compose sequences for IBM1133
+/etc/console-setup/compose.ISIRI-3342.inc,36,36 B,distribution reference data,# Compose sequences for ISIRI-3342
+/etc/console-setup/compose.ISO-8859-1.inc,3596,3.5 KB,distribution reference data,# Compose sequences for ISO-8859-1 / compose '!' '!' to '�' / compose '!' '^' to '�'
+/etc/console-setup/compose.ISO-8859-10.inc,37,37 B,distribution reference data,# Compose sequences for ISO-8859-10
+/etc/console-setup/compose.ISO-8859-11.inc,37,37 B,distribution reference data,# Compose sequences for ISO-8859-11
+/etc/console-setup/compose.ISO-8859-13.inc,3737,3.6 KB,distribution reference data,# Compose sequences for ISO-8859-13 / compose '!' '^' to '�' / compose '!' 'p' to '�'
+/etc/console-setup/compose.ISO-8859-14.inc,3020,2.9 KB,distribution reference data,# Compose sequences for ISO-8859-14 / compose '!' 'p' to '�' / compose '!' 's' to '�'
+/etc/console-setup/compose.ISO-8859-15.inc,3552,3.5 KB,distribution reference data,# Compose sequences for ISO-8859-15 / compose '!' '!' to '�' / compose '!' 'p' to '�'
+/etc/console-setup/compose.ISO-8859-16.inc,37,37 B,distribution reference data,# Compose sequences for ISO-8859-16
+/etc/console-setup/compose.ISO-8859-2.inc,2893,2.8 KB,distribution reference data,# Compose sequences for ISO-8859-2 / compose '!' 'p' to '�' / compose '!' 's' to '�'
+/etc/console-setup/compose.ISO-8859-3.inc,3387,3.3 KB,distribution reference data,"# Compose sequences for ISO-8859-3 / compose '!' 's' to '�' / compose '""' '""' to '�'"
+/etc/console-setup/compose.ISO-8859-4.inc,2805,2.7 KB,distribution reference data,"# Compose sequences for ISO-8859-4 / compose '!' 's' to '�' / compose '""' '""' to '�'"
+/etc/console-setup/compose.ISO-8859-5.inc,36,36 B,distribution reference data,# Compose sequences for ISO-8859-5
+/etc/console-setup/compose.ISO-8859-6.inc,36,36 B,distribution reference data,# Compose sequences for ISO-8859-6
+/etc/console-setup/compose.ISO-8859-7.inc,1217,1.2 KB,distribution reference data,# Compose sequences for ISO-8859-7 / compose '!' '^' to '�' / compose '!' 's' to '�'
+/etc/console-setup/compose.ISO-8859-8.inc,36,36 B,distribution reference data,# Compose sequences for ISO-8859-8
+/etc/console-setup/compose.ISO-8859-9.inc,3617,3.5 KB,distribution reference data,# Compose sequences for ISO-8859-9 / compose '!' '!' to '�' / compose '!' 'p' to '�'
+/etc/console-setup/compose.KOI8-R.inc,32,32 B,distribution reference data,# Compose sequences for KOI8-R
+/etc/console-setup/compose.KOI8-U.inc,32,32 B,distribution reference data,# Compose sequences for KOI8-U
+/etc/console-setup/compose.TIS-620.inc,33,33 B,distribution reference data,# Compose sequences for TIS-620
+/etc/console-setup/compose.VISCII.inc,32,32 B,distribution reference data,# Compose sequences for VISCII
+/etc/console-setup/remap.inc,1391,1.4 KB,distribution reference data,# The content of this file will be appended to the keyboard layout. / # The following is an example how to make Alt+j switch to to the next / # console and Alt+k switch to the previous console.
+/etc/console-setup/vtrgb,161,161 B,distribution reference data,"1,222,57,255,0,118,44,204,128,255,0,255,0,255,0,255 / 1,56,181,199,111,38,181,204,128,0,255,255,0,0,255,255 / 1,43,74,6,184,113,233,204,128,0,0,0,255,255,255,255"
+/etc/console-setup/vtrgb.vga,158,158 B,distribution reference data,"0,170,0,170,0,170,0,170,85,255,85,255,85,255,85,255 / 0,0,170,85,0,0,170,170,85,85,255,255,85,85,255,255 / 0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255"
+/etc/debconf.conf,3052,3.0 KB,distribution reference data,"# This is the main config file for debconf. It tells debconf where to / # store data. The format of this file is a set of stanzas. Each stanza / # except the first sets up a database for debconf to use. For details, see"
+/etc/dhcp/debug,1464,1.4 KB,no extractor for this artifact,# / # The purpose of this script is just to show the variables that are / # available to all the scripts in this directory. All these scripts are
+/etc/dpkg/dpkg.cfg,459,459 B,distribution reference data,# dpkg configuration file / # / # This file can contain default options for dpkg.  All command-line
+/etc/dpkg/origins/debian,85,85 B,distribution reference data,Vendor: Debian / Vendor-URL: http://www.debian.org/ / Bugs: debbugs://bugs.debian.org
+/etc/dpkg/origins/ubuntu,118,118 B,distribution reference data,Vendor: Ubuntu / Vendor-URL: http://www.ubuntu.com/ / Bugs: https://bugs.launchpad.net/ubuntu/+filebug
+/etc/dpkg/shlibs.default,267,267 B,distribution reference data,# dpkg shlibs defaults file / # / # This file contains shlibs entries that are used as a last resort when
+/etc/dpkg/shlibs.override,261,261 B,distribution reference data,"# dpkg shlibs override file / # / # Entries in this file will override all others, only use if you"
+/etc/fonts/conf.avail/30-cjk-aliases.conf,16585,16.2 KB,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/fonts/conf.avail/64-language-selector-prefer.conf,880,880 B,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/fonts/conf.avail/69-language-selector-ja.conf,851,851 B,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/fonts/conf.avail/69-language-selector-zh-cn.conf,1798,1.8 KB,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/fonts/conf.avail/69-language-selector-zh-hk.conf,1607,1.6 KB,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/fonts/conf.avail/69-language-selector-zh-mo.conf,1694,1.7 KB,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/fonts/conf.avail/69-language-selector-zh-sg.conf,1798,1.8 KB,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/fonts/conf.avail/69-language-selector-zh-tw.conf,2191,2.1 KB,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/fonts/conf.avail/99-language-selector-zh.conf,1926,1.9 KB,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE fontconfig SYSTEM ""fonts.dtd""> / <fontconfig>"
+/etc/groff/man.local,1081,1.1 KB,distribution reference data,".\"" -*- nroff -*- / .\"" / .\"" This file is loaded after an-old.tmac."
+/etc/groff/mdoc.local,1075,1.0 KB,distribution reference data,".\"" -*- nroff -*- / .\"" / .\"" This file is loaded after doc.tmac."
+/etc/hdparm.conf,4999,4.9 KB,distribution reference data,"## This is the default configuration for hdparm for Debian.  It is a / ## rather simple script, so please follow the following guidelines :) / ## Any line that begins with a comment is ignored - add as many as you"
+/etc/iproute2/bpf_pinning,91,91 B,distribution reference data,# / # subpath mappings from mount point for pinning / #
+/etc/iproute2/ematch_map,82,82 B,distribution reference data,# lookup table for ematch kinds / 1	cmp / 2	nbyte
+/etc/iproute2/group,33,33 B,distribution reference data,# device group names / 0	default
+/etc/iproute2/nl_protos,285,285 B,distribution reference data,# Netlink protocol names mapping /  / 0   rtnl
+/etc/iproute2/rt_dsfield,357,357 B,distribution reference data,# Differentiated field values / # These include the DSCP and unused bits / 0x0	default
+/etc/iproute2/rt_protos,357,357 B,distribution reference data,# / # Reserved protocols. / #
+/etc/iproute2/rt_protos.d/README,146,146 B,distribution reference data,Each file in this directory is an rt_protos configuration file. iproute2 / commands scan this directory processing all files that end in '.conf'.
+/etc/iproute2/rt_realms,125,125 B,distribution reference data,# / # reserved values / #
+/etc/iproute2/rt_scopes,103,103 B,distribution reference data,# / # reserved values / #
+/etc/iproute2/rt_tables,98,98 B,distribution reference data,# / # reserved values / #
+/etc/iproute2/rt_tables.d/README,146,146 B,distribution reference data,Each file in this directory is an rt_tables configuration file. iproute2 / commands scan this directory processing all files that end in '.conf'.
+/etc/ld.so.cache,34629,33.8 KB,binary content,
+/etc/libnl-3/classid,1175,1.1 KB,distribution reference data,############################################################################### / # / # ClassID <-> Name Translation Table
+/etc/libnl-3/pktloc,1608,1.6 KB,distribution reference data,# / # Location definitions for packet matching / #
+/etc/locale.alias,3077,3.0 KB,distribution reference data,"# Locale name alias data base. / # Copyright (C) 1996-2018 Free Software Foundation, Inc. / #"
+/etc/locale.gen,9898,9.7 KB,distribution reference data,"# This file lists locales that you wish to have built. You can find a list / # of valid supported locales at /usr/share/i18n/SUPPORTED, and you can add / # user defined locales to /usr/local/share/i18n/SUPPORTED. If you change"
+/etc/logcheck/ignore.d.server/gpg-agent,1316,1.3 KB,distribution reference data,^\w{3} [ :[:digit:]]{11} [._[:alnum:]-]+ systemd\[[[:digit:]]+\]: Listening on GnuPG cryptographic agent and passphrase cache\.$ / ^\w{3} [ :[:digit:]]{11} [._[:alnum:]-]+ systemd\[[[:digit:]]+\]: Listening on GnuPG network certificate management daemon\.$ / ^\w{3} [ :[:digit:]]{11} [._[:alnum:]-]+ systemd\[[[:digit:]]+\]: Listening on GnuPG cryptographic agent and passphrase cache \(restricted...
+/etc/logcheck/ignore.d.server/libsasl2-modules,80,80 B,distribution reference data,\w{3} [ :0-9]{11} [._[:alnum:]-]+ [._[:alnum:]-]+: DIGEST-MD5 common mech free
+/etc/logcheck/ignore.d.server/mdadm,3449,3.4 KB,distribution reference data,"^\w{3} [ :0-9]{11} [._[:alnum:]-]+ kernel:( \[ *[[:digit:]]+\.[[:digit:]]+\])? md: md driver [.[:digit:]]+ MAX_MD_DEVS=[[:digit:]]+, MD_SB_DISKS=[[:digit:]]+$ / ^\w{3} [ :0-9]{11} [._[:alnum:]-]+ kernel:( \[ *[[:digit:]]+\.[[:digit:]]+\])? md: bitmap version [.[:digit:]]+$ / ^\w{3} [ :0-9]{11} [._[:alnum:]-]+ kernel:( \[ *[[:digit:]]+\.[[:digit:]]+\])? md: md[[:digit:]]+ stopped\.$"
+/etc/logcheck/ignore.d.server/rsyslog,810,810 B,distribution reference data,"^\w{3} [ :0-9]{11} [._[:alnum:]-]+ kernel: imklog [0-9.]+, log source = /proc/kmsg started.$ / ^\w{3} [ :0-9]{11} [._[:alnum:]-]+ kernel: Kernel logging \(proc\) stopped.$ / ^\w{3} [ :0-9]{11} [._[:alnum:]-]+ rsyslogd: \[origin software=""rsyslogd"" swVersion=""[0-9.]+"" x-pid=""[0-9]+"" x-info=""http://www.rsyslog.com""\] start$"
+/etc/logcheck/violations.d/mdadm,414,414 B,distribution reference data,"^\w{3} [ :0-9]{11} [._[:alnum:]-]+ kernel:( \[ *[[:digit:]]+\.[[:digit:]]+\])? md: kicking non-fresh [[:alnum:]]+ from array!$ / ^\w{3} [ :0-9]{11} [._[:alnum:]-]+ kernel:( \[ *[[:digit:]]+\.[[:digit:]]+\])? raid[[:digit:]]+: Disk failure on [[:alnum:]]+, disabling device\.$ / ^\w{3} [ :0-9]{11} [._[:alnum:]-]+ kernel:( \[ *[[:digit:]]+\.[[:digit:]]+\])?[[:space:]]+Operation continuing on [[:di..."
+/etc/lvm/lvm.conf,96528,94.3 KB,distribution reference data,# This is an example configuration file for the LVM2 system. / # It contains the default settings that would be used if there was no / # /etc/lvm/lvm.conf file.
+/etc/lvm/lvmlocal.conf,2358,2.3 KB,distribution reference data,# This is a local configuration file template for the LVM2 system / # which should be installed as /etc/lvm/lvmlocal.conf . / #
+/etc/lvm/profile/cache-mq.profile,551,551 B,distribution reference data,# Demo configuration 'mq' cache policy / # / # Note: This policy has been deprecated in favor of the smq policy
+/etc/lvm/profile/cache-smq.profile,353,353 B,distribution reference data,# Demo configuration 'smq' cache policy / # / # The stochastic multi-queue (smq) policy addresses some of the problems
+/etc/lvm/profile/command_profile_template.profile,3094,3.0 KB,distribution reference data,# This is a command profile template for the LVM2 system. / # / # It contains all configuration settings that are customizable by command
+/etc/lvm/profile/lvmdbusd.profile,2359,2.3 KB,distribution reference data,# / # DO NOT EDIT THIS FILE! / #
+/etc/lvm/profile/metadata_profile_template.profile,852,852 B,distribution reference data,# This is a metadata profile template for the LVM2 system. / # / # It contains all configuration settings that are customizable by metadata
+/etc/lvm/profile/thin-generic.profile,80,80 B,distribution reference data,"allocation { / 	thin_pool_chunk_size_policy = ""generic"" / 	thin_pool_zero = 1"
+/etc/lvm/profile/thin-performance.profile,84,84 B,distribution reference data,"allocation { / 	thin_pool_chunk_size_policy = ""performance"" / 	thin_pool_zero = 0"
+/etc/magic,114,114 B,distribution reference data,# Magic local data for file(1) command. / # Insert here your local magic data. Format is described in magic(5).
+/etc/magic.mime,114,114 B,distribution reference data,# Magic local data for file(1) command. / # Insert here your local magic data. Format is described in magic(5).
+/etc/mailcap,3689,3.6 KB,distribution reference data,############################################################################### / # / #  MIME media types and programs that process those types
+/etc/mailcap.order,459,459 B,distribution reference data,############################################################################### / # / #  Mailcap.order:  This file allows a system-wide override of MIME program
+/etc/manpath.config,5305,5.2 KB,distribution reference data,# manpath.config / # / # This file is used by the man-db package to configure the man and cat paths.
+/etc/mime.types,25137,24.5 KB,distribution reference data,############################################################################### / # / #  MIME media types and the extensions that represent them.
+/etc/newt/palette.original,0,0 B,zero length,
+/etc/newt/palette.ubuntu,169,169 B,distribution reference data,"root=,magenta / checkbox=,magenta / entry=,magenta"
+/etc/opt/omi/ssl/omi-host-localhost.pem,1150,1.1 KB,distribution reference data,-----BEGIN CERTIFICATE----- / MIIDFzCCAf8CAQEwDQYJKoZIhvcNAQEFBQAwRTEVMBMGCgmSJomT8ixkARkWBWxv / Y2FsMRIwEAYDVQQDDAlsb2NhbGhvc3QxGDAWBgNVBAMMD2xvY2FsaG9zdC5sb2Nh
+/etc/opt/omi/ssl/omikey.pem,1732,1.7 KB,distribution reference data,-----BEGIN PRIVATE KEY----- / MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDGgMSPmct1abP3 / vDHw6EmjYYslenPvKsCP5669r59BmndRY7qUb5CnUEyjF7kTCSqeF0HdQt8N1y10
+/etc/opt/omi/ssl/ssl.cnf,193,193 B,distribution reference data,[ req ] / distinguished_name     = req_distinguished_name / prompt                 = no
+/etc/pollinate/entropy.ubuntu.com.pem,3034,3.0 KB,distribution reference data,-----BEGIN CERTIFICATE----- / MIIDrzCCApegAwIBAgIQCDvgVpBCRrGhdWrJWZHHSjANBgkqhkiG9w0BAQUFADBh / MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+/etc/popularity-contest.conf,0,0 B,zero length,
+/etc/rmt,276,276 B,distribution reference data,#!/bin/sh / # / # This is not a mistake.  This shell script (/etc/rmt) has been provided
+/etc/rpc,927,927 B,distribution reference data,# This file contains user readable names that can be used in place of rpc / # program numbers. /
+/etc/samba/gdbcommands,10,10 B,distribution reference data,bt / quit
+/etc/services,19774,19.3 KB,distribution reference data,"# Network services, Internet style / # / # Note that it is presently the policy of IANA to assign a single well-known"
+/etc/smi.conf,1242,1.2 KB,distribution reference data,# / # smi.conf - Global SMI configuration file. / #
+/etc/sos/sos.conf,1315,1.3 KB,distribution reference data,[global] / # Set global options here that are not component specific / # If you would like one global default value to be specifically overridden for
+/etc/ssl/certs/ca-certificates.crt,202386,197.6 KB,distribution reference data,-----BEGIN CERTIFICATE----- / MIIH0zCCBbugAwIBAgIIXsO3pkN/pOAwDQYJKoZIhvcNAQEFBQAwQjESMBAGA1UE / AwwJQUNDVlJBSVoxMRAwDgYDVQQLDAdQS0lBQ0NWMQ0wCwYDVQQKDARBQ0NWMQsw
+/etc/terminfo/README,215,215 B,distribution reference data,"This directory is for system-local terminfo descriptions. By default, / ncurses will search ${HOME}/.terminfo first, then /etc/terminfo (this / directory), then /lib/terminfo, and last not least /usr/share/terminfo."
+/etc/ubuntu-advantage/help_data.yaml,3611,3.5 KB,distribution reference data,cc-eal: /     help: | /       Common Criteria is an Information Technology Security Evaluation standard
+/etc/ubuntu-advantage/uaclient.conf,445,445 B,distribution reference data,"# Ubuntu-Advantage client config file. / # If you modify this file, run ""ua refresh config"" to ensure changes are / # picked up by Ubuntu-Advantage client."
+/etc/ucf.conf,1299,1.3 KB,distribution reference data,"# / # This file is a bourne shell snippet, and is sourced by the / # ucf script for configuration."
+/etc/update-manager/meta-release,242,242 B,distribution reference data,# default location for the meta-release file /  / [METARELEASE]
+/etc/update-manager/release-upgrades,823,823 B,distribution reference data,# Default behavior for the release upgrader. /  / [DEFAULT]
+/etc/update-manager/release-upgrades.d/ubuntu-advantage-upgrades.cfg,219,219 B,distribution reference data,"[Sources] / Pockets=security,updates,proposed,backports,infra-security,infra-updates,apps-security,apps-updates / [Distro]"
+/etc/updatedb.conf,407,407 B,distribution reference data,"PRUNE_BIND_MOUNTS=""yes"" / # PRUNENAMES="".git .bzr .hg .svn"" / PRUNEPATHS=""/tmp /var/spool /media /var/lib/os-prober /var/lib/ceph /home/.ecryptfs /var/lib/schroot"""
+/etc/vmware-tools/tools.conf.example,10278,10.0 KB,distribution reference data,"# ""CAUTION: tools.conf is highly syntax sensitive file. Use extreme caution / # while editing it. If modified, it is automatically re-loaded by / # VMware Tools services every 5 seconds."""
+/etc/vmware-tools/vgauth/schemas/XMLSchema-hasFacetAndProperty.xsd,5925,5.8 KB,distribution reference data,"<?xml version='1.0'?> / <!DOCTYPE schema PUBLIC ""-//W3C//DTD XMLSCHEMA 200102//EN"" ""XMLSchema.dtd"" [ / <!ENTITY % s ''>"
+/etc/vmware-tools/vgauth/schemas/XMLSchema-instance.xsd,1252,1.2 KB,distribution reference data,"<?xml version='1.0'?> / <!DOCTYPE xs:schema SYSTEM ""XMLSchema.dtd"" [ / <!ELEMENT p ANY>"
+/etc/vmware-tools/vgauth/schemas/XMLSchema.dtd,16474,16.1 KB,distribution reference data,"<!-- DTD for XML Schemas: Part 1: Structures /      Public Identifier: ""-//W3C//DTD XMLSCHEMA 200102//EN"" /      Official Location: http://www.w3.org/2001/XMLSchema.dtd -->"
+/etc/vmware-tools/vgauth/schemas/XMLSchema.xsd,88859,86.8 KB,distribution reference data,"<?xml version=""1.0"" encoding=""UTF-8""?> / <!-- XML Schema schema for XML Schemas: Part 1: Structures --> / <!-- Note this schema is NOT the normative structures schema. -->"
+/etc/vmware-tools/vgauth/schemas/catalog.xml,479,479 B,distribution reference data,"<?xml version=""1.0""?> / <!DOCTYPE catalog PUBLIC ""-//OASIS//DTD Entity Resolution XML Catalog V1.0//EN"" ""http://www.oasis-open.org/committees/entity/release/1.0/catalog.dtd""> / <catalog xmlns=""urn:oasis:names:tc:entity:xmlns:xml:catalog"">"
+/etc/vmware-tools/vgauth/schemas/datatypes.dtd,6559,6.4 KB,distribution reference data,"<!-- /         DTD for XML Schemas: Part 2: Datatypes /         $Id: datatypes.dtd,v 1.23 2001/03/16 17:36:30 ht Exp $"
+/etc/vmware-tools/vgauth/schemas/saml-schema-assertion-2.0.xsd,13160,12.9 KB,distribution reference data,"<?xml version=""1.0"" encoding=""US-ASCII""?> / <schema /     targetNamespace=""urn:oasis:names:tc:SAML:2.0:assertion"""
+/etc/vmware-tools/vgauth/schemas/xenc-schema.xsd,5281,5.2 KB,distribution reference data,"<?xml version=""1.0"" encoding=""UTF-8""?> / <!DOCTYPE schema PUBLIC ""-//W3C//DTD XMLSchema 200102//EN"" ""XMLSchema.dtd"" [ /    <!ATTLIST schema"
+/etc/vmware-tools/vgauth/schemas/xml.xsd,9055,8.8 KB,distribution reference data,"<?xml version='1.0'?> / <?xml-stylesheet href=""../2008/09/xsd.xsl"" type=""text/xsl""?> / <xs:schema targetNamespace=""http://www.w3.org/XML/1998/namespace"""
+/etc/vmware-tools/vgauth/schemas/xmldsig-core-schema.xsd,10452,10.2 KB,distribution reference data,"<?xml version=""1.0"" encoding=""UTF-8""?> / <!DOCTYPE schema PUBLIC ""-//W3C//DTD XMLSchema 200102//EN"" ""XMLSchema.dtd"" [ /    <!ATTLIST schema"
+/etc/xdg/user-dirs.conf,425,425 B,distribution reference data,"# This controls the behaviour of xdg-user-dirs-update which is run on user login / # You can also have per-user config in ~/.config/user-dirs.conf, or specify / # the XDG_CONFIG_HOME and/or XDG_CONFIG_DIRS to override this"
+/etc/xdg/user-dirs.defaults,434,434 B,distribution reference data,# Default settings for user directories / # / # The values are relative pathnames from the home directory and
+/usr/share/doc/gdb/check.log.gz,280885,274.3 KB,compressed or binary,
+/var/opt/microsoft/omsagent/00000000-0000-4000-8000-000000000001/log/urp.log.pos,75,75 B,no extractor for this artifact,/var/opt/microsoft/omsagent/log/urp.log	0000000000000000	0000000000000000
+/var/opt/microsoft/omsagent/00000000-0000-4000-8000-000000000001/state/omsconfig.log.auditd_dsc_log.pos,78,78 B,no extractor for this artifact,/var/opt/microsoft/omsconfig/omsconfig.log	000000000072dd54	00000000000807d5
+/var/opt/microsoft/omsagent/00000000-0000-4000-8000-000000000001/state/omsconfig.log.auditd_plugin.pos,78,78 B,no extractor for this artifact,/var/opt/microsoft/omsconfig/omsconfig.log	000000000072dd54	00000000000807d5
+/var/opt/microsoft/omsconfig/omsconfigdetailed.log.1.gz,2172142,2.1 MB,compressed or binary,
+/var/opt/microsoft/omsconfig/omsconfigdetailed.log.2.gz,2126846,2.0 MB,compressed or binary,

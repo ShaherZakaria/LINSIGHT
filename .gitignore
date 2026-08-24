@@ -1,0 +1,33 @@
+# Triage output - never commit real collection results.
+# Anchored to the repo root so examples/tables/ is not caught by these.
+/out/
+/export/
+/tables/
+/csv/
+/json/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+uac-*-linux-*/
+/report.html
+/browser.html
+/findings.json
+/findings.html
+/timeline.csv
+
+# Sigma rule cache
+.uac_triage/
+/sigma-rules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

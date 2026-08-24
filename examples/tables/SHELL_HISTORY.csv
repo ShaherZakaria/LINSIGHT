@@ -1,0 +1,301 @@
+﻿user,timestamp_utc,shell,file,line_no,command
+root,,bash,/root/.bash_history,1,aptitude update
+root,,bash,/root/.bash_history,2,apt install aptitude
+root,,bash,/root/.bash_history,3,aptitude update
+root,,bash,/root/.bash_history,4,aptitude safe-upgrade
+root,,bash,/root/.bash_history,5,reboot
+root,,bash,/root/.bash_history,6,tcpdump -i eth0 -n 'port 443'
+root,,bash,/root/.bash_history,7,tcpdump -i eth0 -n 'not port 22'
+root,,bash,/root/.bash_history,8,aptitude install tshark
+root,,bash,/root/.bash_history,9,tshark -h
+root,,bash,/root/.bash_history,10,tshark -n -i eth0 'not port 22'
+root,,bash,/root/.bash_history,11,tcpdump -i eth0 -n 'not port 22' -w out.pcap
+root,,bash,/root/.bash_history,12,tshark -r out.pcap -n | more
+root,,bash,/root/.bash_history,13,tcpdump -r out.pcap -n -X | more
+root,,bash,/root/.bash_history,14,tcpdump -r out.pcap -n -X 'port 80' | less
+root,,bash,/root/.bash_history,15,clear
+root,,bash,/root/.bash_history,16,ll
+root,,bash,/root/.bash_history,17,cat filebeat.log
+root,,bash,/root/.bash_history,18,cat filebeat.log | more
+root,,bash,/root/.bash_history,19,cat filebeat.log | less
+root,,bash,/root/.bash_history,20,cd /etc/filebeat/modules.d/
+root,,bash,/root/.bash_history,21,ll
+root,,bash,/root/.bash_history,22,more elasticsearch.yml.disabled
+root,,bash,/root/.bash_history,23,ll
+root,,bash,/root/.bash_history,24,ps aux | grep -i filebeat
+root,,bash,/root/.bash_history,25,cd ..
+root,,bash,/root/.bash_history,26,vi filebeat.yml
+root,,bash,/root/.bash_history,27,grep humio filebeat.yml
+root,,bash,/root/.bash_history,28,host cloud.humio.com
+root,,bash,/root/.bash_history,29,tcpdump -i eth0 -n 'not port 22'
+root,,bash,/root/.bash_history,30,ll
+root,,bash,/root/.bash_history,31,tail -f /var/log/filebeat/filebeat.log
+root,,bash,/root/.bash_history,32,cd ..
+root,,bash,/root/.bash_history,33,systemctl restart filebeat
+root,,bash,/root/.bash_history,34,host cloud.humio.com
+root,,bash,/root/.bash_history,35,systemctl restart filebeat
+root,,bash,/root/.bash_history,36,ll
+root,,bash,/root/.bash_history,37,rm out.pcap
+root,,bash,/root/.bash_history,38,cd ..
+root,,bash,/root/.bash_history,39,ll
+root,,bash,/root/.bash_history,40,cd apache2/
+root,,bash,/root/.bash_history,41,ll
+root,,bash,/root/.bash_history,42,tail error_log
+root,,bash,/root/.bash_history,43,tail access_log
+root,,bash,/root/.bash_history,44,cd /etc/filebeat/
+root,,bash,/root/.bash_history,45,ll
+root,,bash,/root/.bash_history,46,vi filebeat.yml
+root,,bash,/root/.bash_history,47,filebeat -h
+root,,bash,/root/.bash_history,48,filebeat -V
+root,,bash,/root/.bash_history,49,filebeat -V | more
+root,,bash,/root/.bash_history,50,filebeat --version
+root,,bash,/root/.bash_history,51,filebeat -h | more
+root,,bash,/root/.bash_history,52,filebeat version
+root,,bash,/root/.bash_history,53,aptitude remove filebeat
+root,,bash,/root/.bash_history,54,ll
+root,,bash,/root/.bash_history,55,cp filebeat.yml ~
+root,,bash,/root/.bash_history,56,cd
+root,,bash,/root/.bash_history,57,rm -rf /etc/filebeat/
+root,,bash,/root/.bash_history,58,ps aux | grep -i file
+root,,bash,/root/.bash_history,59,systemctl stop filebeat
+root,,bash,/root/.bash_history,60,ps aux | grep -i file
+root,,bash,/root/.bash_history,61,systemctl restart filebeat
+root,,bash,/root/.bash_history,62,systemctl enable filebeat
+root,,bash,/root/.bash_history,63,ls /etc/init.d
+root,,bash,/root/.bash_history,64,cd /etc/init.d
+root,,bash,/root/.bash_history,65,cat filebeat
+root,,bash,/root/.bash_history,66,more filebeat
+root,,bash,/root/.bash_history,67,tcpdump -i eth0 -n 'not port 22'
+root,,bash,/root/.bash_history,68,netstat -an| more
+root,,bash,/root/.bash_history,69,cd /var/log
+root,,bash,/root/.bash_history,70,ll
+root,,bash,/root/.bash_history,71,cd filebeat/
+root,,bash,/root/.bash_history,72,ll
+root,,bash,/root/.bash_history,73,cat filebeat.log
+root,,bash,/root/.bash_history,74,tail -f filebeat.log
+root,,bash,/root/.bash_history,75,cd /etc/filebeat/
+root,,bash,/root/.bash_history,76,ll
+root,,bash,/root/.bash_history,77,vi filebeat.yml
+root,,bash,/root/.bash_history,78,cd -
+root,,bash,/root/.bash_history,79,tail -f filebeat.log
+root,,bash,/root/.bash_history,80,systemctl start filebeat
+root,,bash,/root/.bash_history,81,tcpdump -i eth0 -n 'port 443'
+root,,bash,/root/.bash_history,82,vi filebeat.yml
+root,,bash,/root/.bash_history,83,ll /var/log/apache2/
+root,,bash,/root/.bash_history,84,tail -f filebeat.log
+root,,bash,/root/.bash_history,85,systemctl start filebeat
+root,,bash,/root/.bash_history,86,vi filebeat.yml
+root,,bash,/root/.bash_history,87,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,88,systemctl restart filebeat
+root,,bash,/root/.bash_history,89,tail -f filebeat.log
+root,,bash,/root/.bash_history,90,tail -f /var/log/syslog
+root,,bash,/root/.bash_history,91,tail -f filebeat.log
+root,,bash,/root/.bash_history,92,vi filebeat.yml
+root,,bash,/root/.bash_history,93,systemctl restart filebeat
+root,,bash,/root/.bash_history,94,ps -ef | grep -i filebeat
+root,,bash,/root/.bash_history,95,systemctl start filebeat
+root,,bash,/root/.bash_history,96,tail /var/log/syslog
+root,,bash,/root/.bash_history,97,vi filebeat.yml
+root,,bash,/root/.bash_history,98,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,99,systemctl restart filebeat
+root,,bash,/root/.bash_history,100,tail -f filebeat.log
+root,,bash,/root/.bash_history,101,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,102,systemctl restart filebeat
+root,,bash,/root/.bash_history,103,tail -f filebeat.log
+root,,bash,/root/.bash_history,104,cd /etc/apache2/
+root,,bash,/root/.bash_history,105,ll
+root,,bash,/root/.bash_history,106,vi httpd.conf
+root,,bash,/root/.bash_history,107,ps aux | grep -i apache
+root,,bash,/root/.bash_history,108,ps aux | grep -i httpd
+root,,bash,/root/.bash_history,109,/usr/sbin/httpd -k stop
+root,,bash,/root/.bash_history,110,ps aux | grep -i httpd
+root,,bash,/root/.bash_history,111,/usr/sbin/httpd -k start
+root,,bash,/root/.bash_history,112,netstat -an | more
+root,,bash,/root/.bash_history,113,cd /var/log/apache2/
+root,,bash,/root/.bash_history,114,ll
+root,,bash,/root/.bash_history,115,tail -f access_log
+root,,bash,/root/.bash_history,116,ll
+root,,bash,/root/.bash_history,117,tail error_log
+root,,bash,/root/.bash_history,118,cd ..
+root,,bash,/root/.bash_history,119,ll
+root,,bash,/root/.bash_history,120,cd apache2/
+root,,bash,/root/.bash_history,121,ll
+root,,bash,/root/.bash_history,122,cat access_log
+root,,bash,/root/.bash_history,123,tail -f access_log
+root,,bash,/root/.bash_history,124,vi httpd.conf
+root,,bash,/root/.bash_history,125,apt-get update
+root,,bash,/root/.bash_history,126,apt-get search filebeat
+root,,bash,/root/.bash_history,127,aptitude search filebeat
+root,,bash,/root/.bash_history,128,aptitude
+root,,bash,/root/.bash_history,129,aptitude install filebeat
+root,,bash,/root/.bash_history,130,systemctl enable filebeat
+root,,bash,/root/.bash_history,131,systemctl enable apache2
+root,,bash,/root/.bash_history,132,ll
+root,,bash,/root/.bash_history,133,cd /etc
+root,,bash,/root/.bash_history,134,ls
+root,,bash,/root/.bash_history,135,cd filebeat/
+root,,bash,/root/.bash_history,136,ll
+root,,bash,/root/.bash_history,137,cp filebeat.yml filebeat.yml.bak
+root,,bash,/root/.bash_history,138,vi filebeat.yml
+root,,bash,/root/.bash_history,139,systemctl filebeat stop
+root,,bash,/root/.bash_history,140,systemctl restart filebeat
+root,,bash,/root/.bash_history,141,cd /var/log
+root,,bash,/root/.bash_history,142,cd filebeat/
+root,,bash,/root/.bash_history,143,ll
+root,,bash,/root/.bash_history,144,tail -f filebeat.log
+root,,bash,/root/.bash_history,145,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,146,systemctl restart filebeat
+root,,bash,/root/.bash_history,147,tail -f filebeat.log
+root,,bash,/root/.bash_history,148,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,149,aptitude install tcpdump
+root,,bash,/root/.bash_history,150,grep -i hosts //etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,151,tcpdump 'port 8080'
+root,,bash,/root/.bash_history,152,tcpdump -n 'port 8080'
+root,,bash,/root/.bash_history,153,systemctl restart filebeat
+root,,bash,/root/.bash_history,154,tcpdump -n 'port 8080'
+root,,bash,/root/.bash_history,155,netstat -an | more
+root,,bash,/root/.bash_history,156,ps aux | grep -i file
+root,,bash,/root/.bash_history,157,cat filebeat.log
+root,,bash,/root/.bash_history,158,kk
+root,,bash,/root/.bash_history,159,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,160,systemctl restart filebeat
+root,,bash,/root/.bash_history,161,tail -f filebeat.log
+root,,bash,/root/.bash_history,162,ip addr list
+root,,bash,/root/.bash_history,163,tcpdump -i eth0 -n 'port 443'
+root,,bash,/root/.bash_history,164,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,165,systemctl restart filebeat
+root,,bash,/root/.bash_history,166,tcpdump -i eth0 -n 'port 443'
+root,,bash,/root/.bash_history,167,screen
+root,,bash,/root/.bash_history,168,cd
+root,,bash,/root/.bash_history,169,rm -rf /var/log/filebeat/
+root,,bash,/root/.bash_history,170,cd
+root,,bash,/root/.bash_history,171,cd src
+root,,bash,/root/.bash_history,172,cd srv
+root,,bash,/root/.bash_history,173,cd src
+root,,bash,/root/.bash_history,174,ll
+root,,bash,/root/.bash_history,175,cd ~azureuser/
+root,,bash,/root/.bash_history,176,cd src
+root,,bash,/root/.bash_history,177,ll
+root,,bash,/root/.bash_history,178,dpkg -i filebeat-oss-7.15.0-amd64.deb
+root,,bash,/root/.bash_history,179,ps aux | grep -i file
+root,,bash,/root/.bash_history,180,cd /etc/filebeat/
+root,,bash,/root/.bash_history,181,ll
+root,,bash,/root/.bash_history,182,ll modules.d/
+root,,bash,/root/.bash_history,183,cp ~/filebeat.yml .
+root,,bash,/root/.bash_history,184,ll
+root,,bash,/root/.bash_history,185,screen
+root,,bash,/root/.bash_history,186,vi filebeat.yml
+root,,bash,/root/.bash_history,187,cd
+root,,bash,/root/.bash_history,188,cd /etc/filebeat/
+root,,bash,/root/.bash_history,189,ll
+root,,bash,/root/.bash_history,190,vi filebeat.yml
+root,,bash,/root/.bash_history,191,systemctl restart filebeat
+root,,bash,/root/.bash_history,192,ll
+root,,bash,/root/.bash_history,193,cd /var/log
+root,,bash,/root/.bash_history,194,cd filebeat/
+root,,bash,/root/.bash_history,195,tail -f filebeat.log
+root,,bash,/root/.bash_history,196,cd ..
+root,,bash,/root/.bash_history,197,ll
+root,,bash,/root/.bash_history,198,ps
+root,,bash,/root/.bash_history,199,cd /etc/filebeat/
+root,,bash,/root/.bash_history,200,vi filebeat.yml
+root,,bash,/root/.bash_history,201,systemctl restart filebeat
+root,,bash,/root/.bash_history,202,cd /var/log/filebeat/
+root,,bash,/root/.bash_history,203,tail -f filebeat.log
+root,,bash,/root/.bash_history,204,vi filebeat.yml
+root,,bash,/root/.bash_history,205,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,206,systemctl restart filebeat
+root,,bash,/root/.bash_history,207,tail -f filebeat.log
+root,,bash,/root/.bash_history,208,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,209,screen
+root,,bash,/root/.bash_history,210,cd ~azureuser
+root,,bash,/root/.bash_history,211,ll
+root,,bash,/root/.bash_history,212,cd src
+root,,bash,/root/.bash_history,213,ll
+root,,bash,/root/.bash_history,214,cd httpd-2.4.49
+root,,bash,/root/.bash_history,215,ll
+root,,bash,/root/.bash_history,216,ls
+root,,bash,/root/.bash_history,217,ls docs
+root,,bash,/root/.bash_history,218,cd docs/conf
+root,,bash,/root/.bash_history,219,ls
+root,,bash,/root/.bash_history,220,ls extra/
+root,,bash,/root/.bash_history,221,cat /etc/init.d
+root,,bash,/root/.bash_history,222,cat /etc/init.d/filebeat | more
+root,,bash,/root/.bash_history,223,cd ../..
+root,,bash,/root/.bash_history,224,find . -type f -exec grep DAEMON {} \;
+root,,bash,/root/.bash_history,225,cd
+root,,bash,/root/.bash_history,226,cd /etc/apache2/
+root,,bash,/root/.bash_history,227,ll
+root,,bash,/root/.bash_history,228,vi /etc/filebeat/filebeat.yml
+root,,bash,/root/.bash_history,229,vi httpd.conf
+root,,bash,/root/.bash_history,230,systemctl filebeat stop
+root,,bash,/root/.bash_history,231,/usr/sbin/httpd -k stop
+root,,bash,/root/.bash_history,232,ll
+root,,bash,/root/.bash_history,233,cp httpd.conf ~
+root,,bash,/root/.bash_history,234,cd ..
+root,,bash,/root/.bash_history,235,tail -f /var/log/apache2/error_log
+root,,bash,/root/.bash_history,236,cd ~azureuser
+root,,bash,/root/.bash_history,237,ll
+root,,bash,/root/.bash_history,238,cd src
+root,,bash,/root/.bash_history,239,"find . -name ""mod_cgi*"""
+root,,bash,/root/.bash_history,240,locate mod_cgi
+root,,bash,/root/.bash_history,241,./configure --help
+root,,bash,/root/.bash_history,242,cd httpd-2.4.49
+root,,bash,/root/.bash_history,243,./configure --help
+root,,bash,/root/.bash_history,244,./configure --help | more
+root,,bash,/root/.bash_history,245,./configure --help | grep cgi
+root,,bash,/root/.bash_history,246,./configure --enable-cgi
+root,,bash,/root/.bash_history,247,./configure --help | grep cgi
+root,,bash,/root/.bash_history,248,./configure --enable-cgi --disable-cgid
+root,,bash,/root/.bash_history,249,make
+root,,bash,/root/.bash_history,250,./configure --enable-cgi --disable-cgid
+root,,bash,/root/.bash_history,251,screen -r
+root,,bash,/root/.bash_history,252,tshark -i eth0 -n 'port 80'
+root,,bash,/root/.bash_history,253,tshark -i eth0 -n 'tcp.request'
+root,,bash,/root/.bash_history,254,tshark -i eth0 -n 'http.request'
+root,,bash,/root/.bash_history,255,man tshark
+root,,bash,/root/.bash_history,256,tshark -i eth0 -n -Y  'http.request'
+root,,bash,/root/.bash_history,257,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.70'
+root,,bash,/root/.bash_history,258,clear
+root,,bash,/root/.bash_history,259,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.70'
+root,,bash,/root/.bash_history,260,cd /var/log
+root,,bash,/root/.bash_history,261,ll
+root,,bash,/root/.bash_history,262,aptitude search modsec
+root,,bash,/root/.bash_history,263,iptables -L
+root,,bash,/root/.bash_history,264,ufw
+root,,bash,/root/.bash_history,265,ufw help
+root,,bash,/root/.bash_history,266,ufw status
+root,,bash,/root/.bash_history,267,clear
+root,,bash,/root/.bash_history,268,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.70'
+root,,bash,/root/.bash_history,269,clear
+root,,bash,/root/.bash_history,270,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.70'
+root,,bash,/root/.bash_history,271,cd apache2/
+root,,bash,/root/.bash_history,272,ll
+root,,bash,/root/.bash_history,273,cat error_log
+root,,bash,/root/.bash_history,274,tail -f error_log
+root,,bash,/root/.bash_history,275,vi /etc/apache2/httpd.conf
+root,,bash,/root/.bash_history,276,/usr/sbin/httpd -k stop
+root,,bash,/root/.bash_history,277,echo $CFLAGS
+root,,bash,/root/.bash_history,278,"CFLAGS=""-DBIG_SECURITY_HOLE"""
+root,,bash,/root/.bash_history,279,/usr/sbin/httpd -k stop
+root,,bash,/root/.bash_history,280,vi /etc/apache2/httpd.conf
+root,,bash,/root/.bash_history,281,tail -f error_log
+root,,bash,/root/.bash_history,282,vi /etc/apache2/httpd.conf
+root,,bash,/root/.bash_history,283,/usr/sbin/httpd -k stop
+root,,bash,/root/.bash_history,284,/usr/sbin/httpd -k start
+root,,bash,/root/.bash_history,285,tail -f error_log
+root,,bash,/root/.bash_history,286,vi /etc/apache2/httpd.conf
+root,,bash,/root/.bash_history,287,/usr/sbin/httpd -k stop
+root,,bash,/root/.bash_history,288,netstat -an
+root,,bash,/root/.bash_history,289,netstat -an | more
+root,,bash,/root/.bash_history,290,/usr/sbin/httpd -k start
+root,,bash,/root/.bash_history,291,netstat -an | more
+root,,bash,/root/.bash_history,292,tail -f error_log
+root,,bash,/root/.bash_history,293,vi /etc/apache2/httpd.conf
+root,,bash,/root/.bash_history,294,tail -f error_log
+root,,bash,/root/.bash_history,295,cd /etc/apache2/
+root,,bash,/root/.bash_history,296,grep -i mod_cgi *
+root,,bash,/root/.bash_history,297,vi httpd.conf
+root,,bash,/root/.bash_history,298,/usr/sbin/httpd -k stop
+root,,bash,/root/.bash_history,299,/usr/sbin/httpd -k start
+root,,bash,/root/.bash_history,300,vi httpd.conf

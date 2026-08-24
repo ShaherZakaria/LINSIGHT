@@ -1,0 +1,6 @@
+* text=auto
+
+# The tool runs on the Linux analysis box - a CRLF checkout breaks the shebang.
+*.py text eol=lf
+*.csv text eol=lf
+*.md text eol=lf

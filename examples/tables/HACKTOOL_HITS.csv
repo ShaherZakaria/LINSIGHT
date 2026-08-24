@@ -1,0 +1,39 @@
+﻿severity,category,tool,count,first_utc,last_utc,timestamp_utc,where_seen,table,context,detail
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-10-19 14:16:03,user_agent,WEB_LOG,command,masscan/1.3 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-10-25 19:35:33,user_agent,WEB_LOG,command,masscan/1.0 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-11-12 11:02:13,user_agent,WEB_LOG,command,masscan/1.0 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-11-12 13:34:20,user_agent,WEB_LOG,command,masscan/1.0 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-11-15 20:46:24,user_agent,WEB_LOG,command,masscan/1.3 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-11-25 03:09:36,user_agent,WEB_LOG,command,masscan/1.0 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-11-25 15:28:25,user_agent,WEB_LOG,command,masscan/1.0 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-11-27 02:09:28,user_agent,WEB_LOG,command,masscan/1.0 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-11-30 00:41:35,user_agent,WEB_LOG,command,masscan/1.3 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-12-04 17:29:13,user_agent,WEB_LOG,command,masscan/1.3 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-12-04 18:16:04,user_agent,WEB_LOG,command,masscan/1.3 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,masscan,13,2021-10-19 14:16:03,2021-12-05 18:59:33,2021-12-05 18:46:44,user_agent,WEB_LOG,command,masscan/1.3 (https://github.com/robertdavidgraham/masscan)
+HIGH,scanning and exploitation,nmap,2,2021-12-01 19:22:41,2021-12-01 19:22:42,2021-12-01 19:22:41,user_agent,WEB_LOG,command,Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)
+HIGH,scanning and exploitation,nmap,2,2021-12-01 19:22:41,2021-12-01 19:22:42,2021-12-01 19:22:42,user_agent,WEB_LOG,command,Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:36:16,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:36:16,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:37:09,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:37:11,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:38:02,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:38:04,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:38:55,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:38:57,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:39:49,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:39:49,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:40:43,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-08 16:40:43,message,JOURNAL,text,"EXECVE argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-05 09:27:01,message,VAR_LOG,text,"[4904453.754820] audit: type=1309 audit(1638696421.347:15129196): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-06 14:18:15,message,VAR_LOG,text,"[5008328.133007] audit: type=1309 audit(1638800295.725:15786585): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-06 14:18:15,message,VAR_LOG,text,"[5008328.239136] audit: type=1309 audit(1638800295.833:15786586): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-07 18:18:17,message,VAR_LOG,text,"[5109130.296539] audit: type=1309 audit(1638901097.882:16421345): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-01 03:57:46,message,VAR_LOG,text,"[4539098.589991] audit: type=1309 audit(1638331066.173:12755410): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-01 22:41:40,message,VAR_LOG,text,"[4606532.716485] audit: type=1309 audit(1638398500.310:13212270): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-03 13:10:49,message,VAR_LOG,text,"[4745081.504309] audit: type=1309 audit(1638537049.097:14147565): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-07 18:18:17,message,VAR_LOG,text,"[5109130.296539] audit: type=1309 audit(1638901097.882:16421345): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-06 14:18:15,message,VAR_LOG,text,"[5008328.133007] audit: type=1309 audit(1638800295.725:15786585): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-06 14:18:15,message,VAR_LOG,text,"[5008328.239136] audit: type=1309 audit(1638800295.833:15786586): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-05 09:27:01,message,VAR_LOG,text,"[4904453.754820] audit: type=1309 audit(1638696421.347:15129196): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""
+HIGH,cryptomining,xmrig,477,2021-12-01 03:57:46,2021-12-08 20:04:17,2021-12-03 13:10:49,message,VAR_LOG,text,"[4745081.504309] audit: type=1309 audit(1638537049.097:14147565): argc=3 a0=""pkill"" a1=""-9"" a2=""xmrig"""

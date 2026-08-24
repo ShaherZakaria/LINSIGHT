@@ -1,0 +1,15 @@
+﻿key,value
+uname,Linux ApacheWebServer 5.4.0-1059-azure #62~18.04.1-Ubuntu SMP Tue Sep 14 17:53:18 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+Host date at collection,Wed Dec  8 19:15:00 UTC 2021
+uptime,"19:25:27 up 60 days,  4:19,  1 user,  load average: 17.72, 13.75, 12.45"
+Booted at,2021-10-09 15:06:08
+hostname,ApacheWebServer
+Collection finished,2021-12-08 19:15:00 UTC (from `date` on the host)
+Host UTC offset,"unknown - uac.log carried none, host-local log stamps read as UTC"
+Collection path,~\Downloads\uac\uac-ApacheWebServer-linux-20211208202503.tar
+Collection kind,dir
+Collection layout,uac
+Files in collection,2155
+Rootfs dirs,[root]
+Table scope,full
+Triage tool version,1.0

@@ -1,0 +1,301 @@
+﻿file,owner,kind,schedule,run_as,command,running_pids,line_no
+/etc/crontab,,env,,,SHELL=/bin/sh,,7
+/etc/crontab,,env,,,PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin,,8
+/etc/crontab,,crontab,17 * * * *,root,cd / && run-parts --report /etc/cron.hourly,,11
+/etc/crontab,,crontab,25 6 * * *,root,test -x /usr/sbin/anacron || ( cd / && run-parts --report /etc/cron.daily ),,12
+/etc/crontab,,crontab,47 6 * * 7,root,test -x /usr/sbin/anacron || ( cd / && run-parts --report /etc/cron.weekly ),,13
+/etc/crontab,,crontab,52 6 1 * *,root,test -x /usr/sbin/anacron || ( cd / && run-parts --report /etc/cron.monthly ),,14
+/etc/cron.d/OMSConsistencyInvoker,,crontab,"5,20,35,50 * * * *",omsagent,/opt/omi/bin/OMSConsistencyInvoker >/dev/null 2>&1,,1
+/etc/cron.d/mdadm,,crontab,57 0 * * 0,root,if [ -x /usr/share/mdadm/checkarray ] && [ $(date +\%d) -le 7 ]; then /usr/share/mdadm/checkarray --cron --all --idle --quiet; fi,,12
+/etc/cron.d/omilogrotate,,crontab,*/15 * * * *,root,/usr/sbin/logrotate /etc/logrotate.d/omi --state /var/opt/omi/log/omi-logrotate.status >/dev/null 2>&1,,1
+/etc/cron.d/omsagent,,crontab,*/5 * * * *,root,/usr/sbin/logrotate -s /var/lib/logrotate/omsagent-status /etc/logrotate.d/omsagent* >/dev/null 2>&1,,1
+/etc/cron.d/popularity-contest,,env,,,SHELL=/bin/sh,,1
+/etc/cron.d/popularity-contest,,env,,,PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin,,2
+/etc/cron.d/popularity-contest,,crontab,49 12 * * *,root,test -x /etc/cron.daily/popularity-contest && /etc/cron.daily/popularity-contest --crond,,3
+/etc/cron.d/scxagent,,crontab,0 */4 * * *,root,/usr/sbin/logrotate /etc/logrotate.d/scxagent --state /var/opt/microsoft/scx/log/scx-logrotate.status >/dev/null 2>&1,,1
+/etc/cron.hourly/.placeholder,,script,@hourly,root,.placeholder,,
+/etc/cron.daily/.placeholder,,script,@daily,root,.placeholder,,
+/etc/cron.daily/apport,,script,@daily,root,apport,,
+/etc/cron.daily/apport,,script_line,@daily,,[ -d /var/crash ] || exit 0,,3
+/etc/cron.daily/apport,,script_line,@daily,,find /var/crash/. ! -name . -prune -type f \( \( -size 0 -a \! -name '*.upload*' -a \! -name '*.drkonqi*' \) -o -mtime +7 \) -exec rm -f -- '{}' \;,,4
+/etc/cron.daily/apport,,script_line,@daily,,find /var/crash/. ! -name . -prune -type d -regextype posix-extended -regex '.*/[0-9]{12}$' \( -mtime +7 \) -exec rm -Rf -- '{}' \;,,5
+/etc/cron.daily/apt-compat,,script,@daily,root,apt-compat,,
+/etc/cron.daily/apt-compat,,script_line,@daily,,set -e,,3
+/etc/cron.daily/apt-compat,,script_line,@daily,,if [ -d /run/systemd/system ]; then,,10
+/etc/cron.daily/apt-compat,,script_line,@daily,,exit 0,,11
+/etc/cron.daily/apt-compat,,script_line,@daily,,fi,,12
+/etc/cron.daily/apt-compat,,script_line,@daily,,check_power(),,14
+/etc/cron.daily/apt-compat,,script_line,@daily,,{,,15
+/etc/cron.daily/apt-compat,,script_line,@daily,,if which on_ac_power >/dev/null 2>&1; then,,21
+/etc/cron.daily/apt-compat,,script_line,@daily,,if on_ac_power; then,,22
+/etc/cron.daily/apt-compat,,script_line,@daily,,:,,23
+/etc/cron.daily/apt-compat,,script_line,@daily,,elif [ $? -eq 1 ]; then,,24
+/etc/cron.daily/apt-compat,,script_line,@daily,,return 1,,25
+/etc/cron.daily/apt-compat,,script_line,@daily,,fi,,26
+/etc/cron.daily/apt-compat,,script_line,@daily,,fi,,27
+/etc/cron.daily/apt-compat,,script_line,@daily,,return 0,,28
+/etc/cron.daily/apt-compat,,script_line,@daily,,},,29
+/etc/cron.daily/apt-compat,,script_line,@daily,,random_sleep(),,33
+/etc/cron.daily/apt-compat,,script_line,@daily,,{,,34
+/etc/cron.daily/apt-compat,,script_line,@daily,,RandomSleep=1800,,35
+/etc/cron.daily/apt-compat,,script_line,@daily,,eval $(apt-config shell RandomSleep APT::Periodic::RandomSleep),,36
+/etc/cron.daily/apt-compat,,script_line,@daily,,if [ $RandomSleep -eq 0 ]; then,,37
+/etc/cron.daily/apt-compat,,script_line,@daily,,return,,38
+/etc/cron.daily/apt-compat,,script_line,@daily,,fi,,39
+/etc/cron.daily/apt-compat,,script_line,@daily,,"if [ -z ""$RANDOM"" ] ; then",,40
+/etc/cron.daily/apt-compat,,script_line,@daily,,RANDOM=$(( $(dd if=/dev/urandom bs=2 count=1 2> /dev/null | cksum | cut -d' ' -f1) % 32767 )),,42
+/etc/cron.daily/apt-compat,,script_line,@daily,,fi,,43
+/etc/cron.daily/apt-compat,,script_line,@daily,,TIME=$(($RANDOM % $RandomSleep)),,44
+/etc/cron.daily/apt-compat,,script_line,@daily,,sleep $TIME,"6388,6803,6830,8078,8081",45
+/etc/cron.daily/apt-compat,,script_line,@daily,,},,46
+/etc/cron.daily/apt-compat,,script_line,@daily,,random_sleep,,49
+/etc/cron.daily/apt-compat,,script_line,@daily,,check_power || exit 0,,52
+/etc/cron.daily/apt-compat,,script_line,@daily,,exec /usr/lib/apt/apt.systemd.daily,,55
+/etc/cron.daily/aptitude,,script,@daily,root,aptitude,,
+/etc/cron.daily/aptitude,,script_line,@daily,,bak=/var/backups,,3
+/etc/cron.daily/aptitude,,script_line,@daily,,if test -f /var/lib/aptitude/pkgstates && cd $bak ; then,,6
+/etc/cron.daily/aptitude,,script_line,@daily,,if ! cmp -s aptitude.pkgstates.0 /var/lib/aptitude/pkgstates ; then,,7
+/etc/cron.daily/aptitude,,script_line,@daily,,cp -p /var/lib/aptitude/pkgstates aptitude.pkgstates,,8
+/etc/cron.daily/aptitude,,script_line,@daily,,savelog -c 7 aptitude.pkgstates > /dev/null,,9
+/etc/cron.daily/aptitude,,script_line,@daily,,fi,,10
+/etc/cron.daily/aptitude,,script_line,@daily,,fi,,11
+/etc/cron.daily/bsdmainutils,,script,@daily,root,bsdmainutils,,
+/etc/cron.daily/bsdmainutils,,script_line,@daily,,. /etc/default/bsdmainutils,,5
+/etc/cron.daily/bsdmainutils,,script_line,@daily,,[ x$RUN_DAILY = xtrue ] || exit 0,,7
+/etc/cron.daily/bsdmainutils,,script_line,@daily,,[ -x /usr/sbin/sendmail ] || exit 0,,9
+/etc/cron.daily/bsdmainutils,,script_line,@daily,,if [ ! -x /usr/bin/cpp ]; then,,11
+/etc/cron.daily/bsdmainutils,,script_line,@daily,,"echo ""The cpp package is needed to run calendar.""",,12
+/etc/cron.daily/bsdmainutils,,script_line,@daily,,exit 1,,13
+/etc/cron.daily/bsdmainutils,,script_line,@daily,,fi,,14
+/etc/cron.daily/bsdmainutils,,script_line,@daily,,/usr/bin/calendar -a,,16
+/etc/cron.daily/dpkg,,script,@daily,root,dpkg,,
+/etc/cron.daily/dpkg,,script_line,@daily,,dbdir=/var/lib/dpkg,,3
+/etc/cron.daily/dpkg,,script_line,@daily,,if cd /var/backups ; then,,6
+/etc/cron.daily/dpkg,,script_line,@daily,,dbchanged=no,,9
+/etc/cron.daily/dpkg,,script_line,@daily,,"dbfiles=""arch status diversions statoverride""",,10
+/etc/cron.daily/dpkg,,script_line,@daily,,for db in $dbfiles ; do,,11
+/etc/cron.daily/dpkg,,script_line,@daily,,if ! cmp -s dpkg.${db}.0 $dbdir/$db ; then,,12
+/etc/cron.daily/dpkg,,script_line,@daily,,dbchanged=yes,,13
+/etc/cron.daily/dpkg,,script_line,@daily,,break;,,14
+/etc/cron.daily/dpkg,,script_line,@daily,,fi,,15
+/etc/cron.daily/dpkg,,script_line,@daily,,done,,16
+/etc/cron.daily/dpkg,,script_line,@daily,,"if [ ""$dbchanged"" = ""yes"" ] ; then",,17
+/etc/cron.daily/dpkg,,script_line,@daily,,for db in $dbfiles ; do,,18
+/etc/cron.daily/dpkg,,script_line,@daily,,[ -e $dbdir/$db ] || continue,,19
+/etc/cron.daily/dpkg,,script_line,@daily,,cp -p $dbdir/$db dpkg.$db,,20
+/etc/cron.daily/dpkg,,script_line,@daily,,savelog -c 7 dpkg.$db >/dev/null,,21
+/etc/cron.daily/dpkg,,script_line,@daily,,done,,22
+/etc/cron.daily/dpkg,,script_line,@daily,,fi,,23
+/etc/cron.daily/dpkg,,script_line,@daily,,dbalt=alternatives,,26
+/etc/cron.daily/dpkg,,script_line,@daily,,if ! test -e ${dbalt}.tar.0 ||,,30
+/etc/cron.daily/dpkg,,script_line,@daily,,! tar -df ${dbalt}.tar.0 -C $dbdir $dbalt >/dev/null 2>&1 ;,,31
+/etc/cron.daily/dpkg,,script_line,@daily,,then,,32
+/etc/cron.daily/dpkg,,script_line,@daily,,tar -cf ${dbalt}.tar -C $dbdir $dbalt >/dev/null 2>&1,,33
+/etc/cron.daily/dpkg,,script_line,@daily,,savelog -c 7 ${dbalt}.tar >/dev/null,,34
+/etc/cron.daily/dpkg,,script_line,@daily,,fi,,35
+/etc/cron.daily/dpkg,,script_line,@daily,,fi,,36
+/etc/cron.daily/logrotate,,script,@daily,root,logrotate,,
+/etc/cron.daily/logrotate,,script_line,@daily,,cd /var/lib/logrotate,,4
+/etc/cron.daily/logrotate,,script_line,@daily,,test -e status || touch status,,5
+/etc/cron.daily/logrotate,,script_line,@daily,,head -1 status > status.clean,,6
+/etc/cron.daily/logrotate,,script_line,@daily,,"sed 's/""//g' status | while read logfile date",,7
+/etc/cron.daily/logrotate,,script_line,@daily,,do,,8
+/etc/cron.daily/logrotate,,script_line,@daily,,"[ -e ""$logfile"" ] && echo ""\""$logfile\"" $date""",,9
+/etc/cron.daily/logrotate,,script_line,@daily,,done >> status.clean,,10
+/etc/cron.daily/logrotate,,script_line,@daily,,mv status.clean status,,11
+/etc/cron.daily/logrotate,,script_line,@daily,,test -x /usr/sbin/logrotate || exit 0,,13
+/etc/cron.daily/logrotate,,script_line,@daily,,/usr/sbin/logrotate /etc/logrotate.conf,,14
+/etc/cron.daily/man-db,,script,@daily,root,man-db,,
+/etc/cron.daily/man-db,,script_line,@daily,,set -e,,5
+/etc/cron.daily/man-db,,script_line,@daily,,iosched_idle=,,7
+/etc/cron.daily/man-db,,script_line,@daily,,if ! egrep -q '(envID|VxID):.*[1-9]' /proc/self/status && \,,9
+/etc/cron.daily/man-db,,script_line,@daily,,([ ! -d /proc/vz ] || [ -d /proc/bc ]); then,,10
+/etc/cron.daily/man-db,,script_line,@daily,,iosched_idle='--iosched idle',,11
+/etc/cron.daily/man-db,,script_line,@daily,,fi,,12
+/etc/cron.daily/man-db,,script_line,@daily,,if ! [ -d /var/cache/man ]; then,,14
+/etc/cron.daily/man-db,,script_line,@daily,,install -d -o man -g man -m 0755 /var/cache/man,,16
+/etc/cron.daily/man-db,,script_line,@daily,,fi,,17
+/etc/cron.daily/man-db,,script_line,@daily,,if [ ! -d /run/systemd/system ] && [ -d /var/cache/man ]; then,,20
+/etc/cron.daily/man-db,,script_line,@daily,,cd /,,21
+/etc/cron.daily/man-db,,script_line,@daily,,start-stop-daemon --start --pidfile /dev/null --startas /bin/sh \,,22
+/etc/cron.daily/man-db,,script_line,@daily,,--oknodo --chuid man $iosched_idle -- -c \,,23
+/etc/cron.daily/man-db,,script_line,@daily,,"""find /var/cache/man -type f -name '*.gz' -atime +6 -print0 | \",,24
+/etc/cron.daily/man-db,,script_line,@daily,,"xargs -r0 rm -f""",,25
+/etc/cron.daily/man-db,,script_line,@daily,,fi,,26
+/etc/cron.daily/man-db,,script_line,@daily,,if [ -x /usr/bin/mandb ]; then,,29
+/etc/cron.daily/man-db,,script_line,@daily,,start-stop-daemon --start --pidfile /dev/null \,,32
+/etc/cron.daily/man-db,,script_line,@daily,,--startas /usr/bin/mandb --oknodo --chuid man \,,33
+/etc/cron.daily/man-db,,script_line,@daily,,$iosched_idle \,,34
+/etc/cron.daily/man-db,,script_line,@daily,,-- --no-purge --quiet,,35
+/etc/cron.daily/man-db,,script_line,@daily,,fi,,36
+/etc/cron.daily/man-db,,script_line,@daily,,exit 0,,38
+/etc/cron.daily/mdadm,,script,@daily,root,mdadm,,
+/etc/cron.daily/mdadm,,script_line,@daily,,set -eu,,13
+/etc/cron.daily/mdadm,,script_line,@daily,,MDADM=/sbin/mdadm,,15
+/etc/cron.daily/mdadm,,script_line,@daily,,[ -x $MDADM ] || exit 0 # package may be removed but not purged,,16
+/etc/cron.daily/mdadm,,script_line,@daily,,exec $MDADM --monitor --scan --oneshot,,18
+/etc/cron.daily/mlocate,,script,@daily,root,mlocate,,
+/etc/cron.daily/mlocate,,script_line,@daily,,set -e,,3
+/etc/cron.daily/mlocate,,script_line,@daily,,[ -x /usr/bin/updatedb.mlocate ] || exit 0,,5
+/etc/cron.daily/mlocate,,script_line,@daily,,if which on_ac_power >/dev/null 2>&1; then,,7
+/etc/cron.daily/mlocate,,script_line,@daily,,ON_BATTERY=0,,8
+/etc/cron.daily/mlocate,,script_line,@daily,,on_ac_power >/dev/null 2>&1 || ON_BATTERY=$?,,9
+/etc/cron.daily/mlocate,,script_line,@daily,,"if [ ""$ON_BATTERY"" -eq 1 ]; then",,10
+/etc/cron.daily/mlocate,,script_line,@daily,,exit 0,,11
+/etc/cron.daily/mlocate,,script_line,@daily,,fi,,12
+/etc/cron.daily/mlocate,,script_line,@daily,,fi,,13
+/etc/cron.daily/mlocate,,script_line,@daily,,if [ -x /usr/bin/ionice ] &&,,16
+/etc/cron.daily/mlocate,,script_line,@daily,,/usr/bin/ionice -c3 true 2>/dev/null; then,,17
+/etc/cron.daily/mlocate,,script_line,@daily,,"IONICE=""/usr/bin/ionice -c3""",,18
+/etc/cron.daily/mlocate,,script_line,@daily,,fi,,19
+/etc/cron.daily/mlocate,,script_line,@daily,,NOCACHE=,,22
+/etc/cron.daily/mlocate,,script_line,@daily,,if [ -x /usr/bin/nocache ]; then,,23
+/etc/cron.daily/mlocate,,script_line,@daily,,"NOCACHE=""/usr/bin/nocache""",,24
+/etc/cron.daily/mlocate,,script_line,@daily,,fi,,25
+/etc/cron.daily/mlocate,,script_line,@daily,,flock --nonblock /run/mlocate.daily.lock $NOCACHE $IONICE /usr/bin/updatedb.mlocate,,27
+/etc/cron.daily/passwd,,script,@daily,root,passwd,,
+/etc/cron.daily/passwd,,script_line,@daily,,cd /var/backups || exit 0,,3
+/etc/cron.daily/passwd,,script_line,@daily,,for FILE in passwd group shadow gshadow; do,,5
+/etc/cron.daily/passwd,,script_line,@daily,,test -f /etc/$FILE              || continue,,6
+/etc/cron.daily/passwd,,script_line,@daily,,cmp -s $FILE.bak /etc/$FILE     && continue,,7
+/etc/cron.daily/passwd,,script_line,@daily,,cp -p /etc/$FILE $FILE.bak && chmod 600 $FILE.bak,,8
+/etc/cron.daily/passwd,,script_line,@daily,,done,,9
+/etc/cron.daily/popularity-contest,,script,@daily,root,popularity-contest,,
+/etc/cron.daily/popularity-contest,,script_line,@daily,,set -e,,2
+/etc/cron.daily/popularity-contest,,script_line,@daily,,if [ ! -f /usr/sbin/popularity-contest ]; then,,5
+/etc/cron.daily/popularity-contest,,script_line,@daily,,exit 0,,6
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,7
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"MODE=""$1""",,9
+/etc/cron.daily/popularity-contest,,script_line,@daily,,unset MAILFROM,,11
+/etc/cron.daily/popularity-contest,,script_line,@daily,,unset MAILTO,,12
+/etc/cron.daily/popularity-contest,,script_line,@daily,,unset MY_HOSTID,,13
+/etc/cron.daily/popularity-contest,,script_line,@daily,,unset PARTICIPATE,,14
+/etc/cron.daily/popularity-contest,,script_line,@daily,,unset SUBMITURLS,,15
+/etc/cron.daily/popularity-contest,,script_line,@daily,,unset USEHTTP,,16
+/etc/cron.daily/popularity-contest,,script_line,@daily,,unset MTAOPS,,17
+/etc/cron.daily/popularity-contest,,script_line,@daily,,. /usr/share/popularity-contest/default.conf,,20
+/etc/cron.daily/popularity-contest,,script_line,@daily,,. /etc/popularity-contest.conf,,21
+/etc/cron.daily/popularity-contest,,script_line,@daily,,if test -d /etc/popularity-contest.d/; then,,23
+/etc/cron.daily/popularity-contest,,script_line,@daily,,for file in `run-parts --list --regex '\.conf$' /etc/popularity-contest.d/`;,,24
+/etc/cron.daily/popularity-contest,,script_line,@daily,,do,,25
+/etc/cron.daily/popularity-contest,,script_line,@daily,,. $file,,26
+/etc/cron.daily/popularity-contest,,script_line,@daily,,done,,27
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,28
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ -z ""$MAILTO"" ] && [ ""yes"" != ""$USEHTTP"" ]; then exit 0; fi",,31
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ ""$PARTICIPATE"" = ""no"" ] || [ -z ""$PARTICIPATE"" ]; then exit 0; fi",,34
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ -n ""$HTTP_PROXY"" ]; then",,36
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"export http_proxy=""$HTTP_PROXY"";",,37
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,38
+/etc/cron.daily/popularity-contest,,script_line,@daily,,POPCONOLD=/var/log/popularity-contest,,40
+/etc/cron.daily/popularity-contest,,script_line,@daily,,POPCONNEW=/var/log/popularity-contest.new,,41
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"POPCON=""$POPCONNEW""",,42
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ ""$DAY"" ] && [ ""$DAY"" != ""$(date +%w)"" ] ; then",,45
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ -f ""$POPCONOLD"" ] ; then",,47
+/etc/cron.daily/popularity-contest,,script_line,@daily,,now=$(date +%s),,48
+/etc/cron.daily/popularity-contest,,script_line,@daily,,lastrun=$(date -r $POPCONOLD +%s),,49
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ ""$MODE"" = ""--crond"" ]; then",,50
+/etc/cron.daily/popularity-contest,,script_line,@daily,,week=561600,,52
+/etc/cron.daily/popularity-contest,,script_line,@daily,,else,,53
+/etc/cron.daily/popularity-contest,,script_line,@daily,,week=648000,,55
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,56
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ ""$(( $now - $lastrun ))"" -le ""$week"" ]; then",,57
+/etc/cron.daily/popularity-contest,,script_line,@daily,,exit 0,,58
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,59
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,60
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,61
+/etc/cron.daily/popularity-contest,,script_line,@daily,,cd /var/log,,64
+/etc/cron.daily/popularity-contest,,script_line,@daily,,umask 022,,65
+/etc/cron.daily/popularity-contest,,script_line,@daily,,savelog -c 7 popularity-contest >/dev/null,,66
+/etc/cron.daily/popularity-contest,,script_line,@daily,,run_popcon(),,68
+/etc/cron.daily/popularity-contest,,script_line,@daily,,{,,69
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"runuser -s /bin/sh -c ""/usr/sbin/popularity-contest"" nobody",,70
+/etc/cron.daily/popularity-contest,,script_line,@daily,,},,71
+/etc/cron.daily/popularity-contest,,script_line,@daily,,do_sendmail(),,73
+/etc/cron.daily/popularity-contest,,script_line,@daily,,{,,74
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ -n ""$MAILFROM"" ]; then",,75
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"sendmail -oi $MTAOPS -f ""$MAILFROM"" $MAILTO",,76
+/etc/cron.daily/popularity-contest,,script_line,@daily,,else,,77
+/etc/cron.daily/popularity-contest,,script_line,@daily,,sendmail -oi $MTAOPS $MAILTO,,78
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,79
+/etc/cron.daily/popularity-contest,,script_line,@daily,,},,80
+/etc/cron.daily/popularity-contest,,script_line,@daily,,run_popcon > $POPCON,,84
+/etc/cron.daily/popularity-contest,,script_line,@daily,,GPG=/usr/bin/gpg,,86
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ ""$ENCRYPT"" = ""yes"" ] && ! [ -x ""$GPG"" ]; then",,88
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"logger -t popularity-contest ""encryption required but gpg is not available.""",,89
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"echo ""popularity-contest: encryption required but gpg is not available."" 2>&1",,90
+/etc/cron.daily/popularity-contest,,script_line,@daily,,exit 1,,91
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,92
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ -x ""$GPG"" ] && [ ""$ENCRYPT"" = ""maybe"" ] || [ ""$ENCRYPT"" = ""yes"" ]; then",,94
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"POPCONGPG=""$POPCON.gpg""",,95
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"rm -f ""$POPCONGPG""",,96
+/etc/cron.daily/popularity-contest,,script_line,@daily,,GPGHOME=`mktemp -d`,,97
+/etc/cron.daily/popularity-contest,,script_line,@daily,,$GPG --batch --no-options --no-default-keyring --trust-model=always \,,98
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"--homedir ""$GPGHOME"" --keyring $KEYRING --quiet \",,99
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"--armor -o ""$POPCONGPG"" -r $POPCONKEY --encrypt ""$POPCON""",,100
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"rm -rf ""$GPGHOME""",,101
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"POPCON=""$POPCONGPG""",,102
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,103
+/etc/cron.daily/popularity-contest,,script_line,@daily,,SUBMITTED=no,,105
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ ""$SUBMITURLS"" ] && [ ""yes"" = ""$USEHTTP"" ]; then",,108
+/etc/cron.daily/popularity-contest,,script_line,@daily,,for URL in $SUBMITURLS ; do,,109
+/etc/cron.daily/popularity-contest,,script_line,@daily,,if setsid /usr/share/popularity-contest/popcon-upload \,,110
+/etc/cron.daily/popularity-contest,,script_line,@daily,,-u $URL -f $POPCON -C 2>/dev/null ; then,,111
+/etc/cron.daily/popularity-contest,,script_line,@daily,,SUBMITTED=yes,,112
+/etc/cron.daily/popularity-contest,,script_line,@daily,,else,,113
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"logger -t popularity-contest ""unable to submit report to $URL.""",,114
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,115
+/etc/cron.daily/popularity-contest,,script_line,@daily,,done,,116
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,117
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ ""$MODE"" = ""--crond"" ] && [ yes != ""$SUBMITTED"" ] && [ ""$MAILTO"" ]; then",,121
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ -x ""`which sendmail 2>/dev/null`"" ]; then",,122
+/etc/cron.daily/popularity-contest,,script_line,@daily,,(,,123
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ -n ""$MAILFROM"" ]; then",,124
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"echo ""From: <$MAILFROM>""",,125
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"echo ""Sender: <$MAILFROM>""",,126
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,127
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"echo ""To: $MAILTO""",,128
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"echo ""Subject: popularity-contest submission""",,129
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"echo ""MIME-Version: 1.0""",,130
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"echo ""Content-Type: text/plain""",,131
+/etc/cron.daily/popularity-contest,,script_line,@daily,,echo,,132
+/etc/cron.daily/popularity-contest,,script_line,@daily,,cat $POPCON,,133
+/etc/cron.daily/popularity-contest,,script_line,@daily,,) | do_sendmail,,134
+/etc/cron.daily/popularity-contest,,script_line,@daily,,SUBMITTED=yes,,135
+/etc/cron.daily/popularity-contest,,script_line,@daily,,else,,136
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"logger -t popularity-contest ""unable to submit report using sendmail.""",,137
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,138
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,139
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"if [ ""yes"" != ""$SUBMITTED"" ] ; then",,141
+/etc/cron.daily/popularity-contest,,script_line,@daily,,"logger -t popularity-contest ""unable to submit report.""",,142
+/etc/cron.daily/popularity-contest,,script_line,@daily,,else,,143
+/etc/cron.daily/popularity-contest,,script_line,@daily,,mv $POPCONNEW $POPCONOLD,,144
+/etc/cron.daily/popularity-contest,,script_line,@daily,,fi,,145
+/etc/cron.daily/update-notifier-common,,script,@daily,root,update-notifier-common,,
+/etc/cron.daily/update-notifier-common,,script_line,@daily,,set -e,,3
+/etc/cron.daily/update-notifier-common,,script_line,@daily,,[ -x /usr/lib/update-notifier/package-data-downloader ] || exit 0,,5
+/etc/cron.daily/update-notifier-common,,script_line,@daily,,/usr/lib/update-notifier/package-data-downloader,,8
+/etc/cron.weekly/.placeholder,,script,@weekly,root,.placeholder,,
+/etc/cron.weekly/man-db,,script,@weekly,root,man-db,,
+/etc/cron.weekly/man-db,,script_line,@weekly,,set -e,,5
+/etc/cron.weekly/man-db,,script_line,@weekly,,iosched_idle=,,7
+/etc/cron.weekly/man-db,,script_line,@weekly,,if ! egrep -q '(envID|VxID):.*[1-9]' /proc/self/status && \,,9
+/etc/cron.weekly/man-db,,script_line,@weekly,,([ ! -d /proc/vz ] || [ -d /proc/bc ]); then,,10
+/etc/cron.weekly/man-db,,script_line,@weekly,,iosched_idle='--iosched idle',,11
+/etc/cron.weekly/man-db,,script_line,@weekly,,fi,,12
+/etc/cron.weekly/man-db,,script_line,@weekly,,if ! [ -d /var/cache/man ]; then,,14
+/etc/cron.weekly/man-db,,script_line,@weekly,,install -d -o man -g man -m 0755 /var/cache/man,,16
+/etc/cron.weekly/man-db,,script_line,@weekly,,fi,,17
+/etc/cron.weekly/man-db,,script_line,@weekly,,if [ -x /usr/bin/mandb ]; then,,20
+/etc/cron.weekly/man-db,,script_line,@weekly,,start-stop-daemon --start --pidfile /dev/null \,,23
+/etc/cron.weekly/man-db,,script_line,@weekly,,--startas /usr/bin/mandb --oknodo --chuid man \,,24
+/etc/cron.weekly/man-db,,script_line,@weekly,,$iosched_idle \,,25
+/etc/cron.weekly/man-db,,script_line,@weekly,,-- --quiet,,26
+/etc/cron.weekly/man-db,,script_line,@weekly,,fi,,27
+/etc/cron.weekly/man-db,,script_line,@weekly,,exit 0,,29
+/etc/cron.weekly/update-notifier-common,,script,@weekly,root,update-notifier-common,,
+/etc/cron.weekly/update-notifier-common,,script_line,@weekly,,set -e,,3
+/etc/cron.weekly/update-notifier-common,,script_line,@weekly,,[ -x /usr/lib/ubuntu-release-upgrader/release-upgrade-motd ] || exit 0,,5
+/etc/cron.weekly/update-notifier-common,,script_line,@weekly,,sleep_then_check() {,,7
+/etc/cron.weekly/update-notifier-common,,script_line,@weekly,,sleep $(shuf -i 1-3600 -n 1),"6388,6803,6830,8078,8081",10
+/etc/cron.weekly/update-notifier-common,,script_line,@weekly,,/usr/lib/ubuntu-release-upgrader/release-upgrade-motd,,12
+/etc/cron.weekly/update-notifier-common,,script_line,@weekly,,},,13

@@ -1,0 +1,200 @@
+﻿depth,tree,pid,ppid,user,start_utc,elapsed,container,children,hidden,cmdline,note
+0,systemd,1,0,root,2021-10-09 15:06:07,60-03:45:25,,29,,/sbin/init,
+1,* lvmetad,447,1,root,2021-10-09 15:06:14,60-03:45:18,,,,/sbin/lvmetad -f,
+1,* systemd-udevd,457,1,root,2021-10-09 15:06:14,60-03:45:18,,,,/lib/systemd/systemd-udevd,
+1,* systemd,602,1,azureus+,2021-10-10 17:02:44,59-01:48:48,,1,,/lib/systemd/systemd --user,
+2,** (sd-pam),603,602,azureus+,2021-10-10 17:02:44,59-01:48:48,,,,(sd-pam),
+1,* systemd-timesyn,702,1,systemd+,2021-10-09 15:06:17,60-03:45:15,,,,/lib/systemd/systemd-timesyncd,
+1,* httpd,801,1,root,2021-10-10 17:03:59,59-01:47:33,,4,,/usr/sbin/httpd -k start,
+2,** httpd,1693,801,daemon,2021-11-18 07:37:49,20-11:13:43,,,,/usr/sbin/httpd -k start,
+2,** httpd,1813,801,daemon,2021-11-18 07:48:56,20-11:02:36,,,,/usr/sbin/httpd -k start,
+2,** httpd,2539,801,daemon,2021-11-18 08:02:44,20-10:48:48,,,,/usr/sbin/httpd -k start,
+2,** httpd,2632,801,daemon,2021-11-18 08:31:42,20-10:19:50,,,,/usr/sbin/httpd -k start,
+1,* omsagent,828,1,omsagent,2021-11-19 01:36:35,19-17:14:57,,,,/opt/microsoft/omsagent/ruby/bin/ruby /opt/microsoft/omsagent/bin/omsagent -d /var/opt/microsoft/omsagent/00000000-0000-4000-8000-000000000001/run/omsagent.p...,
+1,* systemd-network,859,1,systemd+,2021-10-09 15:06:21,60-03:45:11,,,,/lib/systemd/systemd-networkd,
+1,* systemd-resolve,870,1,systemd+,2021-10-09 15:06:21,60-03:45:11,,,,/lib/systemd/systemd-resolved,
+1,* atd,1003,1,daemon,2021-10-09 15:06:25,60-03:45:07,,,,/usr/sbin/atd -f,
+1,* dbus-daemon,1014,1,message+,2021-10-09 15:06:25,60-03:45:07,,,,/usr/bin/dbus-daemon --system --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only,
+1,* cron,1029,1,root,2021-10-09 15:06:25,60-03:45:07,,1,,/usr/sbin/cron -f,
+2,** cron,,,,,,,1,,,in the pstree drawing only - no artifact gave it a PID
+3,*** sh,,,,,,,1,,,in the pstree drawing only - no artifact gave it a PID
+4,**** OMSConsistencyI,,,,,,,2,,,in the pstree drawing only - no artifact gave it a PID
+5,***** sh,,,,,,,,,,in the pstree drawing only - no artifact gave it a PID
+5,***** sh,,,,,,,1,,,in the pstree drawing only - no artifact gave it a PID
+6,****** python2,,,,,,,1,,,in the pstree drawing only - no artifact gave it a PID
+7,******* dsc_host,,,,,,,,,,in the pstree drawing only - no artifact gave it a PID
+1,* lxcfs,1046,1,root,2021-10-09 15:06:25,60-03:45:07,,,,/usr/bin/lxcfs /var/lib/lxcfs/,
+1,* accounts-daemon,1065,1,root,2021-10-09 15:06:25,60-03:45:07,,,,/usr/lib/accountsservice/accounts-daemon,
+1,* agetty,1084,1,root,2021-10-09 15:06:25,60-03:45:07,,,,"/sbin/agetty -o -p -- \u --keep-baud 115200,38400,9600 ttyS0 vt220",
+1,* agetty,1103,1,root,2021-10-09 15:06:25,60-03:45:07,,,,/sbin/agetty -o -p -- \u --noclear tty1 linux,
+1,* sshd,1106,1,root,2021-10-09 15:06:26,60-03:45:06,,1,,/usr/sbin/sshd -D,
+2,** sshd,4092,1106,root,2021-12-08 16:12:06,02:39:26,,1,,sshd: azureuser [priv],
+3,*** sshd,4204,4092,azureus+,2021-12-08 16:12:25,02:39:07,,1,,sshd: azureuser@pts/0,
+4,**** bash,4205,4204,azureus+,2021-12-08 16:12:25,02:39:07,,1,,-bash,
+5,***** sudo,9303,4205,root,2021-12-08 16:17:57,02:33:35,,1,,sudo su,
+6,****** su,9314,9303,root,2021-12-08 16:17:57,02:33:35,,1,,su,
+7,******* bash,9331,9314,root,2021-12-08 16:17:59,02:33:33,,1,,bash,
+8,******** uac,6445,9331,root,2021-12-08 18:50:50,00:42,,1,,/bin/sh ./uac -p full -o linux output,
+9,********* uac,6991,6445,root,2021-12-08 18:51:16,00:16,,3,,/bin/sh ./uac -p full -o linux output,
+10,********** statx,7477,6991,,,,,,,,
+10,********** ps,7566,6991,root,,,,,,ps -efl,
+10,********** pstree,,,,,,,,,,in the pstree drawing only - no artifact gave it a PID
+1,* polkitd,1124,1,root,2021-10-09 15:06:26,60-03:45:06,,,,/usr/lib/policykit-1/polkitd --no-debug,
+1,* auoms,4148,1,root,2021-12-05 14:59:17,3-03:52:15,,1,,/opt/microsoft/auoms/bin/auoms,
+2,** auomscollect,494,4148,root,2021-12-08 16:54:37,01:56:55,,,,/opt/microsoft/auoms/bin/auomscollect -n,
+1,* hv_kvp_daemon,7777,1,root,2021-11-30 07:03:41,8-11:47:51,,,,/usr/lib/linux-tools/5.4.0-1059-azure/hv_kvp_daemon -n,
+1,* systemd-logind,7900,1,root,2021-11-18 10:48:34,20-08:02:58,,,,/lib/systemd/systemd-logind,
+1,* bash,15851,1,daemon,2021-11-30 16:19:28,8-02:32:04,,1,,/bin/bash,
+2,** sh,15853,15851,daemon,2021-11-30 16:19:28,8-02:32:04,,1,,sh,
+3,*** sleep,6830,15853,daemon,2021-12-08 18:51:09,00:23,,,,sleep 30,
+1,* sh,20645,1,daemon,2021-11-14 01:26:25,24-17:25:07,,1,,sh .src.sh,
+2,** sleep,6388,20645,daemon,2021-12-08 18:50:45,00:47,,,,sleep 300,
+1,* bash,21783,1,daemon,2021-11-30 16:27:39,8-02:23:53,,1,,/bin/bash,
+2,** sh,21785,21783,daemon,2021-11-30 16:27:39,8-02:23:53,,1,,sh,
+3,*** sleep,6803,21785,daemon,2021-12-08 18:51:07,00:25,,,,sleep 30,
+1,* omiserver,22096,1,root,2021-12-05 08:25:38,3-10:25:54,,2,,/opt/omi/bin/omiserver -d,
+2,** omiengine,22101,22096,omi,2021-12-05 08:25:38,3-10:25:54,,,,/opt/omi/bin/omiengine -d --logfilefd 3 --socketpair 9,
+2,** omiagent,22182,22096,root,2021-12-05 08:25:55,3-10:25:37,,,,/opt/omi/bin/omiagent 9 10 --destdir / --providerdir /opt/omi/lib --loglevel WARNING,
+1,* agettyd,24330,1,daemon,2021-12-05 08:28:02,3-10:23:30,,,,agettyd -c noresetd,
+1,* filebeat,27359,1,root,2021-11-19 01:05:40,19-17:45:52,,,,/usr/share/filebeat/bin/filebeat --environment systemd -c /etc/filebeat/filebeat.yml --path.home /usr/share/filebeat --path.config /etc/filebeat --path.data ...,
+1,* python3,27371,1,root,2021-11-19 01:10:10,19-17:41:22,,1,,/usr/bin/python3 -u /usr/sbin/waagent -daemon,
+2,** python3,27968,27371,root,2021-11-19 01:32:03,19-17:19:29,,,,python3 -u bin/WALinuxAgent-198.18.11.64-py2.7.egg -run-exthandlers,
+1,* systemd-journal,27623,1,root,2021-11-19 01:31:32,19-17:20:00,,,,/lib/systemd/systemd-journald,
+1,* rsyslogd,31957,1,syslog,2021-11-19 01:35:35,19-17:15:57,,,,/usr/sbin/rsyslogd -n,
+0,kthreadd,2,0,root,2021-10-09 15:06:07,60-03:45:25,,84,,[kthreadd],
+1,* rcu_gp,3,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[rcu_gp],
+1,* rcu_par_gp,4,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[rcu_par_gp],
+1,* kworker/0:0H-kblockd,6,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[kworker/0:0H-kb],
+1,* mm_percpu_wq,9,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[mm_percpu_wq],
+1,* ksoftirqd/0,10,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[ksoftirqd/0],
+1,* rcu_sched,11,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[rcu_sched],
+1,* migration/0,12,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[migration/0],
+1,* cpuhp/0,13,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[cpuhp/0],
+1,* kdevtmpfs,14,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[kdevtmpfs],
+1,* netns,15,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[netns],
+1,* rcu_tasks_kthre,16,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[rcu_tasks_kthre],
+1,* kauditd,17,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[kauditd],
+1,* khungtaskd,18,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[khungtaskd],
+1,* oom_reaper,19,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[oom_reaper],
+1,* writeback,20,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[writeback],
+1,* kcompactd0,21,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[kcompactd0],
+1,* ksmd,22,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[ksmd],
+1,* khugepaged,23,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[khugepaged],
+1,* kintegrityd,69,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[kintegrityd],
+1,* kblockd,70,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[kblockd],
+1,* blkcg_punt_bio,71,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[blkcg_punt_bio],
+1,* tpm_dev_wq,72,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[tpm_dev_wq],
+1,* ata_sff,73,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[ata_sff],
+1,* md,74,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[md],
+1,* edac-poller,75,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[edac-poller],
+1,* hv_vmbus_con,76,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[hv_vmbus_con],
+1,* hv_pri_chan,77,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[hv_pri_chan],
+1,* hv_sub_chan,78,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[hv_sub_chan],
+1,* devfreq_wq,79,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[devfreq_wq],
+1,* watchdogd,80,2,root,2021-10-09 15:06:07,60-03:45:25,,,,[watchdogd],
+1,* kswapd0,83,2,root,2021-10-09 15:06:08,60-03:45:24,,,,[kswapd0],
+1,* ecryptfs-kthrea,84,2,root,2021-10-09 15:06:08,60-03:45:24,,,,[ecryptfs-kthrea],
+1,* kthrotld,86,2,root,2021-10-09 15:06:08,60-03:45:24,,,,[kthrotld],
+1,* nfit,87,2,root,2021-10-09 15:06:08,60-03:45:24,,,,[nfit],
+1,* scsi_eh_0,88,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_eh_0],
+1,* nvme-wq,90,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[nvme-wq],
+1,* nvme-reset-wq,91,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[nvme-reset-wq],
+1,* scsi_eh_1,92,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_eh_1],
+1,* scsi_tmf_0,94,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_tmf_0],
+1,* nvme-delete-wq,95,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[nvme-delete-wq],
+1,* scsi_eh_2,96,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_eh_2],
+1,* scsi_tmf_1,98,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_tmf_1],
+1,* scsi_tmf_2,99,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_tmf_2],
+1,* scsi_eh_3,100,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_eh_3],
+1,* scsi_tmf_3,101,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_tmf_3],
+1,* storvsc_error_w,102,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[storvsc_error_w],
+1,* storvsc_error_w,103,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[storvsc_error_w],
+1,* storvsc_error_w,104,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[storvsc_error_w],
+1,* storvsc_error_w,105,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[storvsc_error_w],
+1,* scsi_eh_4,106,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_eh_4],
+1,* scsi_tmf_4,107,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_tmf_4],
+1,* scsi_eh_5,109,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_eh_5],
+1,* scsi_tmf_5,110,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[scsi_tmf_5],
+1,* vfio-irqfd-clea,114,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[vfio-irqfd-clea],
+1,* kworker/0:1H-kblockd,116,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[kworker/0:1H-kb],
+1,* ipv6_addrconf,117,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[ipv6_addrconf],
+1,* kstrp,126,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[kstrp],
+1,* kworker/u3:0,129,2,root,2021-10-09 15:06:09,60-03:45:23,,,,[kworker/u3:0],
+1,* cryptd,202,2,root,2021-10-09 15:06:10,60-03:45:22,,,,[cryptd],
+1,* raid5wq,310,2,root,2021-10-09 15:06:12,60-03:45:20,,,,[raid5wq],
+1,* jbd2/sdb1-8,361,2,root,2021-10-09 15:06:12,60-03:45:20,,,,[jbd2/sdb1-8],
+1,* ext4-rsv-conver,362,2,root,2021-10-09 15:06:12,60-03:45:20,,,,[ext4-rsv-conver],
+1,* iscsi_eh,438,2,root,2021-10-09 15:06:14,60-03:45:18,,,,[iscsi_eh],
+1,* ib-comp-wq,448,2,root,2021-10-09 15:06:14,60-03:45:18,,,,[ib-comp-wq],
+1,* ib-comp-unb-wq,449,2,root,2021-10-09 15:06:14,60-03:45:18,,,,[ib-comp-unb-wq],
+1,* ib_mcast,451,2,root,2021-10-09 15:06:14,60-03:45:18,,,,[ib_mcast],
+1,* ib_nl_sa_wq,453,2,root,2021-10-09 15:06:14,60-03:45:18,,,,[ib_nl_sa_wq],
+1,* rdma_cm,455,2,root,2021-10-09 15:06:14,60-03:45:18,,,,[rdma_cm],
+1,* hv_balloon,477,2,root,2021-10-09 15:06:15,60-03:45:17,,,,[hv_balloon],
+1,* none,609,2,root,2021-10-09 15:06:17,60-03:45:15,,,,bpfilter_umh,
+1,* jbd2/sda1-8,993,2,root,2021-10-09 15:06:25,60-03:45:07,,,,[jbd2/sda1-8],
+1,* ext4-rsv-conver,994,2,root,2021-10-09 15:06:25,60-03:45:07,,,,[ext4-rsv-conver],
+1,* audit_prune_tre,2447,2,root,2021-10-09 15:07:16,60-03:44:16,,,,[audit_prune_tre],
+1,* kworker/u2:0-events_power_efficient,4674,2,root,2021-12-08 18:49:09,02:23,,,,[kworker/u2:0-ev],
+1,* xfsalloc,12395,2,root,2021-10-13 06:46:48,56-12:04:44,,,,[xfsalloc],
+1,* xfs_mru_cache,12403,2,root,2021-10-13 06:46:48,56-12:04:44,,,,[xfs_mru_cache],
+1,* jfsIO,12408,2,root,2021-10-13 06:46:48,56-12:04:44,,,,[jfsIO],
+1,* jfsCommit,12409,2,root,2021-10-13 06:46:48,56-12:04:44,,,,[jfsCommit],
+1,* jfsSync,12410,2,root,2021-10-13 06:46:48,56-12:04:44,,,,[jfsSync],
+1,* kworker/u2:1-events_power_efficient,17280,2,root,2021-12-08 18:19:36,31:56,,,,[kworker/u2:1-ev],
+1,* kworker/u2:3-events_power_efficient,19986,2,root,2021-12-08 17:28:38,01:22:54,,,,[kworker/u2:3-ev],
+1,* kworker/0:1-cgroup_destroy,22463,2,root,2021-12-08 15:49:39,03:01:53,,,,[kworker/0:1-cgr],
+1,* kworker/0:0-events,28904,2,root,2021-12-08 17:45:08,01:06:24,,,,[kworker/0:0-eve],
+1,* kworker/u2:2-events_power_efficient,32156,2,root,2021-12-08 18:42:23,09:09,,,,[kworker/u2:2-ev],
+0,ps,7206,,root,,,,,,ps auxwww,
+0,ps,7656,,root,,00:00,,,,"ps -eo pid,user,etime,args",
+0,ps,7746,,root,2021-12-08 18:51:34,,,,,"ps -eo pid,user,lstart,args",
+0,dash,7755,,,,,,,,,
+0,lsof,7978,,,,,,,,,
+0,lsof,7984,,,,,,,,,
+0,sleep,8078,,daemon,,,,,,,
+0,sleep,8081,,daemon,,,,,,,
+0,uac,8089,,root,,,,,,,
+0,top,8295,,root,,,,,,,
+0,uac,8385,,root,,,,,,/bin/sh ./uac full linux output,
+0,auomscollect,9278,,,,,,,,/opt/microsoft/auoms/bin/auomscollect,
+0,?,3991,,,,,,,,,"listed in hash_running_processes, named by nothing"
+0,?,4270,,,,,,,,,"listed in hash_running_processes, named by nothing"
+0,?,4478,,,,,,,,,"listed in hash_running_processes, named by nothing"
+0,?,5017,,,,,,,,,"listed in /proc, named by nothing"
+0,?,5064,,,,,,,,,"listed in /proc, named by nothing"
+0,?,5131,,,,,,,,,"listed in /proc, named by nothing"
+0,?,8987,,,,,,,,,"listed in /proc, named by nothing"
+0,?,11374,,,,,,,,,"listed in lsof, named by nothing"
+0,?,11421,,,,,,,,,"listed in lsof, named by nothing"
+0,?,11675,,,,,,,,,"listed in /proc, named by nothing"
+0,?,11712,,,,,,,,,"listed in /proc, named by nothing"
+0,?,11828,,,,,,,,,"listed in /proc, named by nothing"
+0,?,11829,,,,,,,,,"listed in /proc, named by nothing"
+0,?,11834,,,,,,,,,"listed in /proc, named by nothing"
+0,?,11950,,,,,,,,,"listed in /proc, named by nothing"
+0,?,11951,,,,,,,,,"listed in /proc, named by nothing"
+0,?,11957,,,,,,,,,"listed in /proc, named by nothing"
+0,?,12635,,,,,,,,,"listed in /proc, named by nothing"
+0,?,12637,,,,,,,,,"listed in /proc, named by nothing"
+0,?,12642,,,,,,,,,"listed in /proc, named by nothing"
+0,?,12685,,,,,,,,,"listed in /proc, named by nothing"
+0,?,12687,,,,,,,,,"listed in /proc, named by nothing"
+0,?,16786,,,,,,,,,"listed in /proc, named by nothing"
+0,?,16791,,,,,,,,,"listed in /proc, named by nothing"
+0,?,16797,,,,,,,,,"listed in /proc, named by nothing"
+0,?,19151,,,,,,,,,"listed in /proc, named by nothing"
+0,?,21035,,,,,,,,,"listed in /proc, named by nothing"
+0,?,21040,,,,,,,,,"listed in /proc, named by nothing"
+0,?,21398,,,,,,,,,"listed in /proc, named by nothing"
+0,?,21400,,,,,,,,,"listed in /proc, named by nothing"
+0,?,25195,,,,,,,,,"listed in /proc, named by nothing"
+0,?,25222,,,,,,,,,"listed in /proc, named by nothing"
+0,?,25379,,,,,,,,,"listed in /proc, named by nothing"
+0,?,26078,,,,,,,,,"listed in /proc, named by nothing"
+0,?,29370,,,,,,,,,"listed in /proc, named by nothing"
+0,?,29401,,,,,,,,,"listed in /proc, named by nothing"
+0,?,30647,,,,,,,,,"listed in /proc, hash_running_processes, named by nothing"
+0,?,30685,,,,,,,,,"listed in /proc, named by nothing"
+0,?,30687,,,,,,,,,"listed in /proc, named by nothing"
+0,?,32420,,,,,,,,,"listed in /proc, hash_running_processes, named by nothing"

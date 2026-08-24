@@ -1,0 +1,301 @@
+﻿timestamp_utc,timestamp_raw,host,process,pid,event,event_class,user,target_user,target_group,source_ip,port,tty,pwd,command,result,message,source
+2021-12-05 06:26:02,Dec  5 06:26:02,ApacheWebServer,CRON,20692,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:26:06,Dec  5 06:26:06,ApacheWebServer,CRON,20692,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:27:01,Dec  5 06:27:01,ApacheWebServer,CRON,21887,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:27:04,Dec  5 06:27:04,ApacheWebServer,CRON,19750,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:27:04,Dec  5 06:27:04,ApacheWebServer,CRON,21887,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:28:02,Dec  5 06:28:02,ApacheWebServer,CRON,23086,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:28:04,Dec  5 06:28:04,ApacheWebServer,CRON,23086,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:29:01,Dec  5 06:29:01,ApacheWebServer,CRON,23735,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:29:03,Dec  5 06:29:03,ApacheWebServer,CRON,23735,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:29:04,Dec  5 06:29:04,ApacheWebServer,sudo,,sudo command,priv,omsagent,root,,,,unknown,/,/opt/microsoft/omsagent/plugin/processinvestigator,success,omsagent : TTY=unknown ; PWD=/ ; USER=root ; COMMAND=/opt/microsoft/omsagent/plugin/processinvestigator,/var/log/auth.log
+2021-12-05 06:29:04,Dec  5 06:29:04,ApacheWebServer,sudo,,session opened,session,root,,,,,,,,success,pam_unix(sudo:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:29:16,Dec  5 06:29:16,ApacheWebServer,sudo,,session closed,session,root,,,,,,,,success,pam_unix(sudo:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:30:02,Dec  5 06:30:02,ApacheWebServer,CRON,23984,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:30:02,Dec  5 06:30:02,ApacheWebServer,CRON,23983,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:30:02,Dec  5 06:30:02,ApacheWebServer,CRON,23982,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:30:03,Dec  5 06:30:03,ApacheWebServer,CRON,23983,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:30:04,Dec  5 06:30:04,ApacheWebServer,CRON,23982,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:30:05,Dec  5 06:30:05,ApacheWebServer,CRON,23984,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:30:32,Dec  5 06:30:32,ApacheWebServer,sshd,24072,invalid user,auth,user,,,198.18.0.5,52506,,,,failure,Invalid user user from 198.18.0.5 port 52506,/var/log/auth.log
+2021-12-05 06:30:32,Dec  5 06:30:32,ApacheWebServer,sshd,24072,connection closed,auth,,,,198.18.0.5,52506,,,,success,Received disconnect from 198.18.0.5 port 52506:11: Bye Bye [preauth],/var/log/auth.log
+2021-12-05 06:30:32,Dec  5 06:30:32,ApacheWebServer,sshd,24072,connection closed,auth,user,,,198.18.0.5,52506,,,,failure,Disconnected from invalid user user 198.18.0.5 port 52506 [preauth],/var/log/auth.log
+2021-12-05 06:30:37,Dec  5 06:30:37,ApacheWebServer,sshd,24104,connection closed,auth,,,,198.18.0.68,37210,,,,success,Received disconnect from 198.18.0.68 port 37210:11:  [preauth],/var/log/auth.log
+2021-12-05 06:30:37,Dec  5 06:30:37,ApacheWebServer,sshd,24104,connection closed,auth,root,,,198.18.0.68,37210,,,,success,Disconnected from authenticating user root 198.18.0.68 port 37210 [preauth],/var/log/auth.log
+2021-12-05 06:31:01,Dec  5 06:31:01,ApacheWebServer,CRON,24165,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:31:03,Dec  5 06:31:03,ApacheWebServer,CRON,24165,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:32:01,Dec  5 06:32:01,ApacheWebServer,CRON,24401,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:32:03,Dec  5 06:32:03,ApacheWebServer,CRON,24401,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:33:01,Dec  5 06:33:01,ApacheWebServer,CRON,24616,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:33:04,Dec  5 06:33:04,ApacheWebServer,CRON,24616,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:34:01,Dec  5 06:34:01,ApacheWebServer,CRON,24825,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:34:03,Dec  5 06:34:03,ApacheWebServer,CRON,24825,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:35:01,Dec  5 06:35:01,ApacheWebServer,CRON,25282,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:35:01,Dec  5 06:35:01,ApacheWebServer,CRON,25281,session opened,session,omsagent,,,,,,,,success,pam_unix(cron:session): session opened for user omsagent by (uid=0),/var/log/auth.log
+2021-12-05 06:35:02,Dec  5 06:35:02,ApacheWebServer,CRON,25283,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:35:03,Dec  5 06:35:03,ApacheWebServer,CRON,25282,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:35:05,Dec  5 06:35:05,ApacheWebServer,CRON,25283,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:35:40,Dec  5 06:35:40,ApacheWebServer,sudo,,sudo command,priv,omsagent,root,,,,unknown,/opt/microsoft/omsconfig/Scripts/2.6x-2.7x,/opt/microsoft/omsconfig/Scripts/OMSAuditdPlugin.sh get /var/opt/microsoft/omsagent/00000000-0000-4000-8000-000000000001/tmp,success,omsagent : TTY=unknown ; PWD=/opt/microsoft/omsconfig/Scripts/2.6x-2.7x ; USER=root ; COMMAND=/opt/microsoft/omsconfig/Scripts/OMSAuditdPlugin.sh get /var/opt/microsoft/omsagent/00000000-0000-4000-8000-000000000001/tmp,/var/log/auth.log
+2021-12-05 06:35:40,Dec  5 06:35:40,ApacheWebServer,sudo,,session opened,session,root,,,,,,,,success,pam_unix(sudo:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:35:42,Dec  5 06:35:42,ApacheWebServer,sudo,,session closed,session,root,,,,,,,,success,pam_unix(sudo:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:35:47,Dec  5 06:35:47,ApacheWebServer,CRON,25281,session closed,session,omsagent,,,,,,,,success,pam_unix(cron:session): session closed for user omsagent,/var/log/auth.log
+2021-12-05 06:35:54,Dec  5 06:35:54,ApacheWebServer,sshd,26059,connection closed,auth,,,,198.18.0.96,38974,,,,success,Received disconnect from 198.18.0.96 port 38974:11: Bye Bye [preauth],/var/log/auth.log
+2021-12-05 06:35:54,Dec  5 06:35:54,ApacheWebServer,sshd,26059,connection closed,auth,,,,198.18.0.96,38974,,,,success,Disconnected from 198.18.0.96 port 38974 [preauth],/var/log/auth.log
+2021-12-05 06:36:01,Dec  5 06:36:01,ApacheWebServer,CRON,26192,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:36:04,Dec  5 06:36:04,ApacheWebServer,CRON,26192,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:37:01,Dec  5 06:37:01,ApacheWebServer,CRON,27398,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:37:03,Dec  5 06:37:03,ApacheWebServer,CRON,27398,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:38:01,Dec  5 06:38:01,ApacheWebServer,CRON,28638,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:38:03,Dec  5 06:38:03,ApacheWebServer,CRON,28638,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:39:01,Dec  5 06:39:01,ApacheWebServer,CRON,29855,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:39:04,Dec  5 06:39:04,ApacheWebServer,CRON,29855,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:40:01,Dec  5 06:40:01,ApacheWebServer,CRON,30807,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:40:01,Dec  5 06:40:01,ApacheWebServer,CRON,30808,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:40:02,Dec  5 06:40:02,ApacheWebServer,CRON,30807,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:40:03,Dec  5 06:40:03,ApacheWebServer,CRON,30808,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:41:01,Dec  5 06:41:01,ApacheWebServer,CRON,30991,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:41:03,Dec  5 06:41:03,ApacheWebServer,CRON,30991,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:42:01,Dec  5 06:42:01,ApacheWebServer,CRON,31231,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:42:03,Dec  5 06:42:03,ApacheWebServer,CRON,31231,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:42:53,Dec  5 06:42:53,ApacheWebServer,sshd,31431,invalid user,auth,user,,,198.18.0.5,60562,,,,failure,Invalid user user from 198.18.0.5 port 60562,/var/log/auth.log
+2021-12-05 06:42:53,Dec  5 06:42:53,ApacheWebServer,sshd,31431,connection closed,auth,,,,198.18.0.5,60562,,,,success,Received disconnect from 198.18.0.5 port 60562:11: Bye Bye [preauth],/var/log/auth.log
+2021-12-05 06:42:53,Dec  5 06:42:53,ApacheWebServer,sshd,31431,connection closed,auth,user,,,198.18.0.5,60562,,,,failure,Disconnected from invalid user user 198.18.0.5 port 60562 [preauth],/var/log/auth.log
+2021-12-05 06:43:01,Dec  5 06:43:01,ApacheWebServer,CRON,31447,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:43:04,Dec  5 06:43:04,ApacheWebServer,CRON,31447,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:44:01,Dec  5 06:44:01,ApacheWebServer,CRON,31621,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:44:02,Dec  5 06:44:02,ApacheWebServer,CRON,31621,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:45:02,Dec  5 06:45:02,ApacheWebServer,CRON,31949,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:45:02,Dec  5 06:45:02,ApacheWebServer,CRON,31948,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:45:02,Dec  5 06:45:02,ApacheWebServer,CRON,31950,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:45:02,Dec  5 06:45:02,ApacheWebServer,CRON,31948,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:45:03,Dec  5 06:45:03,ApacheWebServer,CRON,31949,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:45:05,Dec  5 06:45:05,ApacheWebServer,CRON,31950,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:46:01,Dec  5 06:46:01,ApacheWebServer,CRON,32223,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:46:03,Dec  5 06:46:03,ApacheWebServer,CRON,32223,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:47:02,Dec  5 06:47:02,ApacheWebServer,CRON,606,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:47:02,Dec  5 06:47:02,ApacheWebServer,CRON,607,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:47:06,Dec  5 06:47:06,ApacheWebServer,CRON,607,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:47:18,Dec  5 06:47:18,ApacheWebServer,CRON,606,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:48:02,Dec  5 06:48:02,ApacheWebServer,CRON,1780,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:48:06,Dec  5 06:48:06,ApacheWebServer,CRON,1780,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:49:02,Dec  5 06:49:02,ApacheWebServer,CRON,2562,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:49:05,Dec  5 06:49:05,ApacheWebServer,CRON,2562,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:50:02,Dec  5 06:50:02,ApacheWebServer,CRON,3371,session opened,session,omsagent,,,,,,,,success,pam_unix(cron:session): session opened for user omsagent by (uid=0),/var/log/auth.log
+2021-12-05 06:50:02,Dec  5 06:50:02,ApacheWebServer,CRON,3372,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:50:03,Dec  5 06:50:03,ApacheWebServer,CRON,3373,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:50:06,Dec  5 06:50:06,ApacheWebServer,CRON,3372,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:50:10,Dec  5 06:50:10,ApacheWebServer,CRON,3373,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:51:03,Dec  5 06:51:03,ApacheWebServer,CRON,4123,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:51:12,Dec  5 06:51:12,ApacheWebServer,CRON,4123,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:51:14,Dec  5 06:51:14,ApacheWebServer,sshd,4112,connection closed,auth,,,,198.18.7.88,43219,,,,success,Connection reset by 198.18.7.88 port 43219 [preauth],/var/log/auth.log
+2021-12-05 06:51:35,Dec  5 06:51:35,ApacheWebServer,sudo,,sudo command,priv,omsagent,root,,,,unknown,/opt/microsoft/omsconfig/Scripts/2.6x-2.7x,/opt/microsoft/omsconfig/Scripts/OMSAuditdPlugin.sh get /var/opt/microsoft/omsagent/00000000-0000-4000-8000-000000000001/tmp,success,omsagent : TTY=unknown ; PWD=/opt/microsoft/omsconfig/Scripts/2.6x-2.7x ; USER=root ; COMMAND=/opt/microsoft/omsconfig/Scripts/OMSAuditdPlugin.sh get /var/opt/microsoft/omsagent/00000000-0000-4000-8000-000000000001/tmp,/var/log/auth.log
+2021-12-05 06:51:36,Dec  5 06:51:36,ApacheWebServer,sudo,,session opened,session,root,,,,,,,,success,pam_unix(sudo:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:51:39,Dec  5 06:51:39,ApacheWebServer,sudo,,session closed,session,root,,,,,,,,success,pam_unix(sudo:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:51:49,Dec  5 06:51:49,ApacheWebServer,CRON,3371,session closed,session,omsagent,,,,,,,,success,pam_unix(cron:session): session closed for user omsagent,/var/log/auth.log
+2021-12-05 06:52:01,Dec  5 06:52:01,ApacheWebServer,CRON,4861,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:52:02,Dec  5 06:52:02,ApacheWebServer,sshd,4849,connection closed,auth,,,,198.18.0.57,42694,,,,success,Received disconnect from 198.18.0.57 port 42694:11:  [preauth],/var/log/auth.log
+2021-12-05 06:52:02,Dec  5 06:52:02,ApacheWebServer,sshd,4849,connection closed,auth,root,,,198.18.0.57,42694,,,,success,Disconnected from authenticating user root 198.18.0.57 port 42694 [preauth],/var/log/auth.log
+2021-12-05 06:52:04,Dec  5 06:52:04,ApacheWebServer,CRON,4861,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:52:57,Dec  5 06:52:57,ApacheWebServer,sudo,,sudo command,priv,omsagent,root,,,,unknown,/opt/microsoft/omsconfig/Scripts/2.6x-2.7x,/opt/microsoft/omsconfig/Scripts/OMSAptUpdates.sh,success,omsagent : TTY=unknown ; PWD=/opt/microsoft/omsconfig/Scripts/2.6x-2.7x ; USER=root ; COMMAND=/opt/microsoft/omsconfig/Scripts/OMSAptUpdates.sh,/var/log/auth.log
+2021-12-05 06:52:58,Dec  5 06:52:58,ApacheWebServer,sudo,,session opened,session,root,,,,,,,,success,pam_unix(sudo:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:53:02,Dec  5 06:53:02,ApacheWebServer,CRON,5658,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:53:06,Dec  5 06:53:06,ApacheWebServer,CRON,5658,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:54:03,Dec  5 06:54:03,ApacheWebServer,CRON,6255,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:54:08,Dec  5 06:54:08,ApacheWebServer,CRON,6255,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:54:10,Dec  5 06:54:10,ApacheWebServer,sshd,6274,,,,,,,,,,,,Did not receive identification string from 198.18.0.112 port 44740,/var/log/auth.log
+2021-12-05 06:54:59,Dec  5 06:54:59,ApacheWebServer,sshd,6569,invalid user,auth,user,,,198.18.0.112,37802,,,,failure,Invalid user user from 198.18.0.112 port 37802,/var/log/auth.log
+2021-12-05 06:55:00,Dec  5 06:55:00,ApacheWebServer,sshd,6569,connection closed,auth,,,,198.18.0.112,37802,,,,success,"Received disconnect from 198.18.0.112 port 37802:11: Normal Shutdown, Thank you for playing [preauth]",/var/log/auth.log
+2021-12-05 06:55:00,Dec  5 06:55:00,ApacheWebServer,sshd,6569,connection closed,auth,user,,,198.18.0.112,37802,,,,failure,Disconnected from invalid user user 198.18.0.112 port 37802 [preauth],/var/log/auth.log
+2021-12-05 06:55:03,Dec  5 06:55:03,ApacheWebServer,CRON,6583,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:55:03,Dec  5 06:55:03,ApacheWebServer,CRON,6582,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:55:06,Dec  5 06:55:06,ApacheWebServer,CRON,6582,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:55:17,Dec  5 06:55:17,ApacheWebServer,CRON,6583,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:56:07,Dec  5 06:56:07,ApacheWebServer,CRON,6750,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:56:12,Dec  5 06:56:12,ApacheWebServer,CRON,6750,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:57:03,Dec  5 06:57:03,ApacheWebServer,CRON,6915,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:57:12,Dec  5 06:57:12,ApacheWebServer,CRON,6915,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:58:02,Dec  5 06:58:02,ApacheWebServer,CRON,7081,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:58:04,Dec  5 06:58:04,ApacheWebServer,CRON,7081,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:58:27,Dec  5 06:58:27,ApacheWebServer,sudo,,session closed,session,root,,,,,,,,success,pam_unix(sudo:session): session closed for user root,/var/log/auth.log
+2021-12-05 06:59:06,Dec  5 06:59:06,ApacheWebServer,CRON,7660,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 06:59:10,Dec  5 06:59:10,ApacheWebServer,CRON,7660,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:00:11,Dec  5 07:00:11,ApacheWebServer,CRON,8268,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:00:11,Dec  5 07:00:11,ApacheWebServer,CRON,8269,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:00:11,Dec  5 07:00:11,ApacheWebServer,CRON,8270,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:00:12,Dec  5 07:00:12,ApacheWebServer,CRON,8269,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:00:12,Dec  5 07:00:12,ApacheWebServer,CRON,8268,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:00:12,Dec  5 07:00:12,ApacheWebServer,CRON,8270,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:01:05,Dec  5 07:01:05,ApacheWebServer,CRON,8691,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:01:15,Dec  5 07:01:15,ApacheWebServer,CRON,8691,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:02:06,Dec  5 07:02:06,ApacheWebServer,CRON,8879,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:02:09,Dec  5 07:02:09,ApacheWebServer,CRON,8879,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:03:10,Dec  5 07:03:10,ApacheWebServer,CRON,9035,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:03:11,Dec  5 07:03:11,ApacheWebServer,CRON,9035,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:04:06,Dec  5 07:04:06,ApacheWebServer,CRON,9208,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:04:09,Dec  5 07:04:09,ApacheWebServer,CRON,9208,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:05:15,Dec  5 07:05:15,ApacheWebServer,CRON,9401,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:05:16,Dec  5 07:05:16,ApacheWebServer,CRON,9402,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:05:17,Dec  5 07:05:17,ApacheWebServer,CRON,9398,session opened,session,omsagent,,,,,,,,success,pam_unix(cron:session): session opened for user omsagent by (uid=0),/var/log/auth.log
+2021-12-05 07:05:17,Dec  5 07:05:17,ApacheWebServer,CRON,9401,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:05:21,Dec  5 07:05:21,ApacheWebServer,CRON,9402,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:06:15,Dec  5 07:06:15,ApacheWebServer,CRON,9556,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:06:15,Dec  5 07:06:15,ApacheWebServer,CRON,9556,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:07:14,Dec  5 07:07:14,ApacheWebServer,CRON,9715,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:07:14,Dec  5 07:07:14,ApacheWebServer,sshd,9733,invalid user,auth,user,,,198.18.0.3,62268,,,,failure,Invalid user user from 198.18.0.3 port 62268,/var/log/auth.log
+2021-12-05 07:07:14,Dec  5 07:07:14,ApacheWebServer,sshd,9733,connection closed,auth,,,,198.18.0.3,62268,,,,success,Received disconnect from 198.18.0.3 port 62268:11: Bye Bye [preauth],/var/log/auth.log
+2021-12-05 07:07:14,Dec  5 07:07:14,ApacheWebServer,sshd,9733,connection closed,auth,user,,,198.18.0.3,62268,,,,failure,Disconnected from invalid user user 198.18.0.3 port 62268 [preauth],/var/log/auth.log
+2021-12-05 07:07:14,Dec  5 07:07:14,ApacheWebServer,CRON,9715,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:07:25,Dec  5 07:07:25,ApacheWebServer,sshd,9540,connection closed,auth,,,,198.18.0.68,30573,,,,success,Connection reset by 198.18.0.68 port 30573 [preauth],/var/log/auth.log
+2021-12-05 07:08:14,Dec  5 07:08:14,ApacheWebServer,CRON,9873,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:08:16,Dec  5 07:08:16,ApacheWebServer,CRON,9873,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:08:26,Dec  5 07:08:26,ApacheWebServer,sshd,9960,invalid user,auth,cloud,,,198.18.0.5,44872,,,,failure,Invalid user cloud from 198.18.0.5 port 44872,/var/log/auth.log
+2021-12-05 07:08:31,Dec  5 07:08:31,ApacheWebServer,sshd,9960,connection closed,auth,,,,198.18.0.5,44872,,,,success,Received disconnect from 198.18.0.5 port 44872:11: Bye Bye [preauth],/var/log/auth.log
+2021-12-05 07:08:31,Dec  5 07:08:31,ApacheWebServer,sshd,9960,connection closed,auth,cloud,,,198.18.0.5,44872,,,,failure,Disconnected from invalid user cloud 198.18.0.5 port 44872 [preauth],/var/log/auth.log
+2021-12-05 07:09:23,Dec  5 07:09:23,ApacheWebServer,CRON,10025,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:09:24,Dec  5 07:09:24,ApacheWebServer,CRON,10025,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:10:23,Dec  5 07:10:23,ApacheWebServer,CRON,10225,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:10:24,Dec  5 07:10:24,ApacheWebServer,CRON,10226,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:10:24,Dec  5 07:10:24,ApacheWebServer,CRON,10225,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:10:25,Dec  5 07:10:25,ApacheWebServer,CRON,10226,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:11:08,Dec  5 07:11:08,ApacheWebServer,CRON,10463,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:11:13,Dec  5 07:11:13,ApacheWebServer,CRON,10463,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:12:23,Dec  5 07:12:23,ApacheWebServer,CRON,10709,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:12:24,Dec  5 07:12:24,ApacheWebServer,CRON,10709,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:13:28,Dec  5 07:13:28,ApacheWebServer,CRON,11002,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:13:28,Dec  5 07:13:28,ApacheWebServer,CRON,11002,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:14:26,Dec  5 07:14:26,ApacheWebServer,CRON,11307,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:14:27,Dec  5 07:14:27,ApacheWebServer,CRON,11307,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:15:32,Dec  5 07:15:32,ApacheWebServer,CRON,11585,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:15:32,Dec  5 07:15:32,ApacheWebServer,CRON,11584,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:15:33,Dec  5 07:15:33,ApacheWebServer,CRON,11586,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:15:33,Dec  5 07:15:33,ApacheWebServer,CRON,11585,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:15:33,Dec  5 07:15:33,ApacheWebServer,CRON,11584,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:15:33,Dec  5 07:15:33,ApacheWebServer,CRON,11586,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:16:03,Dec  5 07:16:03,ApacheWebServer,CRON,11918,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:16:12,Dec  5 07:16:12,ApacheWebServer,CRON,11918,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:17:04,Dec  5 07:17:04,ApacheWebServer,CRON,12251,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:17:08,Dec  5 07:17:08,ApacheWebServer,CRON,12252,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:17:08,Dec  5 07:17:08,ApacheWebServer,CRON,12251,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:17:14,Dec  5 07:17:14,ApacheWebServer,CRON,12252,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:18:06,Dec  5 07:18:06,ApacheWebServer,CRON,12584,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:18:15,Dec  5 07:18:15,ApacheWebServer,CRON,12584,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 07:19:07,Dec  5 07:19:07,ApacheWebServer,CRON,12894,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 07:19:15,Dec  5 07:19:15,ApacheWebServer,CRON,12894,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:31,Dec  5 08:25:31,ApacheWebServer,CRON,13190,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13189,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13188,session opened,session,omsagent,,,,,,,,success,pam_unix(cron:session): session opened for user omsagent by (uid=0),/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13189,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13190,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13399,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,sudo,,sudo command,priv,omsagent,root,,,,unknown,/,/opt/microsoft/omsagent/ruby/bin/ruby /opt/microsoft/omsagent/plugin/collectantimalwareinfo.rb,success,omsagent : TTY=unknown ; PWD=/ ; USER=root ; COMMAND=/opt/microsoft/omsagent/ruby/bin/ruby /opt/microsoft/omsagent/plugin/collectantimalwareinfo.rb,/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,sudo,,session opened,session,root,,,,,,,,success,pam_unix(sudo:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,sshd,13398,,,,,,,,,,,,ssh_dispatch_run_fatal: Connection from 198.18.0.62 port 30706: Broken pipe [preauth],/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,9398,session closed,session,omsagent,,,,,,,,success,pam_unix(cron:session): session closed for user omsagent,/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13399,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13586,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,sshd,13643,connection closed,auth,,,,198.18.0.5,43106,,,,success,Connection closed by 198.18.0.5 port 43106 [preauth],/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13586,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:32,Dec  5 08:25:32,ApacheWebServer,CRON,13815,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,13815,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14043,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14043,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14262,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14264,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14262,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14264,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14465,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,sshd,14592,,,,,,,,,,,,ssh_dispatch_run_fatal: Connection from 198.18.0.55 port 8808: Broken pipe [preauth],/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,sshd,14585,,,,,,,,,,,,Did not receive identification string from 198.18.0.55 port 22392,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,sshd,14600,,,,,,,,,,,,ssh_dispatch_run_fatal: Connection from 198.18.0.55 port 8814: Broken pipe [preauth],/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14465,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14646,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14646,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,sudo,,session closed,session,root,,,,,,,,success,pam_unix(sudo:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14862,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,14862,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,15097,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,CRON,15097,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,sudo,,sudo command,priv,omsagent,root,,,,unknown,/,/opt/microsoft/omsagent/plugin/processinvestigator,success,omsagent : TTY=unknown ; PWD=/ ; USER=root ; COMMAND=/opt/microsoft/omsagent/plugin/processinvestigator,/var/log/auth.log
+2021-12-05 08:25:33,Dec  5 08:25:33,ApacheWebServer,sudo,,session opened,session,root,,,,,,,,success,pam_unix(sudo:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:34,Dec  5 08:25:34,ApacheWebServer,CRON,15336,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:34,Dec  5 08:25:34,ApacheWebServer,CRON,15332,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:34,Dec  5 08:25:34,ApacheWebServer,CRON,15333,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:34,Dec  5 08:25:34,ApacheWebServer,sudo,,session closed,session,root,,,,,,,,success,pam_unix(sudo:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:34,Dec  5 08:25:34,ApacheWebServer,CRON,15333,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:34,Dec  5 08:25:34,ApacheWebServer,CRON,15332,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,15336,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,15585,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,15585,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,sshd,15760,connection closed,auth,,,,198.18.0.57,27422,,,,success,Received disconnect from 198.18.0.57 port 27422:11:  [preauth],/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,sshd,15760,connection closed,auth,root,,,198.18.0.57,27422,,,,success,Disconnected from authenticating user root 198.18.0.57 port 27422 [preauth],/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,15833,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,15833,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,16065,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,16065,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,16308,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,16308,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,16575,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,16574,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:35,Dec  5 08:25:35,ApacheWebServer,CRON,16573,session opened,session,omsagent,,,,,,,,success,pam_unix(cron:session): session opened for user omsagent by (uid=0),/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,CRON,16574,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,sshd,16690,,,,,,,,,,,,ssh_dispatch_run_fatal: Connection from 198.18.0.3 port 59058: Broken pipe [preauth],/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,CRON,16575,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,CRON,16757,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,CRON,16757,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,CRON,16957,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,CRON,16957,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,CRON,17129,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:36,Dec  5 08:25:36,ApacheWebServer,CRON,13188,session closed,session,omsagent,,,,,,,,success,pam_unix(cron:session): session closed for user omsagent,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17129,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17316,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17316,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17494,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17493,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17493,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17494,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17680,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,sshd,17669,connection closed,auth,,,,198.18.0.76,26403,,,,success,Received disconnect from 198.18.0.76 port 26403:11:  [preauth],/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,sshd,17669,connection closed,auth,root,,,198.18.0.76,26403,,,,success,Disconnected from authenticating user root 198.18.0.76 port 26403 [preauth],/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17680,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17853,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,sshd,17912,,,,,,,,,,,,Did not receive identification string from 198.18.11.69 port 42639,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17853,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17996,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,17996,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18161,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18161,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18331,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18332,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18330,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18331,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18330,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18332,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18463,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18463,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,sshd,18563,invalid user,auth,minecraft,,,198.18.0.8,32346,,,,failure,Invalid user minecraft from 198.18.0.8 port 32346,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,sshd,18563,connection closed,auth,,,,198.18.0.8,32346,,,,success,Received disconnect from 198.18.0.8 port 32346:11: Bye Bye [preauth],/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,sshd,18563,connection closed,auth,minecraft,,,198.18.0.8,32346,,,,failure,Disconnected from invalid user minecraft 198.18.0.8 port 32346 [preauth],/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18610,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18610,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18754,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18754,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18876,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18876,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18987,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18988,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:37,Dec  5 08:25:37,ApacheWebServer,CRON,18986,session opened,session,omsagent,,,,,,,,success,pam_unix(cron:session): session opened for user omsagent by (uid=0),/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,18987,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,19079,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,sshd,19107,,,,,,,,,,,,ssh_dispatch_run_fatal: Connection from 198.18.0.66 port 25072: Broken pipe [preauth],/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,18988,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,19157,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,19225,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,19079,session closed,session,root,,,,,,,,success,pam_unix(cron:session): session closed for user root,/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,19319,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,19295,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,19324,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:38,Dec  5 08:25:38,ApacheWebServer,CRON,19366,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:39,Dec  5 08:25:39,ApacheWebServer,CRON,19532,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:39,Dec  5 08:25:39,ApacheWebServer,CRON,19531,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:39,Dec  5 08:25:39,ApacheWebServer,CRON,19413,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
+2021-12-05 08:25:39,Dec  5 08:25:39,ApacheWebServer,CRON,19452,session opened,session,root,,,,,,,,success,pam_unix(cron:session): session opened for user root by (uid=0),/var/log/auth.log
