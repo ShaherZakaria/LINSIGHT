@@ -1,34 +1,36 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"
      role="img" aria-label="Linsight">
   <title>Linsight</title>
-  <defs>
-    <!-- Only what falls inside the lens is re-drawn in severity colour. -->
-    <clipPath id="lens">
-      <circle cx="158" cy="104" r="52"/>
-    </clipPath>
-  </defs>
 
   <rect width="256" height="256" rx="52" fill="#0f1419"/>
 
-  <!-- the collection: rows of raw artifact output, undifferentiated -->
-  <g fill="#2b3440">
-    <rect x="34" y="54"  width="132" height="14" rx="7"/>
-    <rect x="34" y="82"  width="180" height="14" rx="7"/>
-    <rect x="34" y="110" width="104" height="14" rx="7"/>
-    <rect x="34" y="138" width="158" height="14" rx="7"/>
-    <rect x="34" y="166" width="120" height="14" rx="7"/>
+  <!-- The pyramid is the severity distribution, drawn: a handful of CRITICAL
+       at the apex over a wide base of INFO. Courses are separated by a 3px
+       gap so the bands read as cut stone rather than a gradient. -->
+  <g>
+    <polygon points="128,40 147.6,70.6 108.4,70.6"                     fill="#ff5f56"/>
+    <polygon points="108.4,73.6 147.6,73.6 167.2,104.2 88.8,104.2"     fill="#ff9f43"/>
+    <polygon points="88.8,107.2 167.2,107.2 186.8,137.8 69.2,137.8"    fill="#ffd93d"/>
+    <polygon points="69.2,140.8 186.8,140.8 206.4,171.4 49.6,171.4"    fill="#5ad1e6"/>
+    <polygon points="49.6,174.4 206.4,174.4 226,205 30,205"            fill="#8b98a8"/>
   </g>
 
-  <!-- the same rows, ranked, but only where the lens is looking -->
-  <g clip-path="url(#lens)">
-    <rect x="34" y="54"  width="132" height="14" rx="7" fill="#ff5f56"/>
-    <rect x="34" y="82"  width="180" height="14" rx="7" fill="#ff9f43"/>
-    <rect x="34" y="110" width="104" height="14" rx="7" fill="#ffd93d"/>
-    <rect x="34" y="138" width="158" height="14" rx="7" fill="#5ad1e6"/>
+  <!-- Eye of Horus - the wedjat, sight and protection. Knocked out in the
+       background colour and outlined, so it stays legible over whichever
+       course it crosses. -->
+  <g transform="translate(128,132)" fill="none" stroke="#0f1419"
+     stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-40,-2 Q-6,-28 38,-11 Q3,18 -40,-2 Z"/>
+    <path d="M-36,-21 Q-2,-42 42,-25"/>
+    <path d="M-7,13 Q-15,28 -23,34"/>
+    <path d="M25,9 Q38,28 19,32 Q28,25 22,19"/>
   </g>
-
-  <!-- the lens -->
-  <circle cx="158" cy="104" r="52" fill="none" stroke="#58a6ff" stroke-width="13"/>
-  <line x1="196" y1="142" x2="224" y2="170"
-        stroke="#58a6ff" stroke-width="18" stroke-linecap="round"/>
+  <g transform="translate(128,132)" fill="none" stroke="#f5d067"
+     stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-40,-2 Q-6,-28 38,-11 Q3,18 -40,-2 Z" fill="#0f1419"/>
+    <path d="M-36,-21 Q-2,-42 42,-25"/>
+    <path d="M-7,13 Q-15,28 -23,34"/>
+    <path d="M25,9 Q38,28 19,32 Q28,25 22,19"/>
+    <circle cx="1" cy="-7" r="7.5" fill="#f5d067" stroke="none"/>
+  </g>
 </svg>
