@@ -157,6 +157,14 @@ python linsight.py .\uac-ApacheWebServer-linux-20211208202503.tar --sigma .\sigm
 python linsight.py --help
 ```
 
+## Where this fits
+
+[`COMPARISON.md`](COMPARISON.md) places linsight against Dissect, Plaso/Timesketch
+and the rest — including the cases where you should reach for one of those
+instead. Short version: Dissect is the better tool for the copied filesystem and
+for disk images; linsight parses the `live_response/` command output that neither
+Dissect nor Plaso reads, and ranks what it finds.
+
 ## Caveats
 
 - Linux collections only. Windows/macOS artifacts are not parsed.
