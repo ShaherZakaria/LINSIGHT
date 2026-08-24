@@ -16,9 +16,9 @@ uac-*-linux-*/
 /findings.html
 /timeline.csv
 
-# Sigma rule cache
+# Sigma rule cache (the vendored snapshot in /sigma-rules is tracked)
 .uac_triage/
-/sigma-rules/
+.linsight/
 
 # Python
 __pycache__/
