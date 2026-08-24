@@ -14378,301 +14378,6 @@ def write_tables_json(tables, path, meta=None):
 
 # -- HTML browser ------------------------------------------------------------
 
-HTML_BROWSER_CSS = """
-:root{--bg:#0f1419;--panel:#161b22;--line:#2b3440;--fg:#d7dee7;--dim:#8b98a8;
---accent:#58a6ff;--crit:#ff5f56;--high:#ff9f43;--med:#ffd93d;--low:#5ad1e6;--info:#8b98a8}
-*{box-sizing:border-box}
-body{margin:0;font:13px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-background:var(--bg);color:var(--fg)}
-header{padding:14px 18px;border-bottom:1px solid var(--line);background:var(--panel);
-position:sticky;top:0;z-index:5}
-header h1{margin:0 0 4px;font-size:16px;letter-spacing:.3px}
-header .meta{color:var(--dim);font-size:12px}
-.layout{display:flex;min-height:calc(100vh - 62px)}
-nav{width:290px;flex:0 0 290px;border-right:1px solid var(--line);background:var(--panel);
-overflow-y:auto;max-height:calc(100vh - 62px);position:sticky;top:62px}
-nav .cat{padding:9px 14px 4px;color:var(--dim);font-size:11px;text-transform:uppercase;
-letter-spacing:.8px}
-nav a{display:flex;justify-content:space-between;gap:8px;padding:6px 14px;color:var(--fg);
-text-decoration:none;border-left:3px solid transparent;cursor:pointer}
-nav a:hover{background:#1c2330}
-nav a.active{background:#1c2330;border-left-color:var(--accent);color:var(--accent)}
-nav a .n{color:var(--dim);font-variant-numeric:tabular-nums;font-size:11px}
-main{flex:1;padding:16px 18px;overflow-x:auto;min-width:0}
-h2{margin:0 0 4px;font-size:15px}
-.desc{color:var(--dim);margin:0 0 12px;font-size:12px}
-.controls{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
-input[type=search]{background:#0d1117;border:1px solid var(--line);color:var(--fg);
-padding:6px 10px;border-radius:5px;min-width:280px;font-size:13px}
-.badge{background:#0d1117;border:1px solid var(--line);border-radius:11px;padding:2px 9px;
-color:var(--dim);font-size:11px}
-.warn{color:var(--high)}
-/* fixed layout so the <colgroup> widths computed from the data are what the
-   browser actually uses - with auto layout one long cell drags its column
-   wide and squeezes every other column into a ragged strip */
-/* min-width so a narrow table still fills the pane - fixed layout then shares
-   the spare width across the columns instead of leaving a ragged right edge */
-table{border-collapse:collapse;font-size:12px;table-layout:fixed;min-width:100%}
-th,td{border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top;
-overflow-wrap:anywhere}
-/* a cell taller than this scrolls inside itself, so one 4000-character
-   evidence blob cannot push the next row off the screen */
-td .c{white-space:pre-wrap;max-height:8.5em;overflow-y:auto}
-td.nw .c{white-space:nowrap;overflow-x:hidden;text-overflow:ellipsis}
-td.nw:hover .c{overflow-x:auto;text-overflow:clip}
-th{background:#1c2330;position:sticky;top:62px;z-index:4;cursor:pointer;user-select:none;
-white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-th:hover{color:var(--accent)}
-/* the per-column filter row sits directly under the labels; its offset is set
-   from the measured label height in wire(), because the two rows have to stay
-   glued together when the body scrolls under them */
-tr.f th{background:var(--panel);padding:3px 4px;cursor:auto;z-index:3}
-tr.f th:hover{color:inherit}
-tr.f input{width:100%;background:#0d1117;border:1px solid var(--line);color:var(--fg);
-border-radius:3px;padding:2px 5px;font:11px/1.5 inherit}
-tr.f input:focus{outline:none;border-color:var(--accent)}
-tr.f input.on{border-color:var(--accent);background:#10243d;color:#fff}
-button.clr{background:#0d1117;border:1px solid var(--line);color:var(--dim);
-border-radius:11px;padding:2px 9px;font-size:11px;cursor:pointer}
-button.clr:hover{color:var(--accent);border-color:var(--accent)}
-tbody tr:nth-child(even){background:#12171e}
-tbody tr:hover{background:#1a212b}
-td.num{text-align:right;font-variant-numeric:tabular-nums}
-.sev-CRITICAL{color:var(--crit);font-weight:600}
-.sev-HIGH{color:var(--high);font-weight:600}
-.sev-MEDIUM{color:var(--med)}
-.sev-LOW{color:var(--low)}
-.sev-INFO{color:var(--info)}
-.empty{color:var(--dim);padding:20px 0}
-@media(max-width:900px){.layout{flex-direction:column}nav{width:100%;max-height:220px;
-position:static;flex:none}th{position:static}}
-"""
-
-HTML_BROWSER_JS = """
-var TB=window.__TABLES__,IDX=window.__INDEX__,cur=null,sortCol=-1,sortAsc=true;
-var colFilters=[],lay=null;   /* per-column filter text; measured column layout */
-function esc(s){return String(s).replace(/[&<>]/g,function(c){
- return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
-function buildNav(){
- var byCat={},order=[];
- IDX.forEach(function(t){if(!byCat[t.category]){byCat[t.category]=[];order.push(t.category);}
-  byCat[t.category].push(t);});
- var h='';
- order.forEach(function(c){h+='<div class="cat">'+esc(c||'Other')+'</div>';
-  byCat[c].forEach(function(t){h+='<a data-name="'+esc(t.name)+'"><span>'+esc(t.name)+
-   '</span><span class="n">'+t.rows.toLocaleString()+'</span></a>';});});
- document.getElementById('nav').innerHTML=h;
- [].forEach.call(document.querySelectorAll('nav a'),function(a){
-  a.onclick=function(){show(a.getAttribute('data-name'));};});
-}
-function show(name){
- cur=name;sortCol=-1;colFilters=[];   /* filters are per table, not sticky */
- [].forEach.call(document.querySelectorAll('nav a'),function(a){
-  a.classList.toggle('active',a.getAttribute('data-name')===name);});
- document.getElementById('q').value='';
- render();
- location.hash=name;
-}
-/* Per-column width from the rows on screen, not from the widest value in the
-   table: sizing to the maximum lets a single long cell decide the layout, and
-   every other column ends up too narrow to read. The 90th percentile fits the
-   rows being scanned and leaves the outliers to wrap or scroll in place.
-   Recomputed per render so it follows the filter - narrowing to one noisy
-   process should retighten the columns around what is left. */
-function layout(t,rows,cap){
- var n=t.columns.length,out=[],step=Math.max(1,Math.floor(cap/200));
- for(var j=0;j<n;j++){
-  var lens=[],num=(rows.length>0),seen=0;
-  for(var i=0;i<cap;i+=step){
-   var v=rows[i][j];if(v===undefined||v===null||v==='')continue;
-   v=String(v);seen++;
-   if(num&&!/^-?[\\d.]+$/.test(v))num=false;
-   var parts=v.split('\\n'),m=0;
-   for(var k=0;k<parts.length;k++)if(parts[k].length>m)m=parts[k].length;
-   lens.push(m);
-  }
-  lens.sort(function(a,b){return a-b;});
-  var p90=lens.length?lens[Math.min(lens.length-1,Math.floor(lens.length*0.9))]:0;
-  var chars=Math.max(t.columns[j].length+2,p90);
-  /* Short columns keep their content on one line; long ones wrap. The
-     threshold sits above a UTC timestamp (19 chars) on purpose - wrapping
-     '2026-06-11 12:24:57' onto two lines doubles the height of every row in
-     the table for no gain. */
-  var nw=(p90<=28&&!num)||(num&&seen);
-  var px=Math.round(chars*7.2)+18;
-  out.push({w:Math.max(64,Math.min(nw?300:460,px)),num:(num&&seen>0),nw:nw});
- }
- return out;
-}
-function sortRows(rows){
- return rows.slice().sort(function(a,b){
-  var x=a[sortCol]||'',y=b[sortCol]||'';
-  var nx=parseFloat(x),ny=parseFloat(y);
-  var c=(!isNaN(nx)&&!isNaN(ny)&&/^-?[\\d.]+$/.test(x)&&/^-?[\\d.]+$/.test(y))
-       ?nx-ny:String(x).localeCompare(String(y));
-  return sortAsc?c:-c;});
-}
-/* The global box searches the whole row; a per-column box searches only its
-   own column. They combine with AND, which is what makes them worth having
-   separately - 'sshd' anywhere plus user=root is a different question from
-   either on its own. */
-function matching(t){
- var q=document.getElementById('q').value.toLowerCase();
- var rows=t.rows;
- if(q){rows=rows.filter(function(r){return r.join(' ').toLowerCase().indexOf(q)>=0;});}
- var act=[];
- for(var i=0;i<colFilters.length;i++){
-  if(colFilters[i]){act.push([i,colFilters[i].toLowerCase()]);}}
- if(act.length){rows=rows.filter(function(r){
-  for(var k=0;k<act.length;k++){
-   var v=r[act[k][0]];v=(v===undefined||v===null)?'':String(v);
-   if(v.toLowerCase().indexOf(act[k][1])<0){return false;}}
-  return true;});}
- if(sortCol>=0){rows=sortRows(rows);}
- return rows;
-}
-/* Excel offers a tick-list of a column's distinct values; the same idea here
-   is a <datalist>, so a low-cardinality column (level, user, process, status)
-   suggests what is actually in it instead of making you guess. Columns whose
-   values are long or nearly unique get no list - a dropdown of 60 different
-   log messages is noise. */
-function options(t,j){
- var seen={},n=0,step=Math.max(1,Math.floor(t.rows.length/4000));
- for(var i=0;i<t.rows.length;i+=step){
-  var v=t.rows[i][j];v=(v===undefined||v===null)?'':String(v);
-  if(!v){continue;}
-  if(v.length>48){return null;}
-  if(!seen[v]){seen[v]=1;n++;if(n>60){return null;}}}
- return n>1?Object.keys(seen).sort():null;
-}
-function bodyHtml(t,rows,cap){
- var sevIdx=t.columns.indexOf('severity'),h='';
- for(var i=0;i<cap;i++){
-  var r=rows[i];h+='<tr>';
-  for(var j=0;j<t.columns.length;j++){
-   var v=r[j]===undefined?'':r[j];
-   var cls=(sevIdx===j)?'sev-'+esc(v):(lay[j].num?'num':'');
-   if(lay[j].nw){cls+=(cls?' ':'')+'nw';}
-   h+='<td'+(cls?' class="'+cls+'"':'')+'><div class="c">'+esc(v)+'</div></td>';}
-  h+='</tr>';}
- return h;
-}
-/* Only the tbody and the counters are rebuilt, never the filter inputs:
-   replacing an input while it has focus loses the caret, which makes it
-   impossible to type more than one character into a filter. */
-function refresh(){
- var t=TB[cur];if(!t){return;}
- var rows=matching(t);
- var cap=rows.length>t.cap?t.cap:rows.length;
- var tb=document.getElementById('tb');
- if(tb){tb.innerHTML=bodyHtml(t,rows,cap);}
- var mn=document.getElementById('matchn');
- if(mn){mn.textContent=rows.length.toLocaleString()+' matching';}
- var note=document.getElementById('note');
- if(note){note.innerHTML=rows.length>cap?'Showing first '+cap.toLocaleString()+
-  ' of '+rows.length.toLocaleString()+' matching rows. Narrow the filter, or use'+
-  ' the CSV / JSON export for everything.':'';}
- var none=document.getElementById('none');
- if(none){none.style.display=rows.length?'none':'block';}
- [].forEach.call(document.querySelectorAll('tr.f input'),function(inp){
-  inp.classList.toggle('on',!!inp.value);});
-}
-function render(){
- var t=TB[cur];if(!t){return;}
- var rows=matching(t);
- var cap=rows.length>t.cap?t.cap:rows.length;
- var h='<h2>'+esc(t.title)+' <span class="badge">'+t.name+'</span></h2>';
- h+='<p class="desc">'+esc(t.description||'');
- if(t.sources&&t.sources.length){h+='<br>sources: '+esc(t.sources.join(', '));}
- h+='</p>';
- h+='<div class="controls"><span class="badge">'+t.row_count.toLocaleString()+
-    ' rows total</span><span class="badge" id="matchn">'+rows.length.toLocaleString()+
-    ' matching</span><button class="clr" id="clr">clear filters</button>';
- if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
-   t.rows.length.toLocaleString()+' \\u2014 full data in the CSV / JSON export</span>';}
- h+='</div>';
- /* the layout is measured once per table, not per keystroke - columns that
-    resize while you are typing into them are worse than columns that do not */
- lay=layout(t,rows.length?rows:t.rows,Math.max(cap,1));
- /* table-layout:fixed only honours the <colgroup> if the table itself has a
-    width. Left to 'auto' the browser falls back to shrink-to-fit and sizes
-    column 1 from its content - which is how IOCS ended up with a 3567px
-    'indicator' beside a 58px 'seen_in'. Sum the columns and say so. */
- var total=0,elastic=-1,widest=0;
- lay.forEach(function(L,i){total+=L.w;
-  /* only a wrapping column is a candidate: extra width buys it another line
-     of visible text, whereas a one-line column just gains blank space */
-  if(!L.num&&!L.nw&&L.w>widest){widest=L.w;elastic=i;}});
- var avail=Math.max(320,(document.getElementById('main').clientWidth||0)-38);
- var stretch=total<avail;
- /* Hand the slack to the widest wrapping column rather than letting fixed
-    layout spread it proportionally - a 297px 'seen_in_count' is padding, the
-    same pixels on 'seen_in' are another line of the value worth reading. With
-    no wrapping column to give it to (a table of short fields), fall back to
-    proportional so the table still fills the pane instead of stretching one
-    column to 1000px of whitespace. */
- h+='<table style="width:'+(stretch?avail:total)+'px"><colgroup>';
- lay.forEach(function(L,i){
-  h+=(stretch&&i===elastic)?'<col>':'<col style="width:'+L.w+'px">';});
- h+='</colgroup><thead><tr id="hdr">';
- t.columns.forEach(function(c,i){
-  var mark=sortCol===i?(sortAsc?' \\u25b2':' \\u25bc'):'';
-  h+='<th data-i="'+i+'" title="'+esc(c)+' \\u2014 click to sort">'+
-     '<span class="lbl">'+esc(c)+mark+'</span></th>';});
- h+='</tr><tr class="f" id="frow">';
- var lists='';
- t.columns.forEach(function(c,i){
-  var opts=options(t,i),lid='';
-  if(opts){lid='dl_'+i;
-   lists+='<datalist id="'+lid+'">';
-   opts.forEach(function(o){lists+='<option value="'+esc(o).replace(/"/g,'&quot;')+'">';});
-   lists+='</datalist>';}
-  h+='<th><input data-i="'+i+'" placeholder="filter '+esc(c)+'"'+
-     (lid?' list="'+lid+'"':'')+' value="'+esc(colFilters[i]||'').replace(/"/g,'&quot;')+
-     '"></th>';});
- h+='</tr></thead><tbody id="tb">'+bodyHtml(t,rows,cap)+'</tbody></table>'+lists;
- h+='<div class="empty" id="none"'+(rows.length?' style="display:none"':'')+
-    '>No rows match.</div>';
- h+='<p class="desc" id="note">'+(rows.length>cap?'Showing first '+cap.toLocaleString()+
-  ' of '+rows.length.toLocaleString()+' matching rows. Narrow the filter, or use'+
-  ' the CSV / JSON export for everything.':'')+'</p>';
- document.getElementById('main').innerHTML=h;
- wire();
-}
-function wire(){
- [].forEach.call(document.querySelectorAll('#hdr th'),function(th){
-  th.onclick=function(){var i=+th.getAttribute('data-i');
-   if(sortCol===i){sortAsc=!sortAsc;}else{sortCol=i;sortAsc=true;}
-   /* repaint the sort arrows in place rather than re-rendering the head,
-      which would take the filter inputs and their values with it */
-   [].forEach.call(document.querySelectorAll('#hdr th'),function(o){
-    var j=+o.getAttribute('data-i');
-    o.querySelector('.lbl').textContent=TB[cur].columns[j]+
-     (sortCol===j?(sortAsc?' \\u25b2':' \\u25bc'):'');});
-   refresh();};});
- [].forEach.call(document.querySelectorAll('tr.f input'),function(inp){
-  var i=+inp.getAttribute('data-i');
-  inp.oninput=function(){colFilters[i]=inp.value;refresh();};
-  /* the input lives inside a th whose click handler sorts - without this,
-     clicking into a filter box would reorder the table under the cursor */
-  inp.onclick=function(e){e.stopPropagation();};});
- var clr=document.getElementById('clr');
- if(clr){clr.onclick=function(){
-  colFilters=[];document.getElementById('q').value='';
-  [].forEach.call(document.querySelectorAll('tr.f input'),function(i){i.value='';});
-  refresh();};}
- /* glue the filter row to the bottom of the label row, measured rather than
-    assumed - the label height moves with the font and the zoom level */
- var hdr=document.getElementById('hdr'),frow=document.getElementById('frow');
- if(hdr&&frow){
-  var top=62+hdr.getBoundingClientRect().height;
-  [].forEach.call(frow.querySelectorAll('th'),function(th){th.style.top=top+'px';});}
-}
-document.getElementById('q').oninput=refresh;
-buildNav();
-show((location.hash||'').replace('#','')||IDX[0].name);
-"""
-
 
 def _script_json(obj):
     """JSON safe to embed inside a <script> element.
@@ -14693,32 +14398,52 @@ def _script_json(obj):
     return json.dumps(obj).replace("<", "\\u003c")
 
 
-def write_tables_html(tables, path, html_cap=2000, meta=None):
-    """Self-contained browser: sidebar of tables, live filter, sortable columns."""
-    index, payload = [], {}
+def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
+                      opts=None):
+    """The console: triage views and every artifact table in one page.
+
+    Self-contained by design - no server, no CDN, no fetch. The box that reads
+    a triage collection is routinely the box that is not allowed to fetch
+    anything, so the payload is embedded and the CSS and JS are inline.
+
+    `tri` is optional: without it the page is the artifact browser alone, which
+    is what a single-table export (--process-map p.html) should still produce.
+    """
+    esc = htmllib.escape
+    index, tbls = [], {}
     for t in tables:
         index.append({"name": t.name, "title": t.title,
                       "category": t.category or "Other", "rows": len(t)})
         d = t.as_dict(limit=html_cap)
         d["cap"] = 500          # rows rendered at once in the DOM
-        payload[t.name] = d
-    meta = meta or {}
-    head = "".join('<div>%s: %s</div>' % (htmllib.escape(str(k)), htmllib.escape(str(v)))
-                   for k, v in meta.items())
+        tbls[t.name] = d
+
+    payload = {"meta": [], "counts": {s: 0 for s in SEVERITIES}, "findings": [],
+               "events": [], "iocs": [], "names": {}, "tactics": {},
+               "order": ATTACK_ORDER, "version": VERSION,
+               "index": index, "tables": tbls}
+    if tri is not None:
+        payload.update(_triage_payload(tri, opts))
+    elif meta:
+        payload["meta"] = [[k, str(v)] for k, v in meta.items() if v]
+
+    host = (tri.meta.get("Hostname") if tri is not None else None) or            (meta or {}).get("Hostname") or "collection"
+    src = tri.col.path if tri is not None else (meta or {}).get("Collection", "")
+
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("<!doctype html><html><head><meta charset='utf-8'>"
                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                 "<title>UAC artifact browser</title><style>%s</style></head><body>"
-                 % HTML_BROWSER_CSS)
-        fh.write("<header><h1>UAC artifact browser</h1><div class='meta'>%s</div></header>"
-                 % head)
-        fh.write("<div class='layout'><nav id='nav'></nav><main>"
-                 "<div class='controls'><input type='search' id='q' "
-                 "placeholder='filter rows in this table...'></div>"
-                 "<div id='main'></div></main></div>")
-        fh.write("<script>window.__INDEX__=%s;window.__TABLES__=%s;</script>"
-                 % (_script_json(index), _script_json(payload)))
-        fh.write("<script>%s</script></body></html>" % HTML_BROWSER_JS)
+                 "<title>linsight - %s</title><style>%s</style></head><body>"
+                 % (esc(str(host)), APP_CSS))
+        fh.write("<header><div class='brand'><b>linsight</b>"
+                 "<span>PARSE LINUX DEEP. HUNT THE MALICIOUS.</span></div>"
+                 "<div class='host'><b>%s</b> &nbsp;<code>%s</code></div>"
+                 "<div class='chips' id='chips'></div></header>"
+                 % (esc(str(host)), esc(str(src))))
+        fh.write("<div class='layout'><nav id='nav'></nav>"
+                 "<main id='main'></main></div>")
+        fh.write("<script>window.__LINSIGHT__=%s;</script>" % _script_json(payload))
+        fh.write("<script>%s</script></body></html>" % APP_JS)
 
 
 def write_single_table(table, path, html_cap=100000):
@@ -14747,7 +14472,7 @@ def _check_output_paths(col, opts):
         return
     base = os.path.abspath(col.path)
     for path in (opts.export, opts.csv_dir, opts.tables_json, opts.tables_html,
-                 opts.json, opts.html, opts.gui, opts.timeline, opts.process_map):
+                 opts.json, opts.html, opts.timeline, opts.process_map):
         if not path:
             continue
         full = os.path.abspath(path)
@@ -14832,9 +14557,10 @@ def export_tables(tri, col, opts, tb=None):
         print("[+] combined table JSON written to %s" % json_path, file=sys.stderr)
     if html_path:
         t0 = time.perf_counter()
-        write_tables_html(tables, html_path, opts.html_rows, meta)
+        write_tables_html(tables, html_path, opts.html_rows, meta, tri, opts)
         writer_times.append(("write HTML browser", time.perf_counter() - t0))
-        print("[+] artifact browser written to %s" % html_path, file=sys.stderr)
+        print("[+] console written to %s (%d findings, %d tables)"
+              % (html_path, len(tri.findings), len(tables)), file=sys.stderr)
     if opts.process_map:
         master = next((t for t in tables if t.name == "PROCESS_MASTER"), None)
         if master is None:
@@ -15268,7 +14994,7 @@ def _gui_label(mitre, tech):
     return "" if _TECH_RE.match(rest) else rest[:60]
 
 
-GUI_CSS = """
+APP_CSS = """
 :root{--bg:#0f1419;--panel:#161b22;--panel2:#1c2330;--line:#2b3440;--fg:#d7dee7;
 --dim:#8b98a8;--accent:#58a6ff;--gold:#f5d067;
 --CRITICAL:#ff5f56;--HIGH:#ff9f43;--MEDIUM:#ffd93d;--LOW:#5ad1e6;--INFO:#8b98a8}
@@ -15301,8 +15027,8 @@ font-variant-numeric:tabular-nums;user-select:none}
 .chip.off{opacity:.42;text-decoration:line-through}
 
 .layout{display:flex;height:calc(100vh - 56px)}
-nav{width:186px;flex:0 0 186px;background:var(--panel);border-right:1px solid var(--line);
-padding:10px 0;display:flex;flex-direction:column}
+nav{width:248px;flex:0 0 248px;background:var(--panel);border-right:1px solid var(--line);
+padding:10px 0;display:flex;flex-direction:column;overflow-y:auto}
 nav a{display:flex;justify-content:space-between;align-items:center;gap:8px;
 padding:7px 14px;color:var(--fg);border-left:3px solid transparent;cursor:pointer}
 nav a:hover{background:var(--panel2)}
@@ -15310,7 +15036,7 @@ nav a.active{background:var(--panel2);border-left-color:var(--gold);color:var(--
 nav a .n{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
 nav .foot{margin-top:auto;padding:10px 14px;color:var(--dim);font-size:10.5px;
 border-top:1px solid var(--line)}
-main{flex:1;overflow:auto;padding:16px 18px}
+main{flex:1;overflow:auto;padding:16px 18px;min-width:0}
 h2{margin:0 0 12px;font-size:14px;font-weight:600;letter-spacing:.3px}
 h3{margin:22px 0 9px;font-size:12px;font-weight:600;color:var(--dim);
 text-transform:uppercase;letter-spacing:1px}
@@ -15344,7 +15070,7 @@ border:1px solid var(--line);border-radius:6px;padding:8px}
 .axis{display:flex;justify-content:space-between;color:var(--dim);font-size:10.5px;
 padding:4px 2px 0}
 table.meta{border-collapse:collapse;font-size:12px}
-table.meta td{padding:3px 14px 3px 0;vertical-align:top}
+table.meta td{padding:3px 14px 3px 0;vertical-align:top;border:0}
 table.meta td:first-child{color:var(--dim);white-space:nowrap}
 
 /* ---- findings ---- */
@@ -15408,11 +15134,68 @@ td.wrap{word-break:break-word}
 .more{margin:12px 0;padding:7px;text-align:center;border:1px dashed var(--line);
 border-radius:5px;color:var(--dim);cursor:pointer}
 .more:hover{color:var(--fg);border-color:var(--accent)}
+/* nav: the five views, then every table under its category */
+nav .cat{padding:12px 14px 4px;color:var(--dim);font-size:10px;text-transform:uppercase;
+letter-spacing:1px}
+nav .sec{margin-top:6px;border-top:1px solid var(--line);padding-top:4px}
+nav a.tbl{padding:5px 14px;font-size:12px}
+nav a.tbl span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ---- tables ----
+   Scoped to .tbl: the console has tables of its own (the timeline, the
+   indicator list, the collection metadata) and fixed layout with measured
+   column widths is right for an artifact grid and wrong for those. */
+.desc{color:var(--dim);margin:0 0 12px;font-size:12px}
+.controls{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.badge{background:#0d1117;border:1px solid var(--line);border-radius:11px;padding:2px 9px;
+color:var(--dim);font-size:11px;white-space:nowrap}
+.warn{color:var(--HIGH)}
+/* fixed layout so the <colgroup> widths computed from the data are what the
+   browser actually uses - with auto layout one long cell drags its column
+   wide and squeezes every other column into a ragged strip */
+/* min-width so a narrow table still fills the pane - fixed layout then shares
+   the spare width across the columns instead of leaving a ragged right edge */
+table.tbl{border-collapse:collapse;font-size:12px;table-layout:fixed;min-width:100%}
+.tbl th,.tbl td{border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top;
+overflow-wrap:anywhere}
+/* a cell taller than this scrolls inside itself, so one 4000-character
+   evidence blob cannot push the next row off the screen */
+.tbl td .c{white-space:pre-wrap;max-height:8.5em;overflow-y:auto}
+.tbl td.nw .c{white-space:nowrap;overflow-x:hidden;text-overflow:ellipsis}
+.tbl td.nw:hover .c{overflow-x:auto;text-overflow:clip}
+.tbl th{background:#1c2330;position:sticky;top:0;z-index:4;cursor:pointer;user-select:none;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tbl th:hover{color:var(--accent)}
+/* the per-column filter row sits directly under the labels; its offset is set
+   from the measured label height in wire(), because the two rows have to stay
+   glued together when the body scrolls under them */
+.tbl tr.f th{background:var(--panel);padding:3px 4px;cursor:auto;z-index:3}
+.tbl tr.f th:hover{color:inherit}
+.tbl tr.f input{width:100%;background:#0d1117;border:1px solid var(--line);color:var(--fg);
+border-radius:3px;padding:2px 5px;font:11px/1.5 inherit}
+.tbl tr.f input:focus{outline:none;border-color:var(--accent)}
+.tbl tr.f input.on{border-color:var(--accent);background:#10243d;color:#fff}
+button.clr{background:#0d1117;border:1px solid var(--line);color:var(--dim);
+border-radius:11px;padding:2px 9px;font-size:11px;cursor:pointer}
+button.clr:hover{color:var(--accent);border-color:var(--accent)}
+.tbl tbody tr:nth-child(even){background:#12171e}
+.tbl tbody tr:hover{background:#1a212b}
+.tbl td.num{text-align:right;font-variant-numeric:tabular-nums}
+.sev-CRITICAL{color:var(--CRITICAL);font-weight:600}
+.sev-HIGH{color:var(--HIGH);font-weight:600}
+.sev-MEDIUM{color:var(--MEDIUM)}
+.sev-LOW{color:var(--LOW)}
+.sev-INFO{color:var(--INFO)}
 """
 
-GUI_JS = """
+APP_JS = """
 var D=window.__LINSIGHT__,SEV=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
-var st={view:'overview',sev:{},q:'',cat:'',tech:'',sel:null,page:400,bucket:null};
+var st={view:'overview',sev:{},q:'',cat:'',tech:'',sel:null,page:400,bucket:null,
+        table:null,tq:''};
+var TB=D.tables||{},IDX=D.index||[];
+var VIEWS=[['overview','Overview',null],['findings','Findings',0],
+ ['attack','ATT&CK',null],['timeline','Timeline',(D.events||[]).length],
+ ['iocs','Indicators',(D.iocs||[]).length]];
 var TLB=[];   /* the timeline chart's bucket bounds, from the last render */
 SEV.forEach(function(s){st.sev[s]=true;});
 
@@ -15435,14 +15218,24 @@ function match(f){
 }
 function findings(){return D.findings.filter(match);}
 
-function setView(v){
+function setView(v,name){
  st.view=v;st.page=400;
- [].forEach.call(document.querySelectorAll('nav a'),function(a){
-  a.classList.toggle('active',a.getAttribute('data-v')===v);});
- location.hash=v;
+ if(v==='table'&&name!==st.table){st.table=name;sortCol=-1;colFilters=[];st.tq='';}
+ location.hash=(v==='table')?'t/'+st.table:v;
  render();
 }
+/* The nav is built once; only the highlight moves, because rebuilding 89
+   anchors on every keystroke is work nobody asked for. */
+function markNav(){
+ [].forEach.call(document.querySelectorAll('nav a'),function(a){
+  a.classList.toggle('active',st.view==='table'
+   ?a.getAttribute('data-t')===st.table
+   :a.getAttribute('data-v')===st.view);});
+}
 function chips(){
+ /* A page written without the triage half has nothing for them to filter, so
+    five zeroes in the header would be furniture rather than a control. */
+ if(!D.findings.length&&!D.events.length){el('chips').innerHTML='';return;}
  var h='';
  SEV.forEach(function(s){
   h+='<button class="chip '+s+' '+(st.sev[s]?'on':'off')+'" data-s="'+s+'">'+
@@ -15521,10 +15314,15 @@ function viewOverview(){
    needs them to turn a click back into a time range. */
 function histo(ev,n,h_px,clickable){
  if(!ev.length)return {html:'<div class="empty">no dated events</div>',b:[]};
- var t0=ev[0].e,t1=ev[ev.length-1].e,span=Math.max(1,t1-t0),b=[],i;
+ /* Span from the extremes rather than from the ends of the list: the payload
+    is sorted, but a filtered view is only as ordered as what it kept, and one
+    event before ev[0] would otherwise land in a negative bucket. */
+ var t0=ev[0].e,t1=t0,i;
+ ev.forEach(function(e){if(e.e<t0)t0=e.e;if(e.e>t1)t1=e.e;});
+ var span=Math.max(1,t1-t0),b=[];
  for(i=0;i<n;i++)b.push({n:0,s:{},t0:t0+span*i/n,t1:t0+span*(i+1)/n});
  ev.forEach(function(e){
-  var k=Math.min(n-1,Math.floor((e.e-t0)*n/span));
+  var k=Math.max(0,Math.min(n-1,Math.floor((e.e-t0)*n/span)));
   b[k].n++;b[k].s[e.s]=(b[k].s[e.s]||0)+1;});
  var max=0;b.forEach(function(x){if(x.n>max)max=x.n;});
  max=max||1;
@@ -15692,12 +15490,16 @@ function viewIocs(){
 
 /* ---------- render + wiring ---------- */
 function render(){
+ /* A table renders itself - it owns its sort, its column filters and its
+    caret, none of which survive being rebuilt from a string. */
+ if(st.view==='table'){tRender();markNav();return;}
  var m=el('main');
  m.innerHTML=st.view==='findings'?viewFindings():
              st.view==='attack'?viewAttack():
              st.view==='timeline'?viewTimeline():
              st.view==='iocs'?viewIocs():viewOverview();
  wire();
+ markNav();
  el('nFind').textContent=findings().length;
 }
 function wire(){
@@ -15735,18 +15537,50 @@ function wire(){
    if(a==='cat'){st.cat=k;setView('findings');}
    else if(a==='tech'){st.tech=k;setView('findings');}};});
 }
+/* Views first, then every table under its category. A page written without
+   the triage half (one table exported on its own) shows only the tables, and
+   one written without tables is the console alone - the same nav covers both
+   rather than each half carrying its own. */
+function buildNav(){
+ var h='';
+ if(D.findings.length||D.events.length){
+  VIEWS.forEach(function(v){
+   var n=v[2]==null?'':'<span class="n"'+(v[0]==='findings'?' id="nFind"':'')+'>'+
+     (v[0]==='findings'?'':v[2])+'</span>';
+   h+='<a data-v="'+v[0]+'">'+v[1]+n+'</a>';});}
+ if(IDX.length){
+  var byCat={},order=[];
+  IDX.forEach(function(t){
+   if(!byCat[t.category]){byCat[t.category]=[];order.push(t.category);}
+   byCat[t.category].push(t);});
+  h+='<div class="sec"></div>';
+  order.forEach(function(c){
+   h+='<div class="cat">'+esc(c||'Other')+'</div>';
+   byCat[c].forEach(function(t){
+    h+='<a class="tbl" data-t="'+esc(t.name)+'" title="'+esc(t.title)+'"><span>'+
+       esc(t.name)+'</span><span class="n">'+t.rows.toLocaleString()+'</span></a>';});});}
+ el('nav').innerHTML=h;
+ [].forEach.call(document.querySelectorAll('nav a'),function(a){
+  a.onclick=function(){
+   var t=a.getAttribute('data-t');
+   setView(t?'table':a.getAttribute('data-v'),t);};});
+}
 function start(){
  chips();
- [].forEach.call(document.querySelectorAll('nav a'),function(a){
-  a.onclick=function(){setView(a.getAttribute('data-v'));};});
- el('nFind').textContent=D.findings.length;
+ buildNav();
+ if(el('nFind'))el('nFind').textContent=D.findings.length;
  var v=(location.hash||'').replace('#','');
- setView(['overview','findings','attack','timeline','iocs'].indexOf(v)>=0?v:'overview');
+ if(v.indexOf('t/')===0&&TB[v.slice(2)])setView('table',v.slice(2));
+ else if(['overview','findings','attack','timeline','iocs'].indexOf(v)>=0&&
+         (D.findings.length||D.events.length))setView(v);
+ else if(D.findings.length||D.events.length)setView('overview');
+ else if(IDX.length)setView('table',IDX[0].name);
  document.onkeydown=function(e){
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
   var k=e.key;
   if(k==='/'){var q=el('q');if(q){q.focus();e.preventDefault();}}
-  if(k>='1'&&k<='5')setView(['overview','findings','attack','timeline','iocs'][+k-1]);
+  if(k>='1'&&k<='5'&&D.findings.length)setView(['overview','findings','attack',
+   'timeline','iocs'][+k-1]);
   /* j/k walk the finding list without leaving the keyboard, the way the
      console report is read. */
   if(st.view==='findings'&&(k==='j'||k==='k')){
@@ -15759,19 +15593,225 @@ function start(){
     var sel=document.querySelector('.row.sel');
     if(sel&&sel.scrollIntoView)sel.scrollIntoView({block:'nearest'});}}};
 }
+
+
+/* ---------- tables ---------- */
+var sortCol=-1,sortAsc=true;
+var colFilters=[],lay=null;   /* per-column filter text; measured column tLayout */
+
+
+
+/* Per-column width from the rows on screen, not from the widest value in the
+   table: sizing to the maximum lets a single long cell decide the tLayout, and
+   every other column ends up too narrow to read. The 90th percentile fits the
+   rows being scanned and leaves the outliers to wrap or scroll in place.
+   Recomputed per tRender so it follows the filter - narrowing to one noisy
+   process should retighten the columns around what is left. */
+function tLayout(t,rows,cap){
+ var n=t.columns.length,out=[],step=Math.max(1,Math.floor(cap/200));
+ for(var j=0;j<n;j++){
+  var lens=[],num=(rows.length>0),seen=0;
+  for(var i=0;i<cap;i+=step){
+   var v=rows[i][j];if(v===undefined||v===null||v==='')continue;
+   v=String(v);seen++;
+   if(num&&!/^-?[\\d.]+$/.test(v))num=false;
+   var parts=v.split('\\n'),m=0;
+   for(var k=0;k<parts.length;k++)if(parts[k].length>m)m=parts[k].length;
+   lens.push(m);
+  }
+  lens.sort(function(a,b){return a-b;});
+  var p90=lens.length?lens[Math.min(lens.length-1,Math.floor(lens.length*0.9))]:0;
+  var chars=Math.max(t.columns[j].length+2,p90);
+  /* Short columns keep their content on one line; long ones wrap. The
+     threshold sits above a UTC timestamp (19 chars) on purpose - wrapping
+     '2026-06-11 12:24:57' onto two lines doubles the height of every row in
+     the table for no gain. */
+  var nw=(p90<=28&&!num)||(num&&seen);
+  var px=Math.round(chars*7.2)+18;
+  out.push({w:Math.max(64,Math.min(nw?300:460,px)),num:(num&&seen>0),nw:nw});
+ }
+ return out;
+}
+function tSortRows(rows){
+ return rows.slice().sort(function(a,b){
+  var x=a[sortCol]||'',y=b[sortCol]||'';
+  var nx=parseFloat(x),ny=parseFloat(y);
+  var c=(!isNaN(nx)&&!isNaN(ny)&&/^-?[\\d.]+$/.test(x)&&/^-?[\\d.]+$/.test(y))
+       ?nx-ny:String(x).localeCompare(String(y));
+  return sortAsc?c:-c;});
+}
+/* The global box searches the whole row; a per-column box searches only its
+   own column. They combine with AND, which is what makes them worth having
+   separately - 'sshd' anywhere plus user=root is a different question from
+   either on its own. */
+function tMatching(t){
+ var q=(st.tq||'').toLowerCase();
+ var rows=t.rows;
+ if(q){rows=rows.filter(function(r){return r.join(' ').toLowerCase().indexOf(q)>=0;});}
+ var act=[];
+ for(var i=0;i<colFilters.length;i++){
+  if(colFilters[i]){act.push([i,colFilters[i].toLowerCase()]);}}
+ if(act.length){rows=rows.filter(function(r){
+  for(var k=0;k<act.length;k++){
+   var v=r[act[k][0]];v=(v===undefined||v===null)?'':String(v);
+   if(v.toLowerCase().indexOf(act[k][1])<0){return false;}}
+  return true;});}
+ if(sortCol>=0){rows=tSortRows(rows);}
+ return rows;
+}
+/* Excel offers a tick-list of a column's distinct values; the same idea here
+   is a <datalist>, so a low-cardinality column (level, user, process, status)
+   suggests what is actually in it instead of making you guess. Columns whose
+   values are long or nearly unique get no list - a dropdown of 60 different
+   log messages is noise. */
+function tOptions(t,j){
+ var seen={},n=0,step=Math.max(1,Math.floor(t.rows.length/4000));
+ for(var i=0;i<t.rows.length;i+=step){
+  var v=t.rows[i][j];v=(v===undefined||v===null)?'':String(v);
+  if(!v){continue;}
+  if(v.length>48){return null;}
+  if(!seen[v]){seen[v]=1;n++;if(n>60){return null;}}}
+ return n>1?Object.keys(seen).sort():null;
+}
+function tBodyHtml(t,rows,cap){
+ var sevIdx=t.columns.indexOf('severity'),h='';
+ for(var i=0;i<cap;i++){
+  var r=rows[i];h+='<tr>';
+  for(var j=0;j<t.columns.length;j++){
+   var v=r[j]===undefined?'':r[j];
+   var cls=(sevIdx===j)?'sev-'+esc(v):(lay[j].num?'num':'');
+   if(lay[j].nw){cls+=(cls?' ':'')+'nw';}
+   h+='<td'+(cls?' class="'+cls+'"':'')+'><div class="c">'+esc(v)+'</div></td>';}
+  h+='</tr>';}
+ return h;
+}
+/* Only the tbody and the counters are rebuilt, never the filter inputs:
+   replacing an input while it has focus loses the caret, which makes it
+   impossible to type more than one character into a filter. */
+function tRefresh(){
+ var t=TB[st.table];if(!t){return;}
+ var rows=tMatching(t);
+ var cap=rows.length>t.cap?t.cap:rows.length;
+ var tb=document.getElementById('tb');
+ if(tb){tb.innerHTML=tBodyHtml(t,rows,cap);}
+ var mn=document.getElementById('matchn');
+ if(mn){mn.textContent=rows.length.toLocaleString()+' matching';}
+ var note=document.getElementById('note');
+ if(note){note.innerHTML=rows.length>cap?'Showing first '+cap.toLocaleString()+
+  ' of '+rows.length.toLocaleString()+' matching rows. Narrow the filter, or use'+
+  ' the CSV / JSON export for everything.':'';}
+ var none=document.getElementById('none');
+ if(none){none.style.display=rows.length?'none':'block';}
+ [].forEach.call(document.querySelectorAll('tr.f input'),function(inp){
+  inp.classList.toggle('on',!!inp.value);});
+}
+function tRender(){
+ var t=TB[st.table];if(!t){return;}
+ var rows=tMatching(t);
+ var cap=rows.length>t.cap?t.cap:rows.length;
+ var h='<h2>'+esc(t.title)+' <span class="badge">'+t.name+'</span></h2>';
+ h+='<p class="desc">'+esc(t.description||'');
+ if(t.sources&&t.sources.length){h+='<br>sources: '+esc(t.sources.join(', '));}
+ h+='</p>';
+ h+='<div class="controls"><input type="search" id="q" placeholder="filter rows '+
+    'in this table..." value="'+esc(st.tq||'')+'"><span class="badge">'+t.row_count.toLocaleString()+
+    ' rows total</span><span class="badge" id="matchn">'+rows.length.toLocaleString()+
+    ' matching</span><button class="clr" id="clr">clear filters</button>';
+ if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
+   t.rows.length.toLocaleString()+' \\u2014 full data in the CSV / JSON export</span>';}
+ h+='</div>';
+ /* the layout is measured once per table, not per keystroke - columns that
+    resize while you are typing into them are worse than columns that do not */
+ lay=tLayout(t,rows.length?rows:t.rows,Math.max(cap,1));
+ /* table-layout:fixed only honours the <colgroup> if the table itself has a
+    width. Left to 'auto' the browser falls back to shrink-to-fit and sizes
+    column 1 from its content - which is how IOCS ended up with a 3567px
+    'indicator' beside a 58px 'seen_in'. Sum the columns and say so. */
+ var total=0,elastic=-1,widest=0;
+ lay.forEach(function(L,i){total+=L.w;
+  /* only a wrapping column is a candidate: extra width buys it another line
+     of visible text, whereas a one-line column just gains blank space */
+  if(!L.num&&!L.nw&&L.w>widest){widest=L.w;elastic=i;}});
+ var avail=Math.max(320,(document.getElementById('main').clientWidth||0)-38);
+ var stretch=total<avail;
+ /* Hand the slack to the widest wrapping column rather than letting fixed
+    layout spread it proportionally - a 297px 'seen_in_count' is padding, the
+    same pixels on 'seen_in' are another line of the value worth reading. With
+    no wrapping column to give it to (a table of short fields), fall back to
+    proportional so the table still fills the pane instead of stretching one
+    column to 1000px of whitespace. */
+ h+='<table class="tbl" style="width:'+(stretch?avail:total)+'px"><colgroup>';
+ lay.forEach(function(L,i){
+  h+=(stretch&&i===elastic)?'<col>':'<col style="width:'+L.w+'px">';});
+ h+='</colgroup><thead><tr id="hdr">';
+ t.columns.forEach(function(c,i){
+  var mark=sortCol===i?(sortAsc?' \\u25b2':' \\u25bc'):'';
+  h+='<th data-i="'+i+'" title="'+esc(c)+' \\u2014 click to sort">'+
+     '<span class="lbl">'+esc(c)+mark+'</span></th>';});
+ h+='</tr><tr class="f" id="frow">';
+ var lists='';
+ t.columns.forEach(function(c,i){
+  var opts=tOptions(t,i),lid='';
+  if(opts){lid='dl_'+i;
+   lists+='<datalist id="'+lid+'">';
+   opts.forEach(function(o){lists+='<option value="'+esc(o).replace(/"/g,'&quot;')+'">';});
+   lists+='</datalist>';}
+  h+='<th><input data-i="'+i+'" placeholder="filter '+esc(c)+'"'+
+     (lid?' list="'+lid+'"':'')+' value="'+esc(colFilters[i]||'').replace(/"/g,'&quot;')+
+     '"></th>';});
+ h+='</tr></thead><tbody id="tb">'+tBodyHtml(t,rows,cap)+'</tbody></table>'+lists;
+ h+='<div class="empty" id="none"'+(rows.length?' style="display:none"':'')+
+    '>No rows match.</div>';
+ h+='<p class="desc" id="note">'+(rows.length>cap?'Showing first '+cap.toLocaleString()+
+  ' of '+rows.length.toLocaleString()+' matching rows. Narrow the filter, or use'+
+  ' the CSV / JSON export for everything.':'')+'</p>';
+ document.getElementById('main').innerHTML=h;
+ tWire();
+}
+function tWire(){
+ [].forEach.call(document.querySelectorAll('#hdr th'),function(th){
+  th.onclick=function(){var i=+th.getAttribute('data-i');
+   if(sortCol===i){sortAsc=!sortAsc;}else{sortCol=i;sortAsc=true;}
+   /* repaint the sort arrows in place rather than re-rendering the head,
+      which would take the filter inputs and their values with it */
+   [].forEach.call(document.querySelectorAll('#hdr th'),function(o){
+    var j=+o.getAttribute('data-i');
+    o.querySelector('.lbl').textContent=TB[st.table].columns[j]+
+     (sortCol===j?(sortAsc?' \\u25b2':' \\u25bc'):'');});
+   tRefresh();};});
+ [].forEach.call(document.querySelectorAll('tr.f input'),function(inp){
+  var i=+inp.getAttribute('data-i');
+  inp.oninput=function(){colFilters[i]=inp.value;tRefresh();};
+  /* the input lives inside a th whose click handler sorts - without this,
+     clicking into a filter box would reorder the table under the cursor */
+  inp.onclick=function(e){e.stopPropagation();};});
+ var q=el('q');
+ if(q)q.oninput=function(){st.tq=q.value;tRefresh();};
+ var clr=document.getElementById('clr');
+ if(clr){clr.onclick=function(){
+  colFilters=[];st.tq='';var qq=el('q');if(qq)qq.value='';
+  [].forEach.call(document.querySelectorAll('tr.f input'),function(i){i.value='';});
+  tRefresh();};}
+ /* glue the filter row to the bottom of the label row, measured rather than
+    assumed - the label height moves with the font and the zoom level */
+ var hdr=document.getElementById('hdr'),frow=document.getElementById('frow');
+ if(hdr&&frow){
+  var top=hdr.getBoundingClientRect().height;
+  [].forEach.call(frow.querySelectorAll('th'),function(th){th.style.top=top+'px';});}
+}
+
 start();
 """
 
 
-def write_gui(tri, path, opts):
-    """Write the interactive single-page console.
+def _triage_payload(tri, opts):
+    """The triage half of the page's data: findings, events, indicators.
 
-    Everything the page needs is embedded: no fetch, no CDN, no server. The
-    payload keys are short because they repeat once per finding and per event -
-    on a noisy collection that is the difference between a 4 MB file and a 9 MB
-    one, and the file is routinely copied off the examination box by hand.
+    Split out from the writer because the page it feeds is the same page that
+    carries the artifact tables - one file, one nav, one set of severity chips
+    over both halves. A run that only exported one table passes no triage at
+    all and gets the tables alone.
     """
-    esc = htmllib.escape
     counts = {s: sum(1 for f in tri.findings if f.severity == s) for s in SEVERITIES}
 
     findings, names, tactics = [], {}, {}
@@ -15801,7 +15841,12 @@ def write_gui(tri, path, opts):
         })
 
     events = []
-    for e in tri.events[-opts.timeline_limit:]:
+    # Sorted before it is capped: analyzers append as they run, and the rule
+    # hunts append after everything else, so the tail of the list is the last
+    # thing parsed rather than the last thing that happened. Uncapped that is
+    # only untidy; capped it silently drops the wrong events, and the chart
+    # downstream reads the first event as the start of time.
+    for e in sorted(tri.events, key=lambda x: x.ts)[-opts.timeline_limit:]:
         events.append({
             "t": e.ts.strftime("%Y-%m-%d %H:%M:%S"),
             # Epoch seconds alongside the string: the activity chart buckets on
@@ -15816,39 +15861,11 @@ def write_gui(tri, path, opts):
 
     iocs = [{"i": k, "w": ", ".join(sorted(v))} for k, v in sorted(tri.iocs.items())]
 
-    payload = {
+    return {
         "meta": [[k, str(v)] for k, v in tri.meta.items() if v],
         "counts": counts, "findings": findings, "events": events,
         "iocs": iocs, "names": names, "tactics": tactics,
-        "order": ATTACK_ORDER, "version": VERSION,
     }
-
-    host = tri.meta.get("Hostname", "collection")
-    nav = [("overview", "Overview", ""), ("findings", "Findings", "nFind"),
-           ("attack", "ATT&amp;CK", ""), ("timeline", "Timeline", len(events)),
-           ("iocs", "Indicators", len(iocs))]
-    navhtml = []
-    for key, label, n in nav:
-        badge = ('<span class="n" id="nFind"></span>' if n == "nFind"
-                 else ('<span class="n">%s</span>' % n if n != "" else ""))
-        navhtml.append('<a data-v="%s">%s%s</a>' % (key, label, badge))
-
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("<!doctype html><html><head><meta charset='utf-8'>"
-                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                 "<title>linsight - %s</title><style>%s</style></head><body>"
-                 % (esc(str(host)), GUI_CSS))
-        fh.write("<header><div class='brand'><b>linsight</b>"
-                 "<span>PARSE LINUX DEEP. HUNT THE MALICIOUS.</span></div>"
-                 "<div class='host'><b>%s</b> &nbsp;<code>%s</code></div>"
-                 "<div class='chips' id='chips'></div></header>"
-                 % (esc(str(host)), esc(tri.col.path)))
-        fh.write("<div class='layout'><nav>%s<div class='foot'>linsight v%s<br>"
-                 "1-5 views &middot; / search &middot; j/k walk</div></nav>"
-                 "<main id='main'></main></div>" % ("".join(navhtml), VERSION))
-        fh.write("<script>window.__LINSIGHT__=%s;</script>" % _script_json(payload))
-        fh.write("<script>%s</script></body></html>" % GUI_JS)
-    print("[+] GUI written to %s" % path, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -15883,9 +15900,6 @@ def main(argv=None):
                     help="evidence lines printed per finding on the console (default 25)")
     ap.add_argument("--json", metavar="PATH", help="write full findings as JSON")
     ap.add_argument("--html", metavar="PATH", help="write a self-contained HTML report")
-    ap.add_argument("--gui", metavar="PATH",
-                    help="write the interactive single-page console "
-                         "(findings, ATT&CK matrix, timeline, indicators)")
     ap.add_argument("--timeline", metavar="PATH", help="write the event timeline as CSV")
     ap.add_argument("--show-timeline", action="store_true",
                     help="also print the timeline on the console")
@@ -15977,13 +15991,14 @@ def main(argv=None):
     tg.add_argument("--export", metavar="DIR",
                     help="write every table format into DIR "
                          "(csv/ and json/, one file per table, plus "
-                         "browser.html)")
+                         "browser.html - the console)")
     tg.add_argument("--csv-dir", metavar="DIR",
                     help="write one CSV per table into DIR")
     tg.add_argument("--tables-json", metavar="PATH",
                     help="write every table as a single JSON document")
     tg.add_argument("--tables-html", metavar="PATH",
-                    help="write the self-contained HTML artifact browser")
+                    help="write the self-contained console: findings, ATT&CK, "
+                         "timeline, indicators and every artifact table")
     tg.add_argument("--process-map", metavar="PATH",
                     help="write ONLY the correlated one-row-per-PID process table "
                          "to a single file (.csv/.html/.json by extension)")
@@ -16086,9 +16101,9 @@ def main(argv=None):
     if opts.sigma_note:
         tri.meta["Sigma ruleset"] = opts.sigma_note
 
-    # Rule hits are findings, and the console report, --json, --html and --gui
-    # are all written from the finding list - so when rules are in play the
-    # tables have to be built first. The build is reused by the export below rather than
+    # Rule hits are findings, and the console report, --json and --html are all
+    # written from the finding list - so when rules are in play the tables have
+    # to be built first. The build is reused by the export below rather than
     # repeated.
     tb = None
     asked_for_rules = bool(opts.yara or opts.sigma or opts.keywords)
@@ -16109,8 +16124,6 @@ def main(argv=None):
         write_json(tri, opts.json)
     if opts.html:
         write_html(tri, opts.html, opts)
-    if opts.gui:
-        write_gui(tri, opts.gui, opts)
     if opts.timeline:
         write_timeline(tri, opts.timeline)
 
