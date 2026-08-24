@@ -88,15 +88,19 @@ python linsight.py ./coll --tables-html b.html  # just the console
 | view | what it is for |
 |---|---|
 | **Overview** | severity cards, activity over the collection's span, the loudest categories, techniques and artifacts — every bar is a click through to the findings behind it |
-| **Findings** | the ranked list beside a detail pane: filter by severity, category, technique or free text; the search covers evidence lines, not just titles |
+| **Findings** | the `FINDINGS` grid: sort any column, filter per column, and click a row to open its evidence, ATT&CK techniques and time span above the table |
 | **ATT&CK** | the techniques the findings actually carry, laid out by tactic and coloured by the worst severity in each cell; click a technique to filter the findings to it |
-| **Timeline** | the merged events as a severity-stacked histogram over the event table — click a column to narrow the table to that window, click it again to let go |
-| **Indicators** | every indicator observed and which artifacts mentioned it |
-| **Tables** | the 89 artifact grids, each sortable, with a row filter and a per-column filter that combine with AND |
+| **Timeline** | the `TIMELINE` grid under a severity-stacked histogram — click a column to narrow the table to that window, click it again to let go |
+| **Indicators** | the `IOCS` grid: every indicator and the artifacts that mentioned it |
+| **Tables** | the remaining artifact grids, each sortable, with a row filter and a per-column filter that combine with AND |
 
-The severity chips in the header filter every view at once, so a technique cell and a timeline column both count what the chips are showing. `alt`-click a chip to isolate one severity. `1`–`5` switch views, `/` focuses the search box, `j`/`k` walk the finding list.
+**The first three views *are* those tables.** There is one findings list, not a view and a table saying the same thing twice — the console half (chips, chart, evidence pane) sits on top of the same grid every other table gets, so sorting and per-column filtering work there too. Nothing is embedded twice, and the two halves have no way to disagree.
 
-One file, no server, no network: the payload is embedded and the CSS and JS are inline, because the box that reads a triage collection is routinely the box that is not allowed to fetch anything.
+The severity chips in the header filter all of them at once, so a technique cell, a timeline column and a findings row all count the same set. `alt`-click a chip to isolate one severity. `1`–`5` switch views, `/` focuses the row filter, `j`/`k` walk the rows.
+
+One file, no server, no network: the payload is embedded and the CSS and JS are inline, because the box that reads a triage collection is routinely the box that is not allowed to fetch anything. Open it with a double click — there is nothing to serve it from.
+
+`--html-rows N` caps how many rows of each table the page carries (default 2000); the CSV and JSON exports always hold everything.
 
 ## Hunting
 

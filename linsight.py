@@ -14418,10 +14418,14 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
         d["cap"] = 500          # rows rendered at once in the DOM
         tbls[t.name] = d
 
-    payload = {"meta": [], "counts": {s: 0 for s in SEVERITIES}, "findings": [],
-               "events": [], "iocs": [], "names": {}, "tactics": {},
-               "order": ATTACK_ORDER, "version": VERSION,
-               "index": index, "tables": tbls}
+    # Which table each console view reads. A view whose table was not built -
+    # a single-table export - simply does not appear in the nav.
+    views = {v: n for v, n in (("findings", "FINDINGS"),
+                               ("timeline", "TIMELINE"), ("iocs", "IOCS"))
+             if n in tbls}
+    payload = {"meta": [], "tactics": ATTACK_TACTICS, "order": ATTACK_ORDER,
+               "version": VERSION, "index": index, "tables": tbls,
+               "views": views}
     if tri is not None:
         payload.update(_triage_payload(tri, opts))
     elif meta:
@@ -14959,41 +14963,6 @@ ATTACK_ORDER = [
     "Command and Control", "Exfiltration", "Impact", "Other",
 ]
 
-_TECH_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
-
-
-def _gui_techniques(mitre):
-    """Every technique ID in one finding's mitre string.
-
-    The field is prose, not a list: "T1078 Valid Accounts / T1021.004 SSH" is
-    two techniques and "T1036 Masquerading" is one, and Sigma contributes its
-    own comma-joined form. Pulling the IDs out with a pattern handles all of
-    them without asking every analyzer to change what it writes.
-    """
-    return _TECH_RE.findall(mitre or "")
-
-
-def _gui_label(mitre, tech):
-    """The human name beside a technique ID, taken from the finding itself.
-
-    "T1053.003 Scheduled Task: Cron" -> "Scheduled Task: Cron". Nothing is
-    invented when the string is a bare ID - the matrix then shows the ID alone,
-    which is still the thing an analyst looks up.
-    """
-    if not mitre:
-        return ""
-    i = mitre.find(tech)
-    if i < 0:
-        return ""
-    rest = mitre[i + len(tech):].lstrip(" -:")
-    for sep in ("/", ","):
-        if sep in rest:
-            rest = rest.split(sep)[0]
-    rest = rest.strip()
-    # A trailing fragment that is just another ID is not a name.
-    return "" if _TECH_RE.match(rest) else rest[:60]
-
-
 APP_CSS = """
 :root{--bg:#0f1419;--panel:#161b22;--panel2:#1c2330;--line:#2b3440;--fg:#d7dee7;
 --dim:#8b98a8;--accent:#58a6ff;--gold:#f5d067;
@@ -15073,22 +15042,17 @@ table.meta{border-collapse:collapse;font-size:12px}
 table.meta td{padding:3px 14px 3px 0;vertical-align:top;border:0}
 table.meta td:first-child{color:var(--dim);white-space:nowrap}
 
-/* ---- findings ---- */
-.split{display:flex;gap:14px;height:calc(100vh - 56px - 32px - 42px)}
-.list{flex:0 0 45%;overflow:auto;border:1px solid var(--line);border-radius:6px;
-background:var(--panel)}
-.row{padding:8px 11px;border-bottom:1px solid var(--line);cursor:pointer;
-border-left:3px solid transparent}
-.row:hover{background:var(--panel2)}
-.row.sel{background:var(--panel2);border-left-color:var(--gold)}
-.row .t{display:flex;gap:8px;align-items:baseline}
-.row .tag{font-size:9.5px;letter-spacing:.7px;padding:1px 5px;border-radius:3px;
-flex:0 0 auto;color:#0f1419;font-weight:700}
-.row .ti{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.row .sub{color:var(--dim);font-size:11px;margin-top:2px;overflow:hidden;
-text-overflow:ellipsis;white-space:nowrap}
-.detail{flex:1;overflow:auto;border:1px solid var(--line);border-radius:6px;
-background:var(--panel);padding:14px 16px}
+/* ---- findings ----
+   The findings list is the FINDINGS grid itself; this is the pane that opens
+   above it for the row under the cursor. */
+.detail{position:relative;max-height:44vh;overflow:auto;border:1px solid var(--line);
+border-radius:6px;background:var(--panel);padding:14px 16px;margin:0 0 10px}
+.detail .x{position:absolute;right:11px;top:7px;cursor:pointer;color:var(--dim);
+font-size:17px;line-height:1}
+.detail .x:hover{color:var(--fg)}
+.pills{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 9px}
+.pills:empty{display:none}
+.tbl tbody tr.sel td{background:#233043;box-shadow:inset 3px 0 0 var(--gold)}
 .detail h4{margin:0 0 6px;font-size:14px;font-weight:600}
 .detail .d{color:var(--dim);margin-bottom:12px}
 .detail pre{background:var(--bg);border:1px solid var(--line);border-radius:5px;
@@ -15188,44 +15152,89 @@ button.clr:hover{color:var(--accent);border-color:var(--accent)}
 .sev-INFO{color:var(--INFO)}
 """
 
-APP_JS = """
-var D=window.__LINSIGHT__,SEV=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
-var st={view:'overview',sev:{},q:'',cat:'',tech:'',sel:null,page:400,bucket:null,
-        table:null,tq:''};
-var TB=D.tables||{},IDX=D.index||[];
-var VIEWS=[['overview','Overview',null],['findings','Findings',0],
- ['attack','ATT&CK',null],['timeline','Timeline',(D.events||[]).length],
- ['iocs','Indicators',(D.iocs||[]).length]];
-var TLB=[];   /* the timeline chart's bucket bounds, from the last render */
+APP_JS = """var D=window.__LINSIGHT__,SEV=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
+var TB=D.tables||{},IDX=D.index||[],V=D.views||{};
+var st={view:null,sev:{},cat:'',tech:'',sel:null,bucket:null,table:null,tq:''};
 SEV.forEach(function(s){st.sev[s]=true;});
+var VIEWS=[['overview','Overview'],['findings','Findings'],['attack','ATT&CK'],
+           ['timeline','Timeline'],['iocs','Indicators']];
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function el(id){return document.getElementById(id);}
 function sevRank(s){var i=SEV.indexOf(s);return i<0?99:i;}
 
-/* One predicate for every view, so a severity chip means the same thing in the
-   matrix as it does in the finding list. */
-function match(f){
- if(!st.sev[f.sev])return false;
- if(st.cat&&f.cat!==st.cat)return false;
- if(st.tech&&f.techs.indexOf(st.tech)<0)return false;
- if(st.q){
-  var q=st.q.toLowerCase();
-  if((f.hay||'').indexOf(q)<0)return false;
- }
- return true;
+/* The three console views ARE the three analysis tables - there is one
+   FINDINGS, one TIMELINE, one IOCS, and the view is how you read it. Nothing
+   is carried twice: the severity cards, the ATT&CK matrix and the activity
+   chart are all computed from these rows rather than from a second copy of
+   the same data embedded beside them. */
+function vt(v){return V[v]&&TB[V[v]]?TB[V[v]]:null;}
+function isView(t){
+ for(var k in V){if(V[k]===t.name)return k;}
+ return null;
 }
-function findings(){return D.findings.filter(match);}
+function ci(t,name){return t?t.columns.indexOf(name):-1;}
+/* '2026-03-24 16:03:05' -> epoch seconds. The column is UTC by construction
+   (every clock is normalised before it reaches a table), so it is read as UTC
+   rather than through the examiner's timezone. */
+function ts(s){
+ var d=Date.parse(String(s||'').replace(' ','T')+'Z');
+ return isNaN(d)?null:d/1000;
+}
+
+var TECH=/\\bT\\d{4}(?:\\.\\d{3})?\\b/g;
+function techsOf(s){return String(s||'').match(TECH)||[];}
+/* The name beside an ID, taken from the cell itself: 'T1053.003 Scheduled
+   Task: Cron' -> 'Scheduled Task: Cron'. A bare ID keeps no name rather than
+   being given an invented one. */
+function techName(mitre,t){
+ var s=String(mitre||''),i=s.indexOf(t);
+ if(i<0)return '';
+ var rest=s.slice(i+t.length).replace(/^[\\s\\-:]+/,'').split('/')[0].split(',')[0].trim();
+ return TECH.test(rest)?'':rest.slice(0,60);
+}
+function tacticOf(t){return D.tactics[t.split('.')[0]]||'Other';}
+
+/* Column indexes for the findings table, resolved once. */
+var F=null;
+function fc(){
+ var t=vt('findings');
+ if(!t)return null;
+ if(F&&F.t===t)return F;
+ F={t:t};
+ ['severity','category','title','mitre','artifact','count','first_utc',
+  'last_utc','detail','evidence_count','evidence'].forEach(function(c){
+   F[c]=ci(t,c);});
+ return F;
+}
+/* Findings under the header chips and the category / technique pills. The
+   row search box is deliberately NOT applied here: it belongs to the grid
+   being typed into, and the overview should not empty itself because a
+   filter was left behind in another view. */
+function frows(){
+ var f=fc();
+ if(!f)return [];
+ return f.t.rows.filter(function(r){
+  if(!st.sev[r[f.severity]])return false;
+  if(st.cat&&r[f.category]!==st.cat)return false;
+  if(st.tech&&techsOf(r[f.mitre]).indexOf(st.tech)<0)return false;
+  return true;});
+}
 
 function setView(v,name){
- st.view=v;st.page=400;
- if(v==='table'&&name!==st.table){st.table=name;sortCol=-1;colFilters=[];st.tq='';}
+ if(v==='table'){
+  if(name!==st.table){st.table=name;sortCol=-1;colFilters=[];st.tq='';}
+ }else if(vt(v)){
+  /* A console view is a table too, so switching to one carries the same
+     reset: its sort and its column filters are its own. */
+  var n=V[v];
+  if(n!==st.table){st.table=n;sortCol=-1;colFilters=[];st.tq='';st.bucket=null;}
+ }
+ st.view=v;
  location.hash=(v==='table')?'t/'+st.table:v;
  render();
 }
-/* The nav is built once; only the highlight moves, because rebuilding 89
-   anchors on every keystroke is work nobody asked for. */
 function markNav(){
  [].forEach.call(document.querySelectorAll('nav a'),function(a){
   a.classList.toggle('active',st.view==='table'
@@ -15233,30 +15242,73 @@ function markNav(){
    :a.getAttribute('data-v')===st.view);});
 }
 function chips(){
- /* A page written without the triage half has nothing for them to filter, so
-    five zeroes in the header would be furniture rather than a control. */
- if(!D.findings.length&&!D.events.length){el('chips').innerHTML='';return;}
+ var f=fc();
+ if(!f){el('chips').innerHTML='';return;}
+ var n={};
+ f.t.rows.forEach(function(r){n[r[f.severity]]=(n[r[f.severity]]||0)+1;});
  var h='';
  SEV.forEach(function(s){
   h+='<button class="chip '+s+' '+(st.sev[s]?'on':'off')+'" data-s="'+s+'">'+
-     '<b>'+(D.counts[s]||0)+'</b>'+s+'</button>';});
+     '<b>'+(n[s]||0)+'</b>'+s+'</button>';});
  el('chips').innerHTML=h;
  [].forEach.call(document.querySelectorAll('#chips .chip'),function(b){
   b.onclick=function(ev){
    ev=ev||window.event;
    var s=b.getAttribute('data-s');
-   /* Alt-click isolates one severity: the common move is "show me only the
+   /* Alt-click isolates one severity - the common move is "only the
       criticals", which is otherwise four clicks. */
-   if(ev&&ev.altKey){
-    SEV.forEach(function(x){st.sev[x]=(x===s);});
-   }else{st.sev[s]=!st.sev[s];}
+   if(ev&&ev.altKey){SEV.forEach(function(x){st.sev[x]=(x===s);});}
+   else{st.sev[s]=!st.sev[s];}
    st.bucket=null;chips();render();};});
 }
 
-/* ---------- overview ---------- */
-/* act is what a click on a bar filters by (''  = not clickable); lab turns the
-   key into what the row reads as, so a technique bar can show its name while
-   still filtering on the bare ID. */
+/* ---------- charts ---------- */
+/* Rows bucketed into n columns between the first and last timestamp, each
+   column a stack of severity segments. Buckets rather than one bar per row: a
+   collection covering a year and one covering an hour have to produce the
+   same shaped chart, and the stack is what makes a burst of CRITICAL visible
+   inside an hour that also carries a thousand INFO lines. */
+function histo(rows,ti,si,n,h_px,clickable){
+ var pts=[];
+ rows.forEach(function(r){
+  var e=ts(r[ti]);
+  if(e!==null)pts.push([e,si>=0?r[si]:'INFO']);});
+ if(!pts.length)return {html:'<div class="empty">no dated rows</div>',b:[]};
+ var t0=pts[0][0],t1=t0,i;
+ pts.forEach(function(p){if(p[0]<t0)t0=p[0];if(p[0]>t1)t1=p[0];});
+ var span=Math.max(1,t1-t0),b=[];
+ for(i=0;i<n;i++)b.push({n:0,s:{},t0:t0+span*i/n,t1:t0+span*(i+1)/n});
+ pts.forEach(function(p){
+  var k=Math.max(0,Math.min(n-1,Math.floor((p[0]-t0)*n/span)));
+  b[k].n++;b[k].s[p[1]]=(b[k].s[p[1]]||0)+1;});
+ var max=0;
+ b.forEach(function(x){if(x.n>max)max=x.n;});
+ max=max||1;
+ var h='<div class="histo'+(clickable?' click':'')+'" style="height:'+h_px+'px">';
+ for(i=0;i<n;i++){
+  var tip=[];
+  SEV.forEach(function(sv){if(b[i].s[sv])tip.push(b[i].s[sv]+' '+sv);});
+  h+='<div class="col'+(st.bucket===i&&clickable?' on':'')+'" data-b="'+i+
+     '" title="'+esc(fmtT(b[i].t0)+'  -  '+(tip.join(', ')||'0'))+'">';
+  /* column-reverse stacks the first child at the bottom, so walking INFO up
+     to CRITICAL puts the loud severities on top where they are read first. */
+  for(var j=SEV.length-1;j>=0;j--){
+   var c=b[i].s[SEV[j]];
+   if(c)h+='<div class="seg" style="height:'+(c*100/max)+'%;background:var(--'+
+     SEV[j]+')"></div>';}
+  h+='</div>';}
+ h+='</div><div class="axis"><span>'+esc(fmtT(t0))+'</span><span>'+
+    esc(fmtT(t0+span/2))+'</span><span>'+esc(fmtT(t1))+'</span></div>';
+ return {html:h,b:b};
+}
+/* Epoch seconds back to the shape the rows carry, built from the UTC parts
+   rather than the locale: the whole report is UTC and an axis that quietly
+   shifts to the examiner's timezone is a wrong answer. */
+function fmtT(sec){
+ var d=new Date(sec*1000),p=function(x){return (x<10?'0':'')+x;};
+ return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
+        p(d.getUTCHours())+':'+p(d.getUTCMinutes());
+}
 function barList(pairs,act,lab){
  if(!pairs.length)return '<div class="empty">nothing</div>';
  var max=pairs[0][1]||1,h='<div class="bars">';
@@ -15268,289 +15320,163 @@ function barList(pairs,act,lab){
      '<div class="n">'+p[1]+'</div></div>';});
  return h+'</div>';
 }
-function techLabel(t){return D.names[t]?t+'  '+D.names[t]:t;}
 function tally(list,fn){
- var m={},out=[];
- list.forEach(function(x){var ks=fn(x);if(!ks)return;
+ var m={},out=[],k;
+ list.forEach(function(x){
+  var ks=fn(x);
+  if(!ks)return;
   if(!(ks instanceof Array))ks=[ks];
-  ks.forEach(function(k){m[k]=(m[k]||0)+1;});});
- for(var k in m)out.push([k,m[k]]);
+  ks.forEach(function(kk){m[kk]=(m[kk]||0)+1;});});
+ for(k in m)out.push([k,m[k]]);
  out.sort(function(a,b){return b[1]-a[1];});
  return out;
 }
+
+/* ---------- overview ---------- */
 function viewOverview(){
- var fs=findings(),h='<h2>Overview</h2><div class="cards">';
+ var f=fc(),fs=frows(),tl=vt('timeline'),io=vt('iocs');
+ var h='<h2>Overview</h2><div class="cards">';
  SEV.forEach(function(s){
-  var n=fs.filter(function(f){return f.sev===s;}).length;
+  var n=fs.filter(function(r){return r[f.severity]===s;}).length;
   h+='<div class="card" data-sev="'+s+'" style="border-top-color:var(--'+s+')">'+
      '<b style="color:var(--'+s+')">'+n+'</b><span>'+s+'</span></div>';});
- h+='<div class="card" style="border-top-color:var(--gold)"><b>'+D.events.length+
-    '</b><span>TIMELINE EVENTS</span></div>';
- h+='<div class="card" style="border-top-color:var(--accent)"><b>'+D.iocs.length+
-    '</b><span>INDICATORS</span></div></div>';
+ if(tl)h+='<div class="card" data-go="timeline" style="border-top-color:var(--gold)">'+
+    '<b>'+tl.row_count.toLocaleString()+'</b><span>TIMELINE EVENTS</span></div>';
+ if(io)h+='<div class="card" data-go="iocs" style="border-top-color:var(--accent)">'+
+    '<b>'+io.row_count.toLocaleString()+'</b><span>INDICATORS</span></div>';
+ h+='</div>';
 
- h+='<div class="grid2"><div><h3>Activity</h3>'+spark()+'</div>';
- h+='<div><h3>Collection</h3><table class="meta">';
+ h+='<div class="grid2"><div><h3>Activity</h3>';
+ h+=tl?histo(tl.rows,ci(tl,'timestamp_utc'),ci(tl,'severity'),60,88,false).html
+      :'<div class="empty">no timeline</div>';
+ h+='</div><div><h3>Collection</h3><table class="meta">';
  D.meta.forEach(function(kv){
   h+='<tr><td>'+esc(kv[0])+'</td><td>'+esc(kv[1])+'</td></tr>';});
  h+='</table></div></div>';
 
  h+='<div class="grid2"><div><h3>Categories</h3>'+
-    barList(tally(fs,function(f){return f.cat;}).slice(0,14),'cat')+'</div>';
+    barList(tally(fs,function(r){return r[f.category];}).slice(0,14),'cat')+'</div>';
  h+='<div><h3>Techniques</h3>'+
-    barList(tally(fs,function(f){return f.techs;}).slice(0,14),'tech',techLabel)+
-    '</div></div>';
-
+    barList(tally(fs,function(r){return techsOf(r[f.mitre]);}).slice(0,14),
+            'tech',techLabel)+'</div></div>';
  h+='<div><h3>Loudest artifacts</h3>'+
-    barList(tally(fs,function(f){return f.src;}).slice(0,10),'')+'</div>';
+    barList(tally(fs,function(r){return r[f.artifact];}).slice(0,10),'')+'</div>';
  return h;
 }
-/* Events bucketed into n columns between the first and last, each column a
-   stack of severity segments. Buckets rather than one bar per event: a
-   collection covering a year and one covering an hour have to produce the same
-   shaped chart, and the stack is what makes a burst of CRITICAL visible inside
-   an hour that also carries a thousand INFO lines.
-   Returns the markup and, on the object, the bucket bounds - the timeline view
-   needs them to turn a click back into a time range. */
-function histo(ev,n,h_px,clickable){
- if(!ev.length)return {html:'<div class="empty">no dated events</div>',b:[]};
- /* Span from the extremes rather than from the ends of the list: the payload
-    is sorted, but a filtered view is only as ordered as what it kept, and one
-    event before ev[0] would otherwise land in a negative bucket. */
- var t0=ev[0].e,t1=t0,i;
- ev.forEach(function(e){if(e.e<t0)t0=e.e;if(e.e>t1)t1=e.e;});
- var span=Math.max(1,t1-t0),b=[];
- for(i=0;i<n;i++)b.push({n:0,s:{},t0:t0+span*i/n,t1:t0+span*(i+1)/n});
- ev.forEach(function(e){
-  var k=Math.max(0,Math.min(n-1,Math.floor((e.e-t0)*n/span)));
-  b[k].n++;b[k].s[e.s]=(b[k].s[e.s]||0)+1;});
- var max=0;b.forEach(function(x){if(x.n>max)max=x.n;});
- max=max||1;
- var h='<div class="histo'+(clickable?' click':'')+'" style="height:'+h_px+'px">';
- for(i=0;i<n;i++){
-  var tip=[];
-  SEV.forEach(function(sv){if(b[i].s[sv])tip.push(b[i].s[sv]+' '+sv);});
-  h+='<div class="col'+(st.bucket===i&&clickable?' on':'')+'" data-b="'+i+
-     '" title="'+esc(fmtT(b[i].t0)+'  -  '+(tip.join(', ')||'0'))+'">';
-  /* column-reverse stacks the first child at the bottom, so walking INFO to
-     CRITICAL puts the loud severities on top where they are read first. */
-  for(var j=SEV.length-1;j>=0;j--){
-   var c=b[i].s[SEV[j]];
-   if(c)h+='<div class="seg" style="height:'+(c*100/max)+'%;background:var(--'+
-     SEV[j]+')"></div>';}
-  h+='</div>';}
- h+='</div><div class="axis"><span>'+esc(fmtT(t0))+'</span><span>'+
-    esc(fmtT(t0+span/2))+'</span><span>'+esc(fmtT(t1))+'</span></div>';
- return {html:h,b:b};
-}
-/* Epoch seconds back to the same string shape the rows carry. Built from the
-   UTC parts, never the locale: the whole report is UTC and a chart axis that
-   quietly shifts to the examiner's timezone is a wrong answer. */
-function fmtT(sec){
- var d=new Date(sec*1000),p=function(x){return (x<10?'0':'')+x;};
- return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
-        p(d.getUTCHours())+':'+p(d.getUTCMinutes());
-}
-function spark(){return histo(D.events,60,88,false).html;}
-
-/* ---------- findings ---------- */
-function viewFindings(){
- var fs=findings();
- fs.sort(function(a,b){
-  var d=sevRank(a.sev)-sevRank(b.sev);if(d)return d;
-  return (b.last||'').localeCompare(a.last||'');});
- var cats=tally(D.findings,function(f){return f.cat;}).map(function(p){return p[0];}).sort();
- var h='<div class="bartop"><input type="search" id="q" placeholder="filter findings, evidence, artifact..." value="'+
-   esc(st.q)+'"><select id="cat"><option value="">all categories</option>';
- cats.forEach(function(c){h+='<option'+(st.cat===c?' selected':'')+'>'+esc(c)+'</option>';});
- h+='</select>';
- if(st.tech)h+='<span class="pill" data-clear="tech">'+esc(st.tech)+' &times;</span>';
- h+='<span class="count">'+fs.length+' of '+D.findings.length+'</span></div>';
-
- h+='<div class="split"><div class="list" id="list">';
- if(!fs.length)h+='<div class="empty">nothing matches</div>';
- fs.slice(0,st.page).forEach(function(f){
-  h+='<div class="row'+(st.sel===f.id?' sel':'')+'" data-id="'+f.id+'">'+
-     '<div class="t"><span class="tag" style="background:var(--'+f.sev+')">'+
-     f.sev+'</span><span class="ti">'+esc(f.title)+'</span></div>'+
-     '<div class="sub">'+esc(f.cat)+(f.last?' &middot; '+esc(f.last):'')+
-     (f.src?' &middot; '+esc(f.src):'')+'</div></div>';});
- if(fs.length>st.page)h+='<div class="more" id="more">show '+
-   Math.min(400,fs.length-st.page)+' more of '+(fs.length-st.page)+'</div>';
- h+='</div><div class="detail" id="det">'+detail(fs)+'</div></div>';
- return h;
-}
-function detail(fs){
- var f=null;
- D.findings.forEach(function(x){if(x.id===st.sel)f=x;});
- if(!f)f=fs[0];
- if(!f)return '<div class="empty">select a finding</div>';
- st.sel=f.id;
- var h='<h4><span class="tag" style="background:var(--'+f.sev+');color:#0f1419;'+
-   'padding:1px 6px;border-radius:3px;font-size:10px;margin-right:7px">'+f.sev+
-   '</span>'+esc(f.title)+'</h4>';
- if(f.detail)h+='<div class="d">'+esc(f.detail)+'</div>';
- h+='<div class="kv"><span>category</span><div>'+esc(f.cat)+'</div>';
- if(f.src)h+='<span>artifact</span><div><code>'+esc(f.src)+'</code></div>';
- if(f.seen)h+='<span>seen</span><div>'+esc(f.seen)+'</div>';
- h+='<span>occurrences</span><div>'+f.count+'</div>';
- if(f.techs.length){
-  h+='<span>ATT&amp;CK</span><div>';
-  f.techs.forEach(function(t){h+='<span class="pill" data-tech="'+esc(t)+'">'+
-    esc(t)+(D.names[t]?' '+esc(D.names[t]):'')+'</span>';});
-  h+='</div>';}
- h+='</div>';
- if(f.ev.length){
-  h+='<pre>'+esc(f.ev.join('\\n'))+'</pre>';
-  if(f.more)h+='<div class="count" style="margin-top:6px">... '+f.more+
-    ' more line(s) not shown</div>';}
- return h;
+function techLabel(t){
+ var f=fc(),nm='';
+ if(f)f.t.rows.some(function(r){
+  if(techsOf(r[f.mitre]).indexOf(t)>=0){nm=techName(r[f.mitre],t);return !!nm;}
+  return false;});
+ return nm?t+'  '+nm:t;
 }
 
-/* ---------- attack matrix ---------- */
+/* ---------- attack ---------- */
 function viewAttack(){
- var fs=findings(),by={};
- fs.forEach(function(f){
-  f.techs.forEach(function(t){
-   var tac=D.tactics[t]||'Other';
+ var f=fc(),fs=frows(),by={};
+ fs.forEach(function(r){
+  techsOf(r[f.mitre]).forEach(function(t){
+   var tac=tacticOf(t);
    if(!by[tac])by[tac]={};
-   if(!by[tac][t])by[tac][t]={n:0,sev:'INFO'};
+   if(!by[tac][t])by[tac][t]={n:0,sev:'INFO',nm:techName(r[f.mitre],t)};
    by[tac][t].n++;
-   if(sevRank(f.sev)<sevRank(by[tac][t].sev))by[tac][t].sev=f.sev;});});
+   if(!by[tac][t].nm)by[tac][t].nm=techName(r[f.mitre],t);
+   if(sevRank(r[f.severity])<sevRank(by[tac][t].sev))by[tac][t].sev=r[f.severity];});});
  var order=D.order.filter(function(t){return by[t];});
  if(!order.length)return '<h2>ATT&amp;CK</h2><div class="empty">'+
    'no findings carry a technique at this filter</div>';
- var h='<h2>ATT&amp;CK <span class="count">&mdash; click a technique to filter the findings</span></h2>'+
-   '<div class="matrix">';
+ var h='<h2>ATT&amp;CK <span class="count">&mdash; click a technique to filter '+
+   'the findings</span></h2><div class="matrix">';
  order.forEach(function(tac){
-  var ts=[];for(var t in by[tac])ts.push(t);
-  ts.sort(function(a,b){
+  var tsl=[],t;
+  for(t in by[tac])tsl.push(t);
+  tsl.sort(function(a,b){
    var d=sevRank(by[tac][a].sev)-sevRank(by[tac][b].sev);
    return d?d:by[tac][b].n-by[tac][a].n;});
-  h+='<div class="tac"><div class="h"><b>'+esc(tac)+'</b>'+ts.length+' technique(s)</div>';
-  ts.forEach(function(t){
+  h+='<div class="tac"><div class="h"><b>'+esc(tac)+'</b>'+tsl.length+
+     ' technique(s)</div>';
+  tsl.forEach(function(t){
    var c=by[tac][t];
    h+='<div class="cell" data-tech="'+esc(t)+'" style="border-left-color:var(--'+
       c.sev+')"><div class="id">'+esc(t)+'<span class="n">'+c.n+'</span></div>'+
-      (D.names[t]?'<div class="nm">'+esc(D.names[t])+'</div>':'')+'</div>';});
+      (c.nm?'<div class="nm">'+esc(c.nm)+'</div>':'')+'</div>';});
   h+='</div>';});
  return h+'</div>';
 }
 
-/* ---------- timeline ---------- */
-function viewTimeline(){
- var q=st.q.toLowerCase();
- var ev=D.events.filter(function(e){
-  if(!st.sev[e.s])return false;
-  if(q&&(e.t+' '+e.c+' '+e.d).toLowerCase().indexOf(q)<0)return false;
-  return true;});
- /* The chart is drawn from everything the severity chips and the search box
-    left, and the selected bucket then narrows only the table below it - so
-    picking a spike never hides the shape the spike sits in. */
- var g=histo(ev,80,132,true);
- TLB=g.b;
- var rows=ev;
- if(st.bucket!=null&&TLB[st.bucket]){
-  var b=TLB[st.bucket];
-  rows=ev.filter(function(e){return e.e>=b.t0&&(e.e<b.t1||st.bucket===TLB.length-1);});}
- var h='<div class="bartop"><input type="search" id="q" placeholder="filter events..." value="'+
-   esc(st.q)+'">';
- if(st.bucket!=null&&TLB[st.bucket])
-  h+='<span class="pill" data-clear="bucket">'+esc(fmtT(TLB[st.bucket].t0)+
-     ' - '+fmtT(TLB[st.bucket].t1))+' &times;</span>';
- h+='<span class="count">'+rows.length+' of '+D.events.length+'</span></div>';
- h+=g.html;
- h+='<table class="grid" style="margin-top:14px"><tr><th>time (UTC)</th><th>sev</th>'+
-    '<th>category</th><th>event</th></tr>';
- rows.slice(0,st.page).forEach(function(e){
-  h+='<tr><td class="mono">'+esc(e.t)+'</td><td style="color:var(--'+e.s+')">'+
-     e.s+'</td><td>'+esc(e.c)+'</td><td class="wrap">'+esc(e.d)+'</td></tr>';});
- h+='</table>';
- if(rows.length>st.page)h+='<div class="more" id="more">show more ('+
-   (rows.length-st.page)+' left)</div>';
- return h;
-}
-
-/* ---------- indicators ---------- */
-function viewIocs(){
- var q=st.q.toLowerCase();
- var rows=D.iocs.filter(function(r){
-  return !q||(r.i+' '+r.w).toLowerCase().indexOf(q)>=0;});
- var h='<div class="bartop"><input type="search" id="q" placeholder="filter indicators..." value="'+
-   esc(st.q)+'"><span class="count">'+rows.length+' of '+D.iocs.length+'</span></div>';
- if(!rows.length)return h+'<div class="empty">no indicators recorded</div>';
- h+='<table class="grid"><tr><th>indicator</th><th>seen in</th></tr>';
- rows.slice(0,st.page).forEach(function(r){
-  h+='<tr><td class="mono">'+esc(r.i)+'</td><td class="wrap">'+esc(r.w)+'</td></tr>';});
- h+='</table>';
- if(rows.length>st.page)h+='<div class="more" id="more">show more ('+
-   (rows.length-st.page)+' left)</div>';
- return h;
-}
-
-/* ---------- render + wiring ---------- */
-function render(){
- /* A table renders itself - it owns its sort, its column filters and its
-    caret, none of which survive being rebuilt from a string. */
- if(st.view==='table'){tRender();markNav();return;}
- var m=el('main');
- m.innerHTML=st.view==='findings'?viewFindings():
-             st.view==='attack'?viewAttack():
-             st.view==='timeline'?viewTimeline():
-             st.view==='iocs'?viewIocs():viewOverview();
- wire();
- markNav();
- el('nFind').textContent=findings().length;
-}
-function wire(){
- var q=el('q');
- if(q){
-  /* The bucket index only means something against the chart it was clicked on;
-     a new query rebuilds the buckets, so the selection has to go with it. */
-  q.oninput=function(){st.q=q.value;st.page=400;st.bucket=null;render();
-   var n=el('q');if(n){n.focus();n.setSelectionRange(n.value.length,n.value.length);}};
+/* ---------- what the three grid views add above their table ---------- */
+/* The console half of a view: everything that is not the grid itself. The
+   grid underneath is the artifact table, rendered by the same code that
+   renders every other table, so sorting and per-column filters come for
+   free rather than being written twice. */
+function viewHead(){
+ var h='';
+ if(st.view==='findings'){
+  h+='<div class="pills">';
+  if(st.cat)h+='<span class="pill" data-clear="cat">category: '+esc(st.cat)+
+    ' &times;</span>';
+  if(st.tech)h+='<span class="pill" data-clear="tech">'+esc(st.tech)+
+    ' &times;</span>';
+  h+='</div>'+detailHtml();
+ }else if(st.view==='timeline'){
+  var t=TB[st.table];
+  /* Drawn from what the chips, the row filter and the column filters left,
+     but never from the bucket: picking a spike must not hide the shape the
+     spike sits in. */
+  var g=histo(tMatching(t,true),ci(t,'timestamp_utc'),ci(t,'severity'),80,132,true);
+  TLB=g.b;
+  h+=g.html;
+  if(st.bucket!=null&&TLB[st.bucket])
+   h+='<div class="pills"><span class="pill" data-clear="bucket">'+
+      esc(fmtT(TLB[st.bucket].t0)+' - '+fmtT(TLB[st.bucket].t1))+
+      ' &times;</span></div>';
  }
- var c=el('cat');
- if(c)c.onchange=function(){st.cat=c.value;st.page=400;render();};
- var more=el('more');
- if(more)more.onclick=function(){st.page+=400;render();};
-
- [].forEach.call(document.querySelectorAll('[data-tech]'),function(x){
-  x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
- [].forEach.call(document.querySelectorAll('[data-clear]'),function(x){
-  var k=x.getAttribute('data-clear');
-  x.onclick=function(){st[k]=(k==='bucket')?null:'';render();};});
- [].forEach.call(document.querySelectorAll('.histo.click .col'),function(c){
-  c.onclick=function(){
-   var i=+c.getAttribute('data-b');
-   st.bucket=(st.bucket===i)?null:i;st.page=400;render();};});
- [].forEach.call(document.querySelectorAll('.row'),function(r){
-  r.onclick=function(){st.sel=+r.getAttribute('data-id');render();};});
- [].forEach.call(document.querySelectorAll('.card[data-sev]'),function(cd){
-  cd.onclick=function(){
-   var s=cd.getAttribute('data-sev');
-   SEV.forEach(function(x){st.sev[x]=(x===s);});
-   chips();setView('findings');};});
- [].forEach.call(document.querySelectorAll('.bar[data-act]'),function(b){
-  b.onclick=function(){
-   var a=b.getAttribute('data-act'),k=b.getAttribute('data-k');
-   if(a==='cat'){st.cat=k;setView('findings');}
-   else if(a==='tech'){st.tech=k;setView('findings');}};});
+ return h;
 }
-/* Views first, then every table under its category. A page written without
-   the triage half (one table exported on its own) shows only the tables, and
-   one written without tables is the console alone - the same nav covers both
-   rather than each half carrying its own. */
+var TLB=[];   /* the timeline chart's bucket bounds, from the last render */
+
+/* The finding under the cursor, read out of the row itself - the grid holds
+   every column the detail pane needs, evidence included. */
+function detailHtml(){
+ var f=fc(),r=st.sel;
+ if(!f||!r)return '';
+ var h='<div class="detail" id="det"><span class="x" data-clear="sel">&times;</span>'+
+   '<h4><span class="tag" style="background:var(--'+r[f.severity]+
+   ');color:#0f1419;padding:1px 6px;border-radius:3px;font-size:10px;'+
+   'margin-right:7px">'+esc(r[f.severity])+'</span>'+esc(r[f.title])+'</h4>';
+ if(f.detail>=0&&r[f.detail])h+='<div class="d">'+esc(r[f.detail])+'</div>';
+ h+='<div class="kv"><span>category</span><div>'+esc(r[f.category])+'</div>';
+ if(r[f.artifact])h+='<span>artifact</span><div><code>'+esc(r[f.artifact])+
+   '</code></div>';
+ var seen=[r[f.first_utc],r[f.last_utc]].filter(Boolean);
+ if(seen.length)h+='<span>seen</span><div>'+esc(seen.join(' .. '))+' UTC</div>';
+ h+='<span>occurrences</span><div>'+esc(r[f.count])+'</div>';
+ var tl=techsOf(r[f.mitre]);
+ if(tl.length){
+  h+='<span>ATT&amp;CK</span><div>';
+  tl.forEach(function(t){
+   var nm=techName(r[f.mitre],t);
+   h+='<span class="pill" data-tech="'+esc(t)+'">'+esc(t)+(nm?' '+esc(nm):'')+
+      '</span>';});
+  h+='</div>';}
+ h+='</div>';
+ if(f.evidence>=0&&r[f.evidence])h+='<pre>'+esc(r[f.evidence])+'</pre>';
+ return h+'</div>';
+}
+
+/* ---------- nav ---------- */
+/* Views first, then every remaining table under its category. The three
+   analysis tables are not listed twice - they are the views above. */
 function buildNav(){
  var h='';
- if(D.findings.length||D.events.length){
+ if(fc()||vt('timeline')||vt('iocs')){
   VIEWS.forEach(function(v){
-   var n=v[2]==null?'':'<span class="n"'+(v[0]==='findings'?' id="nFind"':'')+'>'+
-     (v[0]==='findings'?'':v[2])+'</span>';
+   var t=vt(v[0]),n=t?'<span class="n">'+t.row_count.toLocaleString()+'</span>':'';
    h+='<a data-v="'+v[0]+'">'+v[1]+n+'</a>';});}
- if(IDX.length){
+ var rest=IDX.filter(function(t){return !isView(t);});
+ if(rest.length){
   var byCat={},order=[];
-  IDX.forEach(function(t){
+  rest.forEach(function(t){
    if(!byCat[t.category]){byCat[t.category]=[];order.push(t.category);}
    byCat[t.category].push(t);});
   h+='<div class="sec"></div>';
@@ -15558,43 +15484,67 @@ function buildNav(){
    h+='<div class="cat">'+esc(c||'Other')+'</div>';
    byCat[c].forEach(function(t){
     h+='<a class="tbl" data-t="'+esc(t.name)+'" title="'+esc(t.title)+'"><span>'+
-       esc(t.name)+'</span><span class="n">'+t.rows.toLocaleString()+'</span></a>';});});}
+       esc(t.name)+'</span><span class="n">'+t.rows.toLocaleString()+
+       '</span></a>';});});}
  el('nav').innerHTML=h;
  [].forEach.call(document.querySelectorAll('nav a'),function(a){
   a.onclick=function(){
    var t=a.getAttribute('data-t');
    setView(t?'table':a.getAttribute('data-v'),t);};});
 }
+
+/* ---------- render ---------- */
+function render(){
+ /* Every view except the overview and the matrix is a table, and a table
+    renders itself: it owns its sort, its column filters and its caret, none
+    of which survive being rebuilt from a string. */
+ if(st.view==='table'||vt(st.view)){tRender();markNav();return;}
+ el('main').innerHTML=st.view==='attack'?viewAttack():viewOverview();
+ wire();
+ markNav();
+}
+function wire(){
+ [].forEach.call(document.querySelectorAll('[data-tech]'),function(x){
+  x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
+ [].forEach.call(document.querySelectorAll('.card[data-sev]'),function(cd){
+  cd.onclick=function(){
+   var s=cd.getAttribute('data-sev');
+   SEV.forEach(function(x){st.sev[x]=(x===s);});
+   chips();setView('findings');};});
+ [].forEach.call(document.querySelectorAll('.card[data-go]'),function(cd){
+  cd.onclick=function(){setView(cd.getAttribute('data-go'));};});
+ [].forEach.call(document.querySelectorAll('.bar[data-act]'),function(b){
+  b.onclick=function(){
+   var a=b.getAttribute('data-act'),k=b.getAttribute('data-k');
+   if(a==='cat'){st.cat=k;setView('findings');}
+   else if(a==='tech'){st.tech=k;setView('findings');}};});
+}
 function start(){
  chips();
  buildNav();
- if(el('nFind'))el('nFind').textContent=D.findings.length;
  var v=(location.hash||'').replace('#','');
  if(v.indexOf('t/')===0&&TB[v.slice(2)])setView('table',v.slice(2));
  else if(['overview','findings','attack','timeline','iocs'].indexOf(v)>=0&&
-         (D.findings.length||D.events.length))setView(v);
- else if(D.findings.length||D.events.length)setView('overview');
+         (fc()||vt('timeline')))setView(v);
+ else if(fc()||vt('timeline')||vt('iocs'))setView('overview');
  else if(IDX.length)setView('table',IDX[0].name);
  document.onkeydown=function(e){
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
   var k=e.key;
   if(k==='/'){var q=el('q');if(q){q.focus();e.preventDefault();}}
-  if(k>='1'&&k<='5'&&D.findings.length)setView(['overview','findings','attack',
-   'timeline','iocs'][+k-1]);
-  /* j/k walk the finding list without leaving the keyboard, the way the
-     console report is read. */
-  if(st.view==='findings'&&(k==='j'||k==='k')){
-   var fs=findings();fs.sort(function(a,b){
-    var d=sevRank(a.sev)-sevRank(b.sev);if(d)return d;
-    return (b.last||'').localeCompare(a.last||'');});
-   var i=-1;fs.forEach(function(f,n){if(f.id===st.sel)i=n;});
-   i=Math.max(0,Math.min(fs.length-1,i+(k==='j'?1:-1)));
-   if(fs[i]){st.sel=fs[i].id;render();
-    var sel=document.querySelector('.row.sel');
-    if(sel&&sel.scrollIntoView)sel.scrollIntoView({block:'nearest'});}}};
+  if(k>='1'&&k<='5'&&fc())setView(['overview','findings','attack','timeline',
+   'iocs'][+k-1]);
+  /* j/k walk the rows of whichever grid is open, the way the console report
+     is read - and in the findings view that moves the detail pane with it. */
+  if(k==='j'||k==='k'){
+   if(!TLAST.length)return;
+   var i=TLAST.indexOf(st.sel);
+   i=Math.max(0,Math.min(TLAST.length-1,i<0?0:i+(k==='j'?1:-1)));
+   st.sel=TLAST[i];
+   if(st.view==='findings'){render();}
+   var sel=document.querySelector('tbody tr.sel');
+   if(sel&&sel.scrollIntoView)sel.scrollIntoView({block:'nearest'});}};
 }
-
-
 /* ---------- tables ---------- */
 var sortCol=-1,sortAsc=true;
 var colFilters=[],lay=null;   /* per-column filter text; measured column tLayout */
@@ -15644,7 +15594,7 @@ function tSortRows(rows){
    own column. They combine with AND, which is what makes them worth having
    separately - 'sshd' anywhere plus user=root is a different question from
    either on its own. */
-function tMatching(t){
+function tMatching(t,noBucket){
  var q=(st.tq||'').toLowerCase();
  var rows=t.rows;
  if(q){rows=rows.filter(function(r){return r.join(' ').toLowerCase().indexOf(q)>=0;});}
@@ -15656,9 +15606,31 @@ function tMatching(t){
    var v=r[act[k][0]];v=(v===undefined||v===null)?'':String(v);
    if(v.toLowerCase().indexOf(act[k][1])<0){return false;}}
   return true;});}
+ /* The header chips, the category / technique pills and the timeline bucket
+    are filters too, and they have to bite here rather than in a second pass:
+    the row count, the chart and the grid all read this one list, and a view
+    whose chips disagree with its own table is worse than no chips at all.
+    Only the three console tables answer to them - an artifact grid that
+    happens to carry a severity column is not the findings list. */
+ var v=isView(t);
+ if(v){
+  var si=t.columns.indexOf('severity');
+  if(si>=0)rows=rows.filter(function(r){return st.sev[r[si]]!==false;});
+  if(v==='findings'){
+   var f=fc();
+   if(st.cat)rows=rows.filter(function(r){return r[f.category]===st.cat;});
+   if(st.tech)rows=rows.filter(function(r){
+    return techsOf(r[f.mitre]).indexOf(st.tech)>=0;});}
+  if(v==='timeline'&&!noBucket&&st.bucket!=null&&TLB[st.bucket]){
+   var ti=t.columns.indexOf('timestamp_utc'),bk=TLB[st.bucket];
+   if(ti>=0)rows=rows.filter(function(r){
+    var e=ts(r[ti]);
+    return e!==null&&e>=bk.t0&&(e<bk.t1||st.bucket===TLB.length-1);});}}
  if(sortCol>=0){rows=tSortRows(rows);}
+ TLAST=rows;
  return rows;
 }
+var TLAST=[];   /* the rows on screen, in the order they are on screen */
 /* Excel offers a tick-list of a column's distinct values; the same idea here
    is a <datalist>, so a low-cardinality column (level, user, process, status)
    suggests what is actually in it instead of making you guess. Columns whose
@@ -15676,7 +15648,7 @@ function tOptions(t,j){
 function tBodyHtml(t,rows,cap){
  var sevIdx=t.columns.indexOf('severity'),h='';
  for(var i=0;i<cap;i++){
-  var r=rows[i];h+='<tr>';
+  var r=rows[i];h+='<tr data-r="'+i+'"'+(r===st.sel?' class="sel"':'')+'>';
   for(var j=0;j<t.columns.length;j++){
    var v=r[j]===undefined?'':r[j];
    var cls=(sevIdx===j)?'sev-'+esc(v):(lay[j].num?'num':'');
@@ -15702,6 +15674,11 @@ function tRefresh(){
   ' the CSV / JSON export for everything.':'';}
  var none=document.getElementById('none');
  if(none){none.style.display=rows.length?'none':'block';}
+ /* The chart follows the filter, but the box being typed into must not be
+    rebuilt - so the head is replaced and re-wired while the input above it
+    is left exactly where it is, caret included. */
+ var vh=document.getElementById('vhead');
+ if(vh){vh.innerHTML=viewHead();wireHead();}
  [].forEach.call(document.querySelectorAll('tr.f input'),function(inp){
   inp.classList.toggle('on',!!inp.value);});
 }
@@ -15720,6 +15697,7 @@ function tRender(){
  if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
    t.rows.length.toLocaleString()+' \\u2014 full data in the CSV / JSON export</span>';}
  h+='</div>';
+ h+='<div id="vhead">'+viewHead()+'</div>';
  /* the layout is measured once per table, not per keystroke - columns that
     resize while you are typing into them are worse than columns that do not */
  lay=tLayout(t,rows.length?rows:t.rows,Math.max(cap,1));
@@ -15768,7 +15746,32 @@ function tRender(){
  document.getElementById('main').innerHTML=h;
  tWire();
 }
+/* Handlers for everything viewHead() drew: the histogram columns, the filter
+   pills and the detail pane's close control. */
+function wireHead(){
+ [].forEach.call(document.querySelectorAll('.histo.click .col'),function(c){
+  c.onclick=function(){
+   var i=+c.getAttribute('data-b');
+   st.bucket=(st.bucket===i)?null:i;tRender();};});
+ [].forEach.call(document.querySelectorAll('#vhead [data-clear]'),function(x){
+  var k=x.getAttribute('data-clear');
+  x.onclick=function(){st[k]=(k==='bucket'||k==='sel')?null:'';tRender();};});
+ [].forEach.call(document.querySelectorAll('#vhead [data-tech]'),function(x){
+  x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
+}
 function tWire(){
+ wireHead();
+ /* A findings row opens itself in the detail pane; every other grid is read
+    in place, so a click there would only take the row out from under you. */
+ if(isView(TB[st.table])==='findings'){
+  [].forEach.call(document.querySelectorAll('tbody tr'),function(tr){
+   tr.onclick=function(){
+    st.sel=TLAST[+tr.getAttribute('data-r')];
+    var vh=document.getElementById('vhead');
+    if(vh){vh.innerHTML=viewHead();wireHead();}
+    [].forEach.call(document.querySelectorAll('tbody tr.sel'),function(o){
+     o.classList.remove('sel');});
+    tr.classList.add('sel');};});}
  [].forEach.call(document.querySelectorAll('#hdr th'),function(th){
   th.onclick=function(){var i=+th.getAttribute('data-i');
    if(sortCol===i){sortAsc=!sortAsc;}else{sortCol=i;sortAsc=true;}
@@ -15805,67 +15808,15 @@ start();
 
 
 def _triage_payload(tri, opts):
-    """The triage half of the page's data: findings, events, indicators.
+    """The collection header the console shows beside its charts.
 
-    Split out from the writer because the page it feeds is the same page that
-    carries the artifact tables - one file, one nav, one set of severity chips
-    over both halves. A run that only exported one table passes no triage at
-    all and gets the tables alone.
+    Everything else it needs - the findings, the timeline, the indicators -
+    is read out of the FINDINGS, TIMELINE and IOCS tables, which the builder
+    produces for the CSV and JSON exports anyway. Embedding a second copy for
+    the page to read would double the largest part of the file and give the
+    two copies a way to disagree with each other.
     """
-    counts = {s: sum(1 for f in tri.findings if f.severity == s) for s in SEVERITIES}
-
-    findings, names, tactics = [], {}, {}
-    for i, f in enumerate(tri.findings):
-        techs = []
-        for t in _gui_techniques(f.mitre):
-            if t not in techs:
-                techs.append(t)
-            if t not in names:
-                lbl = _gui_label(f.mitre, t)
-                if lbl:
-                    names[t] = lbl
-            # A sub-technique inherits its parent's column.
-            tactics[t] = ATTACK_TACTICS.get(t.split(".")[0], "Other")
-        ev = f.evidence[:400]
-        # One lowercased haystack per finding, built once here rather than on
-        # every keystroke in the browser: the search box filters the whole set
-        # on each character, and re-joining evidence there is what makes a
-        # 20,000-finding page feel slow.
-        hay = " ".join([f.title, f.detail, f.category, f.source, f.mitre] + ev).lower()
-        findings.append({
-            "id": i, "sev": f.severity, "cat": f.category, "title": f.title,
-            "detail": f.detail, "src": f.source, "techs": techs,
-            "seen": f.seen_text(), "last": f.last_seen or f.first_seen,
-            "count": f.count, "ev": ev,
-            "more": max(0, len(f.evidence) - len(ev)), "hay": hay,
-        })
-
-    events = []
-    # Sorted before it is capped: analyzers append as they run, and the rule
-    # hunts append after everything else, so the tail of the list is the last
-    # thing parsed rather than the last thing that happened. Uncapped that is
-    # only untidy; capped it silently drops the wrong events, and the chart
-    # downstream reads the first event as the start of time.
-    for e in sorted(tri.events, key=lambda x: x.ts)[-opts.timeline_limit:]:
-        events.append({
-            "t": e.ts.strftime("%Y-%m-%d %H:%M:%S"),
-            # Epoch seconds alongside the string: the activity chart buckets on
-            # it, and re-parsing 3000 timestamps in the browser is wasted work.
-            # An analyzer that built a naive datetime still meant UTC, so it is
-            # stamped as such rather than drifting by the examiner's offset.
-            "e": int((e.ts if e.ts.tzinfo else
-                      e.ts.replace(tzinfo=timezone.utc)).timestamp()),
-            "s": e.severity, "c": e.category,
-            "d": trunc(e.description, 300),
-        })
-
-    iocs = [{"i": k, "w": ", ".join(sorted(v))} for k, v in sorted(tri.iocs.items())]
-
-    return {
-        "meta": [[k, str(v)] for k, v in tri.meta.items() if v],
-        "counts": counts, "findings": findings, "events": events,
-        "iocs": iocs, "names": names, "tactics": tactics,
-    }
+    return {"meta": [[k, str(v)] for k, v in tri.meta.items() if v]}
 
 
 # ---------------------------------------------------------------------------
