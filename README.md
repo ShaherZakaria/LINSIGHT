@@ -76,6 +76,26 @@ python linsight.py ./coll --process-map p.csv  # only the merged process table
 
 Findings and the timeline always run over the whole collection; they exist to correlate across the two halves, so narrowing them would cost answers rather than time.
 
+### 3. The GUI
+
+`--html` writes a document. `--gui` writes a console to work the case in — one self-contained page, no server, no network, nothing to install.
+
+```bash
+python linsight.py ./coll --gui case.html
+```
+
+| view | what it is for |
+|---|---|
+| **Overview** | severity cards, activity over the collection's span, the loudest categories, techniques and artifacts — every bar is a click through to the findings behind it |
+| **Findings** | the ranked list beside a detail pane: filter by severity, category, technique or free text; the search covers evidence lines, not just titles |
+| **ATT&CK** | the techniques the findings actually carry, laid out by tactic and coloured by the worst severity in each cell; click a technique to filter the findings to it |
+| **Timeline** | the merged event timeline, severity-filtered and searchable |
+| **Indicators** | every indicator observed and which artifacts mentioned it |
+
+The severity chips in the header filter every view at once, so a technique cell counts what the chips are showing. `alt`-click a chip to isolate one severity. `1`–`5` switch views, `/` focuses the search box, `j`/`k` walk the finding list.
+
+It carries the triage picture only — the 89 artifact tables stay in the `--export` browser, because folding a few million rows into this page would cost the instant open that makes it worth having.
+
 ## Hunting
 
 ### Pivot on an indicator

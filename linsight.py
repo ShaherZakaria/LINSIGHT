@@ -14747,7 +14747,7 @@ def _check_output_paths(col, opts):
         return
     base = os.path.abspath(col.path)
     for path in (opts.export, opts.csv_dir, opts.tables_json, opts.tables_html,
-                 opts.json, opts.html, opts.timeline, opts.process_map):
+                 opts.json, opts.html, opts.gui, opts.timeline, opts.process_map):
         if not path:
             continue
         full = os.path.abspath(path)
@@ -15158,6 +15158,700 @@ def write_html(tri, path, opts):
 
 
 # ---------------------------------------------------------------------------
+# The GUI: one self-contained page that carries the triage picture.
+#
+# --html writes a document - a flat page you read top to bottom and hand to
+# someone. This is the other thing an analyst wants from the same data: a
+# console to work the findings in, filter by severity, pivot on a technique,
+# read the evidence beside the list rather than by scrolling to it.
+#
+# It stays one file with no dependency on the network, because the box that
+# reads a triage collection is routinely the box that is not allowed to fetch
+# anything. Tables are deliberately not bundled: --export already writes
+# browser.html for those, and folding 3.3 million rows into this page would
+# cost the instant first paint that makes it usable.
+
+# Technique -> tactic, parent IDs only; a sub-technique inherits its parent's
+# column. Only the tactic is stored: the technique's *name* already arrives in
+# the finding's mitre string ("T1053.003 Scheduled Task: Cron"), so keeping a
+# second copy here would be one more thing to hold consistent with ATT&CK.
+# An ID that is not listed lands in "Other" rather than being dropped - a Sigma
+# rule can carry any technique at all, and a hit that vanishes from the matrix
+# because the map is short is worse than a hit in the wrong column.
+ATTACK_TACTICS = {
+    "T1592": "Reconnaissance", "T1595": "Reconnaissance",
+    "T1587": "Resource Development", "T1588": "Resource Development",
+    "T1608": "Resource Development",
+    "T1133": "Initial Access", "T1190": "Initial Access",
+    "T1195": "Initial Access", "T1566": "Initial Access",
+    "T1059": "Execution", "T1203": "Execution", "T1204": "Execution",
+    "T1569": "Execution", "T1610": "Execution",
+    "T1053": "Persistence", "T1078": "Persistence", "T1098": "Persistence",
+    "T1136": "Persistence", "T1176": "Persistence", "T1505": "Persistence",
+    "T1525": "Persistence", "T1543": "Persistence", "T1546": "Persistence",
+    "T1547": "Persistence", "T1554": "Persistence", "T1574": "Persistence",
+    "T1068": "Privilege Escalation", "T1134": "Privilege Escalation",
+    "T1548": "Privilege Escalation", "T1611": "Privilege Escalation",
+    "T1014": "Defense Evasion", "T1027": "Defense Evasion",
+    "T1036": "Defense Evasion", "T1055": "Defense Evasion",
+    "T1070": "Defense Evasion", "T1140": "Defense Evasion",
+    "T1205": "Defense Evasion", "T1218": "Defense Evasion",
+    "T1222": "Defense Evasion", "T1480": "Defense Evasion",
+    "T1497": "Defense Evasion", "T1553": "Defense Evasion",
+    "T1562": "Defense Evasion", "T1564": "Defense Evasion",
+    "T1620": "Defense Evasion",
+    "T1003": "Credential Access", "T1040": "Credential Access",
+    "T1110": "Credential Access", "T1528": "Credential Access",
+    "T1539": "Credential Access", "T1552": "Credential Access",
+    "T1555": "Credential Access", "T1556": "Credential Access",
+    "T1557": "Credential Access",
+    "T1018": "Discovery", "T1033": "Discovery", "T1046": "Discovery",
+    "T1049": "Discovery", "T1057": "Discovery", "T1069": "Discovery",
+    "T1082": "Discovery", "T1083": "Discovery", "T1087": "Discovery",
+    "T1518": "Discovery", "T1526": "Discovery", "T1613": "Discovery",
+    "T1021": "Lateral Movement", "T1072": "Lateral Movement",
+    "T1210": "Lateral Movement", "T1563": "Lateral Movement",
+    "T1570": "Lateral Movement",
+    "T1005": "Collection", "T1074": "Collection", "T1560": "Collection",
+    "T1071": "Command and Control", "T1090": "Command and Control",
+    "T1095": "Command and Control", "T1104": "Command and Control",
+    "T1105": "Command and Control", "T1132": "Command and Control",
+    "T1219": "Command and Control", "T1571": "Command and Control",
+    "T1572": "Command and Control", "T1573": "Command and Control",
+    "T1041": "Exfiltration", "T1048": "Exfiltration", "T1567": "Exfiltration",
+    "T1485": "Impact", "T1486": "Impact", "T1489": "Impact",
+    "T1490": "Impact", "T1495": "Impact", "T1496": "Impact",
+    "T1499": "Impact", "T1531": "Impact", "T1561": "Impact",
+    "T1565": "Impact",
+}
+
+# Left to right as ATT&CK draws it, so the matrix reads as an attack sequence.
+ATTACK_ORDER = [
+    "Reconnaissance", "Resource Development", "Initial Access", "Execution",
+    "Persistence", "Privilege Escalation", "Defense Evasion",
+    "Credential Access", "Discovery", "Lateral Movement", "Collection",
+    "Command and Control", "Exfiltration", "Impact", "Other",
+]
+
+_TECH_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
+
+
+def _gui_techniques(mitre):
+    """Every technique ID in one finding's mitre string.
+
+    The field is prose, not a list: "T1078 Valid Accounts / T1021.004 SSH" is
+    two techniques and "T1036 Masquerading" is one, and Sigma contributes its
+    own comma-joined form. Pulling the IDs out with a pattern handles all of
+    them without asking every analyzer to change what it writes.
+    """
+    return _TECH_RE.findall(mitre or "")
+
+
+def _gui_label(mitre, tech):
+    """The human name beside a technique ID, taken from the finding itself.
+
+    "T1053.003 Scheduled Task: Cron" -> "Scheduled Task: Cron". Nothing is
+    invented when the string is a bare ID - the matrix then shows the ID alone,
+    which is still the thing an analyst looks up.
+    """
+    if not mitre:
+        return ""
+    i = mitre.find(tech)
+    if i < 0:
+        return ""
+    rest = mitre[i + len(tech):].lstrip(" -:")
+    for sep in ("/", ","):
+        if sep in rest:
+            rest = rest.split(sep)[0]
+    rest = rest.strip()
+    # A trailing fragment that is just another ID is not a name.
+    return "" if _TECH_RE.match(rest) else rest[:60]
+
+
+GUI_CSS = """
+:root{--bg:#0f1419;--panel:#161b22;--panel2:#1c2330;--line:#2b3440;--fg:#d7dee7;
+--dim:#8b98a8;--accent:#58a6ff;--gold:#f5d067;
+--CRITICAL:#ff5f56;--HIGH:#ff9f43;--MEDIUM:#ffd93d;--LOW:#5ad1e6;--INFO:#8b98a8}
+*{box-sizing:border-box}
+body{margin:0;font:13px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+background:var(--bg);color:var(--fg);overflow:hidden}
+code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace}
+a{color:var(--accent);text-decoration:none}
+
+/* ---- chrome ---- */
+header{display:flex;align-items:center;gap:16px;padding:10px 16px;
+border-bottom:1px solid var(--line);background:var(--panel);height:56px}
+.brand{display:flex;align-items:baseline;gap:9px;flex:0 0 auto}
+.brand b{font-size:17px;font-weight:600;letter-spacing:-.3px}
+.brand span{font-size:9.5px;letter-spacing:2px;color:var(--dim)}
+.host{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap;flex:1 1 auto}
+.host b{color:var(--fg);font-weight:600}
+.chips{display:flex;gap:6px;flex:0 0 auto}
+.chip{border:1px solid var(--line);border-radius:14px;padding:2px 10px;cursor:pointer;
+font-size:11px;letter-spacing:.5px;background:transparent;color:var(--dim);
+font-variant-numeric:tabular-nums;user-select:none}
+.chip b{color:var(--fg);margin-right:5px}
+.chip.on{background:var(--panel2)}
+.chip.on.CRITICAL{color:var(--CRITICAL);border-color:var(--CRITICAL)}
+.chip.on.HIGH{color:var(--HIGH);border-color:var(--HIGH)}
+.chip.on.MEDIUM{color:var(--MEDIUM);border-color:var(--MEDIUM)}
+.chip.on.LOW{color:var(--LOW);border-color:var(--LOW)}
+.chip.on.INFO{color:var(--INFO);border-color:var(--INFO)}
+.chip.off{opacity:.42;text-decoration:line-through}
+
+.layout{display:flex;height:calc(100vh - 56px)}
+nav{width:186px;flex:0 0 186px;background:var(--panel);border-right:1px solid var(--line);
+padding:10px 0;display:flex;flex-direction:column}
+nav a{display:flex;justify-content:space-between;align-items:center;gap:8px;
+padding:7px 14px;color:var(--fg);border-left:3px solid transparent;cursor:pointer}
+nav a:hover{background:var(--panel2)}
+nav a.active{background:var(--panel2);border-left-color:var(--gold);color:var(--gold)}
+nav a .n{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+nav .foot{margin-top:auto;padding:10px 14px;color:var(--dim);font-size:10.5px;
+border-top:1px solid var(--line)}
+main{flex:1;overflow:auto;padding:16px 18px}
+h2{margin:0 0 12px;font-size:14px;font-weight:600;letter-spacing:.3px}
+h3{margin:22px 0 9px;font-size:12px;font-weight:600;color:var(--dim);
+text-transform:uppercase;letter-spacing:1px}
+
+/* ---- overview ---- */
+.cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.card{flex:1 1 128px;background:var(--panel);border:1px solid var(--line);
+border-top-width:3px;border-radius:6px;padding:11px 13px;cursor:pointer}
+.card:hover{background:var(--panel2)}
+.card b{display:block;font-size:25px;line-height:1.15;font-variant-numeric:tabular-nums}
+.card span{color:var(--dim);font-size:10.5px;letter-spacing:1.1px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px}
+.bars{display:flex;flex-direction:column;gap:5px}
+.bar{display:grid;grid-template-columns:1fr 46px;gap:9px;align-items:center;cursor:pointer}
+.bar:hover .lbl{color:var(--gold)}
+.bar .lbl{position:relative;padding:3px 7px;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap;border-radius:3px;background:var(--panel)}
+.bar .fill{position:absolute;left:0;top:0;bottom:0;background:var(--panel2);z-index:0}
+.bar .tx{position:relative;z-index:1}
+.bar .n{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
+.histo{display:flex;align-items:flex-end;gap:2px;background:var(--panel);
+border:1px solid var(--line);border-radius:6px;padding:8px}
+.histo .col{flex:1;min-width:2px;height:100%;display:flex;flex-direction:column-reverse}
+.histo .col:hover{outline:1px solid var(--gold);outline-offset:1px}
+.histo.click .col{cursor:pointer}
+/* A bucket holding one event still has to be visible next to a bucket holding
+   a thousand, or a quiet week reads as no data at all. */
+.histo .seg{width:100%;opacity:.85;min-height:2px}
+.histo .col:hover .seg{opacity:1}
+.histo .col.on{outline:1px solid var(--gold)}
+.axis{display:flex;justify-content:space-between;color:var(--dim);font-size:10.5px;
+padding:4px 2px 0}
+table.meta{border-collapse:collapse;font-size:12px}
+table.meta td{padding:3px 14px 3px 0;vertical-align:top}
+table.meta td:first-child{color:var(--dim);white-space:nowrap}
+
+/* ---- findings ---- */
+.split{display:flex;gap:14px;height:calc(100vh - 56px - 32px - 42px)}
+.list{flex:0 0 45%;overflow:auto;border:1px solid var(--line);border-radius:6px;
+background:var(--panel)}
+.row{padding:8px 11px;border-bottom:1px solid var(--line);cursor:pointer;
+border-left:3px solid transparent}
+.row:hover{background:var(--panel2)}
+.row.sel{background:var(--panel2);border-left-color:var(--gold)}
+.row .t{display:flex;gap:8px;align-items:baseline}
+.row .tag{font-size:9.5px;letter-spacing:.7px;padding:1px 5px;border-radius:3px;
+flex:0 0 auto;color:#0f1419;font-weight:700}
+.row .ti{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .sub{color:var(--dim);font-size:11px;margin-top:2px;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.detail{flex:1;overflow:auto;border:1px solid var(--line);border-radius:6px;
+background:var(--panel);padding:14px 16px}
+.detail h4{margin:0 0 6px;font-size:14px;font-weight:600}
+.detail .d{color:var(--dim);margin-bottom:12px}
+.detail pre{background:var(--bg);border:1px solid var(--line);border-radius:5px;
+padding:10px;overflow:auto;max-height:52vh;font-size:11.5px;white-space:pre-wrap;
+word-break:break-all;margin:0}
+.kv{display:grid;grid-template-columns:92px 1fr;gap:4px 12px;margin-bottom:13px;
+font-size:12px}
+.kv span{color:var(--dim)}
+.pill{display:inline-block;border:1px solid var(--line);border-radius:11px;
+padding:0 8px;margin:0 4px 4px 0;font-size:11px;cursor:pointer;color:var(--accent)}
+.pill:hover{background:var(--panel2)}
+.empty{color:var(--dim);padding:26px 4px;text-align:center}
+.bartop{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+input[type=search],select{background:var(--panel);color:var(--fg);
+border:1px solid var(--line);border-radius:5px;padding:5px 9px;font:inherit;outline:none}
+input[type=search]{flex:1}
+input[type=search]:focus,select:focus{border-color:var(--accent)}
+.count{color:var(--dim);font-size:11.5px;white-space:nowrap}
+
+/* ---- attack matrix ---- */
+.matrix{display:flex;gap:8px;overflow-x:auto;padding-bottom:8px;align-items:flex-start}
+.tac{flex:0 0 152px;background:var(--panel);border:1px solid var(--line);border-radius:6px}
+.tac .h{padding:7px 9px;border-bottom:1px solid var(--line);font-size:10.5px;
+color:var(--dim);text-transform:uppercase;letter-spacing:.8px;line-height:1.3}
+.tac .h b{display:block;color:var(--fg);font-size:11.5px;letter-spacing:0;
+text-transform:none}
+.cell{margin:6px;padding:5px 7px;border-radius:4px;cursor:pointer;
+border-left:3px solid var(--line);background:var(--panel2)}
+.cell:hover{outline:1px solid var(--gold)}
+.cell .id{font-size:11px;font-variant-numeric:tabular-nums}
+.cell .nm{color:var(--dim);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+.cell .n{float:right;color:var(--dim);font-size:10.5px}
+
+/* ---- tables (timeline, iocs) ---- */
+table.grid{width:100%;border-collapse:collapse;font-size:12px}
+table.grid th{position:sticky;top:0;background:var(--panel2);text-align:left;
+padding:6px 9px;border-bottom:1px solid var(--line);font-weight:600;z-index:1}
+table.grid td{padding:4px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+table.grid tr:hover td{background:var(--panel)}
+td.mono{font-family:ui-monospace,Consolas,monospace;white-space:nowrap}
+td.wrap{word-break:break-word}
+.more{margin:12px 0;padding:7px;text-align:center;border:1px dashed var(--line);
+border-radius:5px;color:var(--dim);cursor:pointer}
+.more:hover{color:var(--fg);border-color:var(--accent)}
+"""
+
+GUI_JS = """
+var D=window.__LINSIGHT__,SEV=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
+var st={view:'overview',sev:{},q:'',cat:'',tech:'',sel:null,page:400,bucket:null};
+var TLB=[];   /* the timeline chart's bucket bounds, from the last render */
+SEV.forEach(function(s){st.sev[s]=true;});
+
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function el(id){return document.getElementById(id);}
+function sevRank(s){var i=SEV.indexOf(s);return i<0?99:i;}
+
+/* One predicate for every view, so a severity chip means the same thing in the
+   matrix as it does in the finding list. */
+function match(f){
+ if(!st.sev[f.sev])return false;
+ if(st.cat&&f.cat!==st.cat)return false;
+ if(st.tech&&f.techs.indexOf(st.tech)<0)return false;
+ if(st.q){
+  var q=st.q.toLowerCase();
+  if((f.hay||'').indexOf(q)<0)return false;
+ }
+ return true;
+}
+function findings(){return D.findings.filter(match);}
+
+function setView(v){
+ st.view=v;st.page=400;
+ [].forEach.call(document.querySelectorAll('nav a'),function(a){
+  a.classList.toggle('active',a.getAttribute('data-v')===v);});
+ location.hash=v;
+ render();
+}
+function chips(){
+ var h='';
+ SEV.forEach(function(s){
+  h+='<button class="chip '+s+' '+(st.sev[s]?'on':'off')+'" data-s="'+s+'">'+
+     '<b>'+(D.counts[s]||0)+'</b>'+s+'</button>';});
+ el('chips').innerHTML=h;
+ [].forEach.call(document.querySelectorAll('#chips .chip'),function(b){
+  b.onclick=function(ev){
+   ev=ev||window.event;
+   var s=b.getAttribute('data-s');
+   /* Alt-click isolates one severity: the common move is "show me only the
+      criticals", which is otherwise four clicks. */
+   if(ev&&ev.altKey){
+    SEV.forEach(function(x){st.sev[x]=(x===s);});
+   }else{st.sev[s]=!st.sev[s];}
+   st.bucket=null;chips();render();};});
+}
+
+/* ---------- overview ---------- */
+/* act is what a click on a bar filters by (''  = not clickable); lab turns the
+   key into what the row reads as, so a technique bar can show its name while
+   still filtering on the bare ID. */
+function barList(pairs,act,lab){
+ if(!pairs.length)return '<div class="empty">nothing</div>';
+ var max=pairs[0][1]||1,h='<div class="bars">';
+ pairs.forEach(function(p){
+  h+='<div class="bar" data-k="'+esc(p[0])+'" data-act="'+(act||'')+'">'+
+     '<div class="lbl"><div class="fill" style="width:'+
+     Math.max(2,Math.round(p[1]*100/max))+'%"></div>'+
+     '<div class="tx">'+esc((lab?lab(p[0]):p[0])||'(none)')+'</div></div>'+
+     '<div class="n">'+p[1]+'</div></div>';});
+ return h+'</div>';
+}
+function techLabel(t){return D.names[t]?t+'  '+D.names[t]:t;}
+function tally(list,fn){
+ var m={},out=[];
+ list.forEach(function(x){var ks=fn(x);if(!ks)return;
+  if(!(ks instanceof Array))ks=[ks];
+  ks.forEach(function(k){m[k]=(m[k]||0)+1;});});
+ for(var k in m)out.push([k,m[k]]);
+ out.sort(function(a,b){return b[1]-a[1];});
+ return out;
+}
+function viewOverview(){
+ var fs=findings(),h='<h2>Overview</h2><div class="cards">';
+ SEV.forEach(function(s){
+  var n=fs.filter(function(f){return f.sev===s;}).length;
+  h+='<div class="card" data-sev="'+s+'" style="border-top-color:var(--'+s+')">'+
+     '<b style="color:var(--'+s+')">'+n+'</b><span>'+s+'</span></div>';});
+ h+='<div class="card" style="border-top-color:var(--gold)"><b>'+D.events.length+
+    '</b><span>TIMELINE EVENTS</span></div>';
+ h+='<div class="card" style="border-top-color:var(--accent)"><b>'+D.iocs.length+
+    '</b><span>INDICATORS</span></div></div>';
+
+ h+='<div class="grid2"><div><h3>Activity</h3>'+spark()+'</div>';
+ h+='<div><h3>Collection</h3><table class="meta">';
+ D.meta.forEach(function(kv){
+  h+='<tr><td>'+esc(kv[0])+'</td><td>'+esc(kv[1])+'</td></tr>';});
+ h+='</table></div></div>';
+
+ h+='<div class="grid2"><div><h3>Categories</h3>'+
+    barList(tally(fs,function(f){return f.cat;}).slice(0,14),'cat')+'</div>';
+ h+='<div><h3>Techniques</h3>'+
+    barList(tally(fs,function(f){return f.techs;}).slice(0,14),'tech',techLabel)+
+    '</div></div>';
+
+ h+='<div><h3>Loudest artifacts</h3>'+
+    barList(tally(fs,function(f){return f.src;}).slice(0,10),'')+'</div>';
+ return h;
+}
+/* Events bucketed into n columns between the first and last, each column a
+   stack of severity segments. Buckets rather than one bar per event: a
+   collection covering a year and one covering an hour have to produce the same
+   shaped chart, and the stack is what makes a burst of CRITICAL visible inside
+   an hour that also carries a thousand INFO lines.
+   Returns the markup and, on the object, the bucket bounds - the timeline view
+   needs them to turn a click back into a time range. */
+function histo(ev,n,h_px,clickable){
+ if(!ev.length)return {html:'<div class="empty">no dated events</div>',b:[]};
+ var t0=ev[0].e,t1=ev[ev.length-1].e,span=Math.max(1,t1-t0),b=[],i;
+ for(i=0;i<n;i++)b.push({n:0,s:{},t0:t0+span*i/n,t1:t0+span*(i+1)/n});
+ ev.forEach(function(e){
+  var k=Math.min(n-1,Math.floor((e.e-t0)*n/span));
+  b[k].n++;b[k].s[e.s]=(b[k].s[e.s]||0)+1;});
+ var max=0;b.forEach(function(x){if(x.n>max)max=x.n;});
+ max=max||1;
+ var h='<div class="histo'+(clickable?' click':'')+'" style="height:'+h_px+'px">';
+ for(i=0;i<n;i++){
+  var tip=[];
+  SEV.forEach(function(sv){if(b[i].s[sv])tip.push(b[i].s[sv]+' '+sv);});
+  h+='<div class="col'+(st.bucket===i&&clickable?' on':'')+'" data-b="'+i+
+     '" title="'+esc(fmtT(b[i].t0)+'  -  '+(tip.join(', ')||'0'))+'">';
+  /* column-reverse stacks the first child at the bottom, so walking INFO to
+     CRITICAL puts the loud severities on top where they are read first. */
+  for(var j=SEV.length-1;j>=0;j--){
+   var c=b[i].s[SEV[j]];
+   if(c)h+='<div class="seg" style="height:'+(c*100/max)+'%;background:var(--'+
+     SEV[j]+')"></div>';}
+  h+='</div>';}
+ h+='</div><div class="axis"><span>'+esc(fmtT(t0))+'</span><span>'+
+    esc(fmtT(t0+span/2))+'</span><span>'+esc(fmtT(t1))+'</span></div>';
+ return {html:h,b:b};
+}
+/* Epoch seconds back to the same string shape the rows carry. Built from the
+   UTC parts, never the locale: the whole report is UTC and a chart axis that
+   quietly shifts to the examiner's timezone is a wrong answer. */
+function fmtT(sec){
+ var d=new Date(sec*1000),p=function(x){return (x<10?'0':'')+x;};
+ return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
+        p(d.getUTCHours())+':'+p(d.getUTCMinutes());
+}
+function spark(){return histo(D.events,60,88,false).html;}
+
+/* ---------- findings ---------- */
+function viewFindings(){
+ var fs=findings();
+ fs.sort(function(a,b){
+  var d=sevRank(a.sev)-sevRank(b.sev);if(d)return d;
+  return (b.last||'').localeCompare(a.last||'');});
+ var cats=tally(D.findings,function(f){return f.cat;}).map(function(p){return p[0];}).sort();
+ var h='<div class="bartop"><input type="search" id="q" placeholder="filter findings, evidence, artifact..." value="'+
+   esc(st.q)+'"><select id="cat"><option value="">all categories</option>';
+ cats.forEach(function(c){h+='<option'+(st.cat===c?' selected':'')+'>'+esc(c)+'</option>';});
+ h+='</select>';
+ if(st.tech)h+='<span class="pill" data-clear="tech">'+esc(st.tech)+' &times;</span>';
+ h+='<span class="count">'+fs.length+' of '+D.findings.length+'</span></div>';
+
+ h+='<div class="split"><div class="list" id="list">';
+ if(!fs.length)h+='<div class="empty">nothing matches</div>';
+ fs.slice(0,st.page).forEach(function(f){
+  h+='<div class="row'+(st.sel===f.id?' sel':'')+'" data-id="'+f.id+'">'+
+     '<div class="t"><span class="tag" style="background:var(--'+f.sev+')">'+
+     f.sev+'</span><span class="ti">'+esc(f.title)+'</span></div>'+
+     '<div class="sub">'+esc(f.cat)+(f.last?' &middot; '+esc(f.last):'')+
+     (f.src?' &middot; '+esc(f.src):'')+'</div></div>';});
+ if(fs.length>st.page)h+='<div class="more" id="more">show '+
+   Math.min(400,fs.length-st.page)+' more of '+(fs.length-st.page)+'</div>';
+ h+='</div><div class="detail" id="det">'+detail(fs)+'</div></div>';
+ return h;
+}
+function detail(fs){
+ var f=null;
+ D.findings.forEach(function(x){if(x.id===st.sel)f=x;});
+ if(!f)f=fs[0];
+ if(!f)return '<div class="empty">select a finding</div>';
+ st.sel=f.id;
+ var h='<h4><span class="tag" style="background:var(--'+f.sev+');color:#0f1419;'+
+   'padding:1px 6px;border-radius:3px;font-size:10px;margin-right:7px">'+f.sev+
+   '</span>'+esc(f.title)+'</h4>';
+ if(f.detail)h+='<div class="d">'+esc(f.detail)+'</div>';
+ h+='<div class="kv"><span>category</span><div>'+esc(f.cat)+'</div>';
+ if(f.src)h+='<span>artifact</span><div><code>'+esc(f.src)+'</code></div>';
+ if(f.seen)h+='<span>seen</span><div>'+esc(f.seen)+'</div>';
+ h+='<span>occurrences</span><div>'+f.count+'</div>';
+ if(f.techs.length){
+  h+='<span>ATT&amp;CK</span><div>';
+  f.techs.forEach(function(t){h+='<span class="pill" data-tech="'+esc(t)+'">'+
+    esc(t)+(D.names[t]?' '+esc(D.names[t]):'')+'</span>';});
+  h+='</div>';}
+ h+='</div>';
+ if(f.ev.length){
+  h+='<pre>'+esc(f.ev.join('\\n'))+'</pre>';
+  if(f.more)h+='<div class="count" style="margin-top:6px">... '+f.more+
+    ' more line(s) not shown</div>';}
+ return h;
+}
+
+/* ---------- attack matrix ---------- */
+function viewAttack(){
+ var fs=findings(),by={};
+ fs.forEach(function(f){
+  f.techs.forEach(function(t){
+   var tac=D.tactics[t]||'Other';
+   if(!by[tac])by[tac]={};
+   if(!by[tac][t])by[tac][t]={n:0,sev:'INFO'};
+   by[tac][t].n++;
+   if(sevRank(f.sev)<sevRank(by[tac][t].sev))by[tac][t].sev=f.sev;});});
+ var order=D.order.filter(function(t){return by[t];});
+ if(!order.length)return '<h2>ATT&amp;CK</h2><div class="empty">'+
+   'no findings carry a technique at this filter</div>';
+ var h='<h2>ATT&amp;CK <span class="count">&mdash; click a technique to filter the findings</span></h2>'+
+   '<div class="matrix">';
+ order.forEach(function(tac){
+  var ts=[];for(var t in by[tac])ts.push(t);
+  ts.sort(function(a,b){
+   var d=sevRank(by[tac][a].sev)-sevRank(by[tac][b].sev);
+   return d?d:by[tac][b].n-by[tac][a].n;});
+  h+='<div class="tac"><div class="h"><b>'+esc(tac)+'</b>'+ts.length+' technique(s)</div>';
+  ts.forEach(function(t){
+   var c=by[tac][t];
+   h+='<div class="cell" data-tech="'+esc(t)+'" style="border-left-color:var(--'+
+      c.sev+')"><div class="id">'+esc(t)+'<span class="n">'+c.n+'</span></div>'+
+      (D.names[t]?'<div class="nm">'+esc(D.names[t])+'</div>':'')+'</div>';});
+  h+='</div>';});
+ return h+'</div>';
+}
+
+/* ---------- timeline ---------- */
+function viewTimeline(){
+ var q=st.q.toLowerCase();
+ var ev=D.events.filter(function(e){
+  if(!st.sev[e.s])return false;
+  if(q&&(e.t+' '+e.c+' '+e.d).toLowerCase().indexOf(q)<0)return false;
+  return true;});
+ /* The chart is drawn from everything the severity chips and the search box
+    left, and the selected bucket then narrows only the table below it - so
+    picking a spike never hides the shape the spike sits in. */
+ var g=histo(ev,80,132,true);
+ TLB=g.b;
+ var rows=ev;
+ if(st.bucket!=null&&TLB[st.bucket]){
+  var b=TLB[st.bucket];
+  rows=ev.filter(function(e){return e.e>=b.t0&&(e.e<b.t1||st.bucket===TLB.length-1);});}
+ var h='<div class="bartop"><input type="search" id="q" placeholder="filter events..." value="'+
+   esc(st.q)+'">';
+ if(st.bucket!=null&&TLB[st.bucket])
+  h+='<span class="pill" data-clear="bucket">'+esc(fmtT(TLB[st.bucket].t0)+
+     ' - '+fmtT(TLB[st.bucket].t1))+' &times;</span>';
+ h+='<span class="count">'+rows.length+' of '+D.events.length+'</span></div>';
+ h+=g.html;
+ h+='<table class="grid" style="margin-top:14px"><tr><th>time (UTC)</th><th>sev</th>'+
+    '<th>category</th><th>event</th></tr>';
+ rows.slice(0,st.page).forEach(function(e){
+  h+='<tr><td class="mono">'+esc(e.t)+'</td><td style="color:var(--'+e.s+')">'+
+     e.s+'</td><td>'+esc(e.c)+'</td><td class="wrap">'+esc(e.d)+'</td></tr>';});
+ h+='</table>';
+ if(rows.length>st.page)h+='<div class="more" id="more">show more ('+
+   (rows.length-st.page)+' left)</div>';
+ return h;
+}
+
+/* ---------- indicators ---------- */
+function viewIocs(){
+ var q=st.q.toLowerCase();
+ var rows=D.iocs.filter(function(r){
+  return !q||(r.i+' '+r.w).toLowerCase().indexOf(q)>=0;});
+ var h='<div class="bartop"><input type="search" id="q" placeholder="filter indicators..." value="'+
+   esc(st.q)+'"><span class="count">'+rows.length+' of '+D.iocs.length+'</span></div>';
+ if(!rows.length)return h+'<div class="empty">no indicators recorded</div>';
+ h+='<table class="grid"><tr><th>indicator</th><th>seen in</th></tr>';
+ rows.slice(0,st.page).forEach(function(r){
+  h+='<tr><td class="mono">'+esc(r.i)+'</td><td class="wrap">'+esc(r.w)+'</td></tr>';});
+ h+='</table>';
+ if(rows.length>st.page)h+='<div class="more" id="more">show more ('+
+   (rows.length-st.page)+' left)</div>';
+ return h;
+}
+
+/* ---------- render + wiring ---------- */
+function render(){
+ var m=el('main');
+ m.innerHTML=st.view==='findings'?viewFindings():
+             st.view==='attack'?viewAttack():
+             st.view==='timeline'?viewTimeline():
+             st.view==='iocs'?viewIocs():viewOverview();
+ wire();
+ el('nFind').textContent=findings().length;
+}
+function wire(){
+ var q=el('q');
+ if(q){
+  /* The bucket index only means something against the chart it was clicked on;
+     a new query rebuilds the buckets, so the selection has to go with it. */
+  q.oninput=function(){st.q=q.value;st.page=400;st.bucket=null;render();
+   var n=el('q');if(n){n.focus();n.setSelectionRange(n.value.length,n.value.length);}};
+ }
+ var c=el('cat');
+ if(c)c.onchange=function(){st.cat=c.value;st.page=400;render();};
+ var more=el('more');
+ if(more)more.onclick=function(){st.page+=400;render();};
+
+ [].forEach.call(document.querySelectorAll('[data-tech]'),function(x){
+  x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
+ [].forEach.call(document.querySelectorAll('[data-clear]'),function(x){
+  var k=x.getAttribute('data-clear');
+  x.onclick=function(){st[k]=(k==='bucket')?null:'';render();};});
+ [].forEach.call(document.querySelectorAll('.histo.click .col'),function(c){
+  c.onclick=function(){
+   var i=+c.getAttribute('data-b');
+   st.bucket=(st.bucket===i)?null:i;st.page=400;render();};});
+ [].forEach.call(document.querySelectorAll('.row'),function(r){
+  r.onclick=function(){st.sel=+r.getAttribute('data-id');render();};});
+ [].forEach.call(document.querySelectorAll('.card[data-sev]'),function(cd){
+  cd.onclick=function(){
+   var s=cd.getAttribute('data-sev');
+   SEV.forEach(function(x){st.sev[x]=(x===s);});
+   chips();setView('findings');};});
+ [].forEach.call(document.querySelectorAll('.bar[data-act]'),function(b){
+  b.onclick=function(){
+   var a=b.getAttribute('data-act'),k=b.getAttribute('data-k');
+   if(a==='cat'){st.cat=k;setView('findings');}
+   else if(a==='tech'){st.tech=k;setView('findings');}};});
+}
+function start(){
+ chips();
+ [].forEach.call(document.querySelectorAll('nav a'),function(a){
+  a.onclick=function(){setView(a.getAttribute('data-v'));};});
+ el('nFind').textContent=D.findings.length;
+ var v=(location.hash||'').replace('#','');
+ setView(['overview','findings','attack','timeline','iocs'].indexOf(v)>=0?v:'overview');
+ document.onkeydown=function(e){
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
+  var k=e.key;
+  if(k==='/'){var q=el('q');if(q){q.focus();e.preventDefault();}}
+  if(k>='1'&&k<='5')setView(['overview','findings','attack','timeline','iocs'][+k-1]);
+  /* j/k walk the finding list without leaving the keyboard, the way the
+     console report is read. */
+  if(st.view==='findings'&&(k==='j'||k==='k')){
+   var fs=findings();fs.sort(function(a,b){
+    var d=sevRank(a.sev)-sevRank(b.sev);if(d)return d;
+    return (b.last||'').localeCompare(a.last||'');});
+   var i=-1;fs.forEach(function(f,n){if(f.id===st.sel)i=n;});
+   i=Math.max(0,Math.min(fs.length-1,i+(k==='j'?1:-1)));
+   if(fs[i]){st.sel=fs[i].id;render();
+    var sel=document.querySelector('.row.sel');
+    if(sel&&sel.scrollIntoView)sel.scrollIntoView({block:'nearest'});}}};
+}
+start();
+"""
+
+
+def write_gui(tri, path, opts):
+    """Write the interactive single-page console.
+
+    Everything the page needs is embedded: no fetch, no CDN, no server. The
+    payload keys are short because they repeat once per finding and per event -
+    on a noisy collection that is the difference between a 4 MB file and a 9 MB
+    one, and the file is routinely copied off the examination box by hand.
+    """
+    esc = htmllib.escape
+    counts = {s: sum(1 for f in tri.findings if f.severity == s) for s in SEVERITIES}
+
+    findings, names, tactics = [], {}, {}
+    for i, f in enumerate(tri.findings):
+        techs = []
+        for t in _gui_techniques(f.mitre):
+            if t not in techs:
+                techs.append(t)
+            if t not in names:
+                lbl = _gui_label(f.mitre, t)
+                if lbl:
+                    names[t] = lbl
+            # A sub-technique inherits its parent's column.
+            tactics[t] = ATTACK_TACTICS.get(t.split(".")[0], "Other")
+        ev = f.evidence[:400]
+        # One lowercased haystack per finding, built once here rather than on
+        # every keystroke in the browser: the search box filters the whole set
+        # on each character, and re-joining evidence there is what makes a
+        # 20,000-finding page feel slow.
+        hay = " ".join([f.title, f.detail, f.category, f.source, f.mitre] + ev).lower()
+        findings.append({
+            "id": i, "sev": f.severity, "cat": f.category, "title": f.title,
+            "detail": f.detail, "src": f.source, "techs": techs,
+            "seen": f.seen_text(), "last": f.last_seen or f.first_seen,
+            "count": f.count, "ev": ev,
+            "more": max(0, len(f.evidence) - len(ev)), "hay": hay,
+        })
+
+    events = []
+    for e in tri.events[-opts.timeline_limit:]:
+        events.append({
+            "t": e.ts.strftime("%Y-%m-%d %H:%M:%S"),
+            # Epoch seconds alongside the string: the activity chart buckets on
+            # it, and re-parsing 3000 timestamps in the browser is wasted work.
+            # An analyzer that built a naive datetime still meant UTC, so it is
+            # stamped as such rather than drifting by the examiner's offset.
+            "e": int((e.ts if e.ts.tzinfo else
+                      e.ts.replace(tzinfo=timezone.utc)).timestamp()),
+            "s": e.severity, "c": e.category,
+            "d": trunc(e.description, 300),
+        })
+
+    iocs = [{"i": k, "w": ", ".join(sorted(v))} for k, v in sorted(tri.iocs.items())]
+
+    payload = {
+        "meta": [[k, str(v)] for k, v in tri.meta.items() if v],
+        "counts": counts, "findings": findings, "events": events,
+        "iocs": iocs, "names": names, "tactics": tactics,
+        "order": ATTACK_ORDER, "version": VERSION,
+    }
+
+    host = tri.meta.get("Hostname", "collection")
+    nav = [("overview", "Overview", ""), ("findings", "Findings", "nFind"),
+           ("attack", "ATT&amp;CK", ""), ("timeline", "Timeline", len(events)),
+           ("iocs", "Indicators", len(iocs))]
+    navhtml = []
+    for key, label, n in nav:
+        badge = ('<span class="n" id="nFind"></span>' if n == "nFind"
+                 else ('<span class="n">%s</span>' % n if n != "" else ""))
+        navhtml.append('<a data-v="%s">%s%s</a>' % (key, label, badge))
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("<!doctype html><html><head><meta charset='utf-8'>"
+                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                 "<title>linsight - %s</title><style>%s</style></head><body>"
+                 % (esc(str(host)), GUI_CSS))
+        fh.write("<header><div class='brand'><b>linsight</b>"
+                 "<span>PARSE LINUX DEEP. HUNT THE MALICIOUS.</span></div>"
+                 "<div class='host'><b>%s</b> &nbsp;<code>%s</code></div>"
+                 "<div class='chips' id='chips'></div></header>"
+                 % (esc(str(host)), esc(tri.col.path)))
+        fh.write("<div class='layout'><nav>%s<div class='foot'>linsight v%s<br>"
+                 "1-5 views &middot; / search &middot; j/k walk</div></nav>"
+                 "<main id='main'></main></div>" % ("".join(navhtml), VERSION))
+        fh.write("<script>window.__LINSIGHT__=%s;</script>" % _script_json(payload))
+        fh.write("<script>%s</script></body></html>" % GUI_JS)
+    print("[+] GUI written to %s" % path, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
@@ -15189,6 +15883,9 @@ def main(argv=None):
                     help="evidence lines printed per finding on the console (default 25)")
     ap.add_argument("--json", metavar="PATH", help="write full findings as JSON")
     ap.add_argument("--html", metavar="PATH", help="write a self-contained HTML report")
+    ap.add_argument("--gui", metavar="PATH",
+                    help="write the interactive single-page console "
+                         "(findings, ATT&CK matrix, timeline, indicators)")
     ap.add_argument("--timeline", metavar="PATH", help="write the event timeline as CSV")
     ap.add_argument("--show-timeline", action="store_true",
                     help="also print the timeline on the console")
@@ -15389,9 +16086,9 @@ def main(argv=None):
     if opts.sigma_note:
         tri.meta["Sigma ruleset"] = opts.sigma_note
 
-    # Rule hits are findings, and the console report, --json and --html are all
-    # written from the finding list - so when rules are in play the tables have
-    # to be built first. The build is reused by the export below rather than
+    # Rule hits are findings, and the console report, --json, --html and --gui
+    # are all written from the finding list - so when rules are in play the
+    # tables have to be built first. The build is reused by the export below rather than
     # repeated.
     tb = None
     asked_for_rules = bool(opts.yara or opts.sigma or opts.keywords)
@@ -15412,6 +16109,8 @@ def main(argv=None):
         write_json(tri, opts.json)
     if opts.html:
         write_html(tri, opts.html, opts)
+    if opts.gui:
+        write_gui(tri, opts.gui, opts)
     if opts.timeline:
         write_timeline(tri, opts.timeline)
 
