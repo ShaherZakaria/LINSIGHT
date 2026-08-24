@@ -1,0 +1,21 @@
+# linsight.py requirements
+#
+# There are none. The tool imports nothing outside the Python standard
+# library, which is deliberate: it is meant to run on an evidence workstation
+# where installing packages is often not allowed and the analysis box may have
+# no route out. `pip install -r requirements.txt` succeeds and installs
+# nothing, which is the accurate answer rather than an empty file.
+#
+# Requires Python 3.8 or newer.
+#
+# ---------------------------------------------------------------------------
+# Optional
+# ---------------------------------------------------------------------------
+# PyYAML is used for parsing Sigma rules IF it happens to be importable. A
+# built-in parser handles them otherwise, so --sigma works either way; PyYAML
+# is faster and follows the YAML spec more closely on unusual rules. Uncomment
+# to install it, or install the extras file instead:
+#
+#     pip install -r requirements-optional.txt
+#
+# PyYAML>=5.1

@@ -1,11 +1,17 @@
-# uac_triage
+<p align="center">
+  <img src="assets/logo.svg" alt="linsight" width="540">
+</p>
 
-Parse a Linux triage collection and surface the things worth looking at first.
+<h1 align="center">linsight</h1>
+
+<p align="center">
+  Parse a Linux triage collection and surface the things worth looking at first.
+</p>
 
 Point it at a [UAC](https://github.com/tclahr/uac) or [Velociraptor](https://docs.velociraptor.app/docs/offline_triage/) offline collection and it produces two things: a severity-ranked set of **findings**, and every interesting artifact normalised into browsable **tables**. Single file, standard library only, Python 3.8+.
 
 ```
-python uac_triage.py ./uac-host-linux-20260324234043.tar.gz
+python linsight.py ./uac-host-linux-20260324234043.tar.gz
 ```
 
 ## Why
@@ -14,12 +20,12 @@ A UAC collection is a few thousand files of raw command output. The evidence is 
 
 ## Install
 
-There is nothing to install. Copy `uac_triage.py` onto the analysis box and run it.
+There is nothing to install. Copy `linsight.py` onto the analysis box and run it.
 
 ```bash
-git clone https://github.com/ShaherZakaria/uac-triage.git
-cd uac-triage
-python uac_triage.py <collection>
+git clone https://github.com/ShaherZakaria/linsight.git
+cd linsight
+python linsight.py <collection>
 ```
 
 No third-party packages are imported. PyYAML is used for Sigma rule parsing *if it happens to be importable*, and a built-in parser handles it otherwise.
@@ -42,11 +48,11 @@ It reads an **extracted directory** or the **archive directly** — `.tar`, `.ta
 The analyzers' conclusions, ranked `CRITICAL` / `HIGH` / `MEDIUM` / `LOW` / `INFO`. Each carries its category, the artifact it came from, its evidence lines, and a UTC timestamp derived from the evidence itself rather than from when you ran the tool.
 
 ```bash
-python uac_triage.py ./coll                          # console report
-python uac_triage.py ./coll --min-severity HIGH      # only the loud stuff
-python uac_triage.py ./coll --html report.html       # self-contained HTML
-python uac_triage.py ./coll --json findings.json     # machine-readable
-python uac_triage.py ./coll --timeline timeline.csv  # merged event timeline
+python linsight.py ./coll                          # console report
+python linsight.py ./coll --min-severity HIGH      # only the loud stuff
+python linsight.py ./coll --html report.html       # self-contained HTML
+python linsight.py ./coll --json findings.json     # machine-readable
+python linsight.py ./coll --timeline timeline.csv  # merged event timeline
 ```
 
 `--window H` sets the incident window used to decide what counts as "recent" (default 72 hours before collection time).
@@ -56,10 +62,10 @@ python uac_triage.py ./coll --timeline timeline.csv  # merged event timeline
 89 artifact types normalised into one grid each — processes, sockets, open files, cron, systemd units, auth log, journal, shell history, packages, persistence, the bodyfile, and so on. Every row keeps a `source` column naming the file it was parsed from.
 
 ```bash
-python uac_triage.py ./coll --export ./out       # csv/ + json/ + browser.html
-python uac_triage.py ./coll --csv-dir ./tables   # just the CSVs
-python uac_triage.py ./coll --tables-html b.html # just the HTML browser
-python uac_triage.py ./coll --process-map p.csv  # only the merged process table
+python linsight.py ./coll --export ./out       # csv/ + json/ + browser.html
+python linsight.py ./coll --csv-dir ./tables   # just the CSVs
+python linsight.py ./coll --tables-html b.html # just the HTML browser
+python linsight.py ./coll --process-map p.csv  # only the merged process table
 ```
 
 `--scope` narrows the table build to half the collection:
@@ -75,8 +81,8 @@ Findings and the timeline always run over the whole collection; they exist to co
 ### Pivot on an indicator
 
 ```bash
-python uac_triage.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3
-python uac_triage.py ./coll --pivot @iocs.txt
+python linsight.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3
+python linsight.py ./coll --pivot @iocs.txt
 ```
 
 Searches every collected artifact case-insensitively. All terms are matched in one pass, so a long list costs no more than a short one. `@file` reads one indicator per line, `#` for comments.
@@ -84,8 +90,8 @@ Searches every collected artifact case-insensitively. All terms are matched in o
 ### YARA
 
 ```bash
-python uac_triage.py ./coll --yara ./rules/
-python uac_triage.py ./coll --yara ./rules/ --deep   # + memory image strings
+python linsight.py ./coll --yara ./rules/
+python linsight.py ./coll --yara ./rules/ --deep   # + memory image strings
 ```
 
 Scans the collected filesystem and per-process memory strings. `--deep` adds `memory_dump/*strings*`, which is slow and multi-GB.
@@ -93,15 +99,15 @@ Scans the collected filesystem and per-process memory strings. `--deep` adds `me
 ### Sigma
 
 ```bash
-python uac_triage.py ./coll --sigma ./my-rules/     # your own rules
-python uac_triage.py ./coll --update-sigma          # fetch SigmaHQ, then hunt
-python uac_triage.py ./coll --sigma-cached          # hunt offline from cache
-python uac_triage.py --update-sigma                 # refresh the cache only
+python linsight.py ./coll --sigma ./my-rules/     # your own rules
+python linsight.py ./coll --update-sigma          # fetch SigmaHQ, then hunt
+python linsight.py ./coll --sigma-cached          # hunt offline from cache
+python linsight.py --update-sigma                 # refresh the cache only
 ```
 
 Rules run against the normalised tables — auth, journal, auditd, processes, cron, web logs — routed by each rule's `logsource`. `--update-sigma` keeps the Linux and web-log rules and skips the ~3000 Windows event-log ones, which could not fire here anyway. The fetch is conditional: an unchanged ruleset is a 304 and no download.
 
-For an air-gapped examination box, `--sigma-source` takes a zip you downloaded elsewhere or a directory, and `--sigma-dir` says where the cache lives (default `~/.uac_triage/sigma`, or `$UAC_SIGMA_DIR`).
+For an air-gapped examination box, `--sigma-source` takes a zip you downloaded elsewhere or a directory, and `--sigma-dir` says where the cache lives (default `~/.linsight/sigma`, or `$LINSIGHT_SIGMA_DIR`).
 
 **`--update-sigma` is the only thing in this tool that touches the network.** Everything else is offline.
 
@@ -140,7 +146,7 @@ See [`examples/`](examples/) for a full run against a public sample collection �
 ## Full options
 
 ```
-python uac_triage.py --help
+python linsight.py --help
 ```
 
 ## Caveats

@@ -1,6 +1,6 @@
 # Example output
 
-A real run of `uac_triage.py` against a UAC collection from an Ubuntu 18.04
+A real run of `linsight.py` against a UAC collection from an Ubuntu 18.04
 Azure VM running Apache, collected `2021-12-08 19:15:00 UTC`.
 
 | file | what it is |
@@ -40,7 +40,7 @@ This slice is 1.6 MB. The full export of the same collection was **2.5 GB** —
 Reproduce the whole thing with:
 
 ```bash
-python uac_triage.py <collection> --export ./out --html report.html
+python linsight.py <collection> --export ./out --html report.html
 ```
 
 ## Redaction

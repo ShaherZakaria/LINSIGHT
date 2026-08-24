@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-uac_triage.py - parse a Linux triage collection and highlight the critical /
+linsight.py - parse a Linux triage collection and highlight the critical /
 interesting events.
 
 Two collection layouts are understood, detected from the collection itself:
@@ -14,14 +14,14 @@ Two collection layouts are understood, detected from the collection itself:
 Works on an extracted collection directory OR directly on the .tar / .tar.gz /
 .zip either tool produced. Pure standard library, Python 3.8+.
 
-    python uac_triage.py <collection>                      # console report
-    python uac_triage.py <collection> --html report.html   # + HTML report
-    python uac_triage.py <collection> --json out.json --timeline tl.csv
-    python uac_triage.py <collection> --min-severity HIGH  # only the loud stuff
-    python uac_triage.py <collection> --pivot /dev/shm/kit # cross-artifact hunt
-    python uac_triage.py <collection> --deep               # scan memory strings
-    python uac_triage.py <collection> --update-sigma       # fetch SigmaHQ, hunt
-    python uac_triage.py <collection> --sigma-cached       # ... offline, cached
+    python linsight.py <collection>                      # console report
+    python linsight.py <collection> --html report.html   # + HTML report
+    python linsight.py <collection> --json out.json --timeline tl.csv
+    python linsight.py <collection> --min-severity HIGH  # only the loud stuff
+    python linsight.py <collection> --pivot /dev/shm/kit # cross-artifact hunt
+    python linsight.py <collection> --deep               # scan memory strings
+    python linsight.py <collection> --update-sigma       # fetch SigmaHQ, hunt
+    python linsight.py <collection> --sigma-cached       # ... offline, cached
 
 Two output layers:
 
@@ -30,8 +30,8 @@ Two output layers:
               table per artifact type, written as one CSV and one JSON per
               table plus an HTML browser:
 
-    python uac_triage.py <collection> --export ./out     # csv/ json/ browser
-    python uac_triage.py <collection> --csv-dir ./csv    # just the CSVs
+    python linsight.py <collection> --export ./out     # csv/ json/ browser
+    python linsight.py <collection> --csv-dir ./csv    # just the CSVs
 
 The table layer can be narrowed to half the collection with --scope:
 
@@ -2572,10 +2572,10 @@ def sigma_rule_wanted(text):
 
 def sigma_cache_dir(explicit=None):
     """Where the fetched ruleset lives - outside any collection, by design."""
-    path = explicit or os.environ.get("UAC_SIGMA_DIR")
+    path = explicit or os.environ.get("LINSIGHT_SIGMA_DIR")
     if path:
         return os.path.abspath(os.path.expanduser(path))
-    return os.path.join(os.path.expanduser("~"), ".uac_triage", "sigma")
+    return os.path.join(os.path.expanduser("~"), ".linsight", "sigma")
 
 
 def sigma_cache_manifest(dest):
@@ -2650,7 +2650,7 @@ def _sigma_fetch(url, etag=None, timeout=60, quiet=False):
     import urllib.request
 
     req = urllib.request.Request(url, headers={
-        "User-Agent": "uac_triage/%s" % VERSION,
+        "User-Agent": "linsight/%s" % VERSION,
         "Accept": "application/zip, */*",
     })
     if etag:
@@ -6577,7 +6577,7 @@ _SPILL_DIR = []                 # one temp dir per process, made on first spill
 
 def _spill_dir():
     if not _SPILL_DIR:
-        d = tempfile.mkdtemp(prefix="uac_triage_rows_")
+        d = tempfile.mkdtemp(prefix="linsight_rows_")
         _SPILL_DIR.append(d)
         # registered rather than cleaned up by the caller: the run can end at a
         # SystemExit from any of the output checks, and a few hundred MB of
@@ -6611,8 +6611,8 @@ class Table:
     # table through the spill path: a code path that only runs on collections
     # too big to test with is a code path nobody has tested.
     SPILL_NEVER = 10 ** 12
-    SPILL_AFTER = int(os.environ.get("UAC_SPILL_AFTER", SPILL_NEVER))
-    SPILL_CHUNK = int(os.environ.get("UAC_SPILL_CHUNK", 4000))
+    SPILL_AFTER = int(os.environ.get("LINSIGHT_SPILL_AFTER", SPILL_NEVER))
+    SPILL_CHUNK = int(os.environ.get("LINSIGHT_SPILL_CHUNK", 4000))
 
     def __init__(self, name, title, columns, category="", description="", sources=None):
         self.name = name                  # sheet / file name, <=31 chars, unique
@@ -14297,7 +14297,7 @@ def write_tables_ndjson(tables, dirpath, meta=None):
               "sources": t.sources, "ndjson_file": t.name + ".ndjson"}
              for t in tables]
     with open(os.path.join(dirpath, "00_INDEX.json"), "w", encoding="utf-8") as fh:
-        json.dump({"tool": "uac_triage.py", "version": VERSION,
+        json.dump({"tool": "linsight.py", "version": VERSION,
                    "generated_from": meta, "tables": index}, fh, indent=1)
 
     for t in tables:
@@ -14325,7 +14325,7 @@ def write_tables_ndjson(tables, dirpath, meta=None):
 def write_tables_json(tables, path, meta=None):
     """Streamed - the bodyfile table alone can be a couple of hundred thousand rows."""
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write('{\n"tool": "uac_triage.py",\n"version": %s,\n' % json.dumps(VERSION))
+        fh.write('{\n"tool": "linsight.py",\n"version": %s,\n' % json.dumps(VERSION))
         fh.write('"generated_from": %s,\n' % json.dumps(meta or {}))
         fh.write('"index": %s,\n' % json.dumps(
             [{"name": t.name, "title": t.title, "category": t.category,
@@ -14953,7 +14953,7 @@ def wrap(text, width):
 
 def write_json(tri, path):
     data = {
-        "tool": "uac_triage.py", "version": VERSION,
+        "tool": "linsight.py", "version": VERSION,
         "collection": tri.col.path,
         "metadata": tri.meta,
         "summary": {s: sum(1 for f in tri.findings if f.severity == s) for s in SEVERITIES},
@@ -15074,7 +15074,7 @@ def write_html(tri, path, opts):
                          % (esc(k), esc(", ".join(sorted(v)))))
         parts.append("</table>")
 
-    parts.append("<p class='kv'>generated by uac_triage.py v%s</p></body></html>" % VERSION)
+    parts.append("<p class='kv'>generated by linsight.py v%s</p></body></html>" % VERSION)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("".join(parts))
     print("[+] HTML report written to %s" % path, file=sys.stderr)
@@ -15088,17 +15088,17 @@ def main(argv=None):
                     "critical / interesting events.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-               "  python uac_triage.py ./uac-host-linux-20260324\n"
-               "  python uac_triage.py collection.tar.gz --html report.html --json out.json\n"
-               "  python uac_triage.py ./coll --min-severity HIGH --timeline timeline.csv\n"
-               "  python uac_triage.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3\n"
-               "  python uac_triage.py ./coll --export ./triage_out\n"
-               "  python uac_triage.py ./coll --csv-dir ./tables --quiet\n"
-               "  python uac_triage.py ./coll --export ./live --scope live\n"
-               "  python uac_triage.py ./coll --export ./disk --scope offline\n"
-               "  python uac_triage.py ./coll --update-sigma   # fetch SigmaHQ, then hunt\n"
-               "  python uac_triage.py ./coll --sigma-cached   # hunt offline with the cache\n"
-               "  python uac_triage.py --update-sigma          # refresh the cache only\n")
+               "  python linsight.py ./uac-host-linux-20260324\n"
+               "  python linsight.py collection.tar.gz --html report.html --json out.json\n"
+               "  python linsight.py ./coll --min-severity HIGH --timeline timeline.csv\n"
+               "  python linsight.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3\n"
+               "  python linsight.py ./coll --export ./triage_out\n"
+               "  python linsight.py ./coll --csv-dir ./tables --quiet\n"
+               "  python linsight.py ./coll --export ./live --scope live\n"
+               "  python linsight.py ./coll --export ./disk --scope offline\n"
+               "  python linsight.py ./coll --update-sigma   # fetch SigmaHQ, then hunt\n"
+               "  python linsight.py ./coll --sigma-cached   # hunt offline with the cache\n"
+               "  python linsight.py --update-sigma          # refresh the cache only\n")
     ap.add_argument("collection", nargs="?",
                     help="collection directory, .tar, .tar.gz or .zip - UAC "
                          "output or a Velociraptor offline collector zip; the "
@@ -15174,7 +15174,7 @@ def main(argv=None):
                          "--update-sigma.")
     rg.add_argument("--sigma-dir", metavar="DIR",
                     help="where the cached ruleset lives (default "
-                         "~/.uac_triage/sigma, or $UAC_SIGMA_DIR). It is a "
+                         "~/.linsight/sigma, or $LINSIGHT_SIGMA_DIR). It is a "
                          "plain directory of .yml files, so --sigma takes it "
                          "too.")
     rg.add_argument("--sigma-source", metavar="URL|ZIP|DIR",
@@ -15232,7 +15232,7 @@ def main(argv=None):
 
     # set before any table is built, because a table that has already buffered
     # its rows cannot be made to have spilled them
-    if opts.low_memory and "UAC_SPILL_AFTER" not in os.environ:
+    if opts.low_memory and "LINSIGHT_SPILL_AFTER" not in os.environ:
         Table.SPILL_AFTER = 20000
 
     opts.color = (not opts.no_color) and sys.stdout.isatty()
