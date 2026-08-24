@@ -255,9 +255,9 @@ root,,bash,/root/.bash_history,253,tshark -i eth0 -n 'tcp.request'
 root,,bash,/root/.bash_history,254,tshark -i eth0 -n 'http.request'
 root,,bash,/root/.bash_history,255,man tshark
 root,,bash,/root/.bash_history,256,tshark -i eth0 -n -Y  'http.request'
-root,,bash,/root/.bash_history,257,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.70'
+root,,bash,/root/.bash_history,257,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.69'
 root,,bash,/root/.bash_history,258,clear
-root,,bash,/root/.bash_history,259,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.70'
+root,,bash,/root/.bash_history,259,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.69'
 root,,bash,/root/.bash_history,260,cd /var/log
 root,,bash,/root/.bash_history,261,ll
 root,,bash,/root/.bash_history,262,aptitude search modsec
@@ -266,9 +266,9 @@ root,,bash,/root/.bash_history,264,ufw
 root,,bash,/root/.bash_history,265,ufw help
 root,,bash,/root/.bash_history,266,ufw status
 root,,bash,/root/.bash_history,267,clear
-root,,bash,/root/.bash_history,268,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.70'
+root,,bash,/root/.bash_history,268,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.69'
 root,,bash,/root/.bash_history,269,clear
-root,,bash,/root/.bash_history,270,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.70'
+root,,bash,/root/.bash_history,270,tshark -i eth0 -n -Y  'http.request' 'not host 198.18.11.69'
 root,,bash,/root/.bash_history,271,cd apache2/
 root,,bash,/root/.bash_history,272,ll
 root,,bash,/root/.bash_history,273,cat error_log

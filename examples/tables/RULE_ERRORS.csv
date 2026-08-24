@@ -1,0 +1,5 @@
+﻿engine,rule,reason
+sigma,sigma-rules/rules\linux\network_connection\net_connection_lnx_susp_malware_callback_port.yml: Potentially Suspicious Malware Callback Communication - Linux,modifier 'cidr' is not supported
+sigma,sigma-rules/rules\network\zeek\zeek_http_webdav_put_request.yml: WebDav Put Request,modifier 'cidr' is not supported
+sigma,sigma-rules/rules\network\zeek\zeek_rdp_public_listener.yml: Publicly Accessible RDP Service,modifier 'cidr' is not supported
+sigma,sigma-rules/rules\web\proxy_generic\proxy_webdav_external_execution.yml: Suspicious External WebDAV Execution,modifier 'cidr' is not supported

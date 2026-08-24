@@ -58,7 +58,7 @@
 1,* agettyd,24330,1,daemon,2021-12-05 08:28:02,3-10:23:30,,,,agettyd -c noresetd,
 1,* filebeat,27359,1,root,2021-11-19 01:05:40,19-17:45:52,,,,/usr/share/filebeat/bin/filebeat --environment systemd -c /etc/filebeat/filebeat.yml --path.home /usr/share/filebeat --path.config /etc/filebeat --path.data ...,
 1,* python3,27371,1,root,2021-11-19 01:10:10,19-17:41:22,,1,,/usr/bin/python3 -u /usr/sbin/waagent -daemon,
-2,** python3,27968,27371,root,2021-11-19 01:32:03,19-17:19:29,,,,python3 -u bin/WALinuxAgent-198.18.11.64-py2.7.egg -run-exthandlers,
+2,** python3,27968,27371,root,2021-11-19 01:32:03,19-17:19:29,,,,python3 -u bin/WALinuxAgent-198.18.11.65-py2.7.egg -run-exthandlers,
 1,* systemd-journal,27623,1,root,2021-11-19 01:31:32,19-17:20:00,,,,/lib/systemd/systemd-journald,
 1,* rsyslogd,31957,1,syslog,2021-11-19 01:35:35,19-17:15:57,,,,/usr/sbin/rsyslogd -n,
 0,kthreadd,2,0,root,2021-10-09 15:06:07,60-03:45:25,,84,,[kthreadd],

@@ -6,7 +6,7 @@ addresses go to the IANA documentation range. Base64 SSH key material is
 dropped. Private/loopback/reserved addresses are left alone: they identify
 nothing and removing them would make the example unreadable.
 """
-import csv, io, os, re, sys, ipaddress
+import csv, io, os, pathlib, re, sys, ipaddress
 
 IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 MAC  = re.compile(r"\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b")
@@ -18,7 +18,7 @@ GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                   r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 MACHINE_ID = re.compile(r"(?<=system@)[0-9a-f]{32}(?=-)")
 # The console header echoes the path the run was launched from.
-USERPATH = re.compile(r"[A-Za-z]:[\\/]Users[\\/][^\\/:*?\"<>|]+", re.I)
+USERPATH = re.compile(r"[A-Za-z]:(?:\\\\|\\|/)Users(?:\\\\|\\|/)[^\\/:*?<>|]+", re.I)
 
 ip_map, mac_map, guid_map = {}, {}, {}
 
@@ -50,8 +50,28 @@ def sub_mac(m):
         mac_map[mac] = "00:00:5e:00:53:%02x" % (len(mac_map) + 1)
     return mac_map[mac]
 
+# A Sigma rule's id is public - it is how you look the rule up in SigmaHQ -
+# and scrubbing it would strip the example of the only thing that makes a
+# SIGMA_MATCHES row actionable. Only GUIDs that are NOT rule ids get replaced.
+KEEP_GUIDS = set()
+
+
+def load_rule_ids(rule_dir):
+    pat = re.compile(r"^id:\s*([0-9a-fA-F-]{36})\s*$", re.M)
+    for p in pathlib.Path(rule_dir).rglob("*.yml"):
+        try:
+            KEEP_GUIDS.update(g.lower() for g in
+                              pat.findall(p.read_text(encoding="utf-8",
+                                                      errors="replace")))
+        except OSError:
+            continue
+    return len(KEEP_GUIDS)
+
+
 def sub_guid(m):
     g = m.group(0).lower()
+    if g in KEEP_GUIDS:
+        return m.group(0)
     if g not in guid_map:
         guid_map[g] = "00000000-0000-4000-8000-%012x" % (len(guid_map) + 1)
     return guid_map[g]
@@ -91,10 +111,18 @@ def copy_csv(src, dst, limit):
 if __name__ == "__main__":
     src_dir, out_dir, log_src, limit = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
     tables = sys.argv[5].split(",")
+    if len(sys.argv) > 6 and sys.argv[6]:
+        print("  whitelisted %d Sigma rule id(s)" % load_rule_ids(sys.argv[6]))
     os.makedirs(os.path.join(out_dir, "tables"), exist_ok=True)
     copy_text(log_src, os.path.join(out_dir, "findings-console.txt"))
     copy_text(os.path.join(src_dir, "findings.html"),
               os.path.join(out_dir, "findings.html"))
+    # The artifact browser goes through the same pass, in the same run: a
+    # second invocation would build a fresh IP map and the same host would get
+    # two different fake addresses across the two files.
+    browser = os.path.join(src_dir, "browser.html")
+    if os.path.exists(browser):
+        copy_text(browser, os.path.join(out_dir, "browser.html"))
     kept = []
     for t in tables:
         p = os.path.join(src_dir, "csv", t + ".csv")

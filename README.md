@@ -141,7 +141,15 @@ The same rule drives Velociraptor support: which artifacts a collection holds is
 
 ## Example output
 
-See [`examples/`](examples/) for a full run against a public sample collection — console findings, the HTML report, and a representative slice of the exported tables.
+[`examples/`](examples/) holds a complete, redacted run against a 2021 Apache/Azure collection hunted with 411 Sigma rules — the console report, the HTML findings report, the artifact browser, and a slice of the exported tables. It was produced by:
+
+```bash
+python linsight.py .\uac-ApacheWebServer-linux-20211208202503.tar --sigma .\sigma-rules\ --export .\parse
+```
+
+104 findings, 764 Sigma matches, 73 tables, 3,334,124 rows.
+
+> Anything added to `examples/` must go through [`tools/redact_example.py`](tools/redact_example.py) first. A raw export carries thousands of real addresses, the host's machine ID and, on a cloud host, its tenant identifiers.
 
 ## Full options
 

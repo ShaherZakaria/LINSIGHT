@@ -162,16 +162,16 @@ udp,UNCONN,0,0,127.0.0.1,25224,0.0.0.0,,828,omsagent,/opt/microsoft/omsagent/rub
 tcp,LISTEN,0,128,0.0.0.0,25324,0.0.0.0,,828,omsagent,/opt/microsoft/omsagent/ruby/bin/ruby,omsagent,,ss_-anp.txt
 tcp,LISTEN,0,128,127.0.0.53,53,0.0.0.0,,870,systemd-resolve,/lib/systemd/systemd-resolved,systemd+,,ss_-anp.txt
 tcp,LISTEN,0,128,0.0.0.0,22,0.0.0.0,,1106,sshd,/usr/sbin/sshd,root,,ss_-anp.txt
-tcp,ESTAB,0,0,10.0.0.4,33680,198.18.0.42,443,27359,filebeat,/usr/share/filebeat/bin/filebeat,root,,ss_-anp.txt
-tcp,TIME-WAIT,0,0,10.0.0.4,43150,198.18.11.65,443,,,,,,ss_-anp.txt
+tcp,ESTAB,0,0,10.0.0.4,33680,198.18.0.56,443,27359,filebeat,/usr/share/filebeat/bin/filebeat,root,,ss_-anp.txt
+tcp,TIME-WAIT,0,0,10.0.0.4,43150,198.18.11.67,443,,,,,,ss_-anp.txt
 tcp,TIME-WAIT,0,0,10.0.0.4,42372,169.254.169.254,80,,,,,,ss_-anp.txt
-tcp,FIN-WAIT-1,0,1081,10.0.0.4,22,198.18.0.58,45983,,,,,,ss_-anp.txt
-tcp,TIME-WAIT,0,0,10.0.0.4,43118,198.18.11.65,443,,,,,,ss_-anp.txt
-tcp,TIME-WAIT,0,0,10.0.0.4,43088,198.18.11.65,443,,,,,,ss_-anp.txt
-tcp,TIME-WAIT,0,0,10.0.0.4,43110,198.18.11.65,443,,,,,,ss_-anp.txt
-tcp,ESTAB,0,0,10.0.0.4,33610,198.18.0.43,443,27359,filebeat,/usr/share/filebeat/bin/filebeat,root,,ss_-anp.txt
-tcp,ESTAB,0,0,10.0.0.4,33612,198.18.0.43,443,27359,filebeat,/usr/share/filebeat/bin/filebeat,root,,ss_-anp.txt
-tcp,ESTAB,0,0,10.0.0.4,44214,198.18.0.44,443,24330,agettyd,/tmp/agettyd (deleted),daemon,,ss_-anp.txt
+tcp,FIN-WAIT-1,0,1081,10.0.0.4,22,198.18.0.84,45983,,,,,,ss_-anp.txt
+tcp,TIME-WAIT,0,0,10.0.0.4,43118,198.18.11.67,443,,,,,,ss_-anp.txt
+tcp,TIME-WAIT,0,0,10.0.0.4,43088,198.18.11.67,443,,,,,,ss_-anp.txt
+tcp,TIME-WAIT,0,0,10.0.0.4,43110,198.18.11.67,443,,,,,,ss_-anp.txt
+tcp,ESTAB,0,0,10.0.0.4,33610,198.18.0.57,443,27359,filebeat,/usr/share/filebeat/bin/filebeat,root,,ss_-anp.txt
+tcp,ESTAB,0,0,10.0.0.4,33612,198.18.0.57,443,27359,filebeat,/usr/share/filebeat/bin/filebeat,root,,ss_-anp.txt
+tcp,ESTAB,0,0,10.0.0.4,44214,198.18.0.58,443,24330,agettyd,/tmp/agettyd (deleted),daemon,,ss_-anp.txt
 tcp,ESTAB,0,0,10.0.0.4,22,198.18.0.0,29953,"4092,4204",sshd,/usr/sbin/sshd,"azureus+,root",,ss_-anp.txt
 tcp,LISTEN,0,511,0.0.0.0,80,0.0.0.0,,"801,1693,1813,2539,2632",httpd,/usr/sbin/httpd,"daemon,root",,ss_-anp.txt
 tcp,LISTEN,0,128,::,22,::,,1106,sshd,/usr/sbin/sshd,root,,ss_-anp.txt

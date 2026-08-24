@@ -111,6 +111,19 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 VERSION = "1.0"
+AUTHOR = "Shaher Elrobaa"
+
+# Plain ASCII on purpose: a Windows console still running a legacy code page
+# raises UnicodeEncodeError on box-drawing characters, and a masthead that can
+# abort the run is worse than no masthead.
+BANNER = r"""
+ _ _           _       _     _
+| (_)_ __  ___(_) __ _| |__ | |_
+| | | '_ \/ __| |/ _` | '_ \| __|
+| | | | | \__ \ | (_| | | | | |_
+|_|_|_| |_|___/_|\__, |_| |_|\__|
+                 |___/
+"""
 
 # ---------------------------------------------------------------------------
 # severity / finding model
@@ -14852,6 +14865,30 @@ def c(text, style, enabled):
     return "%s%s%s" % (COLORS[style], text, COLORS["reset"]) if enabled else text
 
 
+def print_banner(color, stream=None):
+    """The mark, once, before any work - and never on stdout.
+
+    stdout carries the report; a caller redirecting it to a file wants the
+    findings in that file, not a masthead, and one piping it into another tool
+    wants it even less. stderr is where the [*] status lines already go.
+    """
+    out = stream or sys.stderr
+    # opts.color is decided by stdout, and this writes to stderr: one can be a
+    # terminal while the other is a pipe, and colouring a pipe puts raw escape
+    # sequences in whatever reads it.
+    try:
+        color = color and out.isatty()
+    except Exception:
+        color = False
+    try:
+        out.write(c(BANNER, "head", color))
+        out.write(c("  linux triage, ranked", "bold", color)
+                  + "   v%s   developed by %s\n\n" % (VERSION, AUTHOR))
+        out.flush()
+    except Exception:
+        pass          # a closed or undecodable stderr must not end the run
+
+
 def print_console(tri, opts):
     color = opts.color
     out = sys.stdout
@@ -15243,6 +15280,9 @@ def main(argv=None):
             k.SetConsoleMode(k.GetStdHandle(-11), 7)
         except Exception:
             opts.color = False
+
+    if not opts.quiet:
+        print_banner(opts.color)
 
     # Rules first: refreshing the cache is the one thing worth doing without a
     # collection at all, and a fetch that fails should say so before a tar is
