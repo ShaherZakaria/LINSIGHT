@@ -64,7 +64,7 @@ python linsight.py ./coll --timeline timeline.csv  # merged event timeline
 ```bash
 python linsight.py ./coll --export ./out       # csv/ + json/ + browser.html
 python linsight.py ./coll --csv-dir ./tables   # just the CSVs
-python linsight.py ./coll --tables-html b.html # just the HTML browser
+python linsight.py ./coll --tables-html b.html # just the console (below)
 python linsight.py ./coll --process-map p.csv  # only the merged process table
 ```
 
@@ -76,12 +76,13 @@ python linsight.py ./coll --process-map p.csv  # only the merged process table
 
 Findings and the timeline always run over the whole collection; they exist to correlate across the two halves, so narrowing them would cost answers rather than time.
 
-### 3. The GUI
+### 3. The console
 
-`--html` writes a document. `--gui` writes a console to work the case in — one self-contained page, no server, no network, nothing to install.
+`--html` writes a document — a page you read top to bottom and hand to someone. The **browser** is the other thing an analyst wants from the same run: a console to work the case in, where the findings, the ATT&CK coverage, the timeline and all 89 tables sit behind one nav and one set of severity chips.
 
 ```bash
-python linsight.py ./coll --gui case.html
+python linsight.py ./coll --export ./out        # csv/ + json/ + browser.html
+python linsight.py ./coll --tables-html b.html  # just the console
 ```
 
 | view | what it is for |
@@ -89,12 +90,13 @@ python linsight.py ./coll --gui case.html
 | **Overview** | severity cards, activity over the collection's span, the loudest categories, techniques and artifacts — every bar is a click through to the findings behind it |
 | **Findings** | the ranked list beside a detail pane: filter by severity, category, technique or free text; the search covers evidence lines, not just titles |
 | **ATT&CK** | the techniques the findings actually carry, laid out by tactic and coloured by the worst severity in each cell; click a technique to filter the findings to it |
-| **Timeline** | the merged event timeline, severity-filtered and searchable |
+| **Timeline** | the merged events as a severity-stacked histogram over the event table — click a column to narrow the table to that window, click it again to let go |
 | **Indicators** | every indicator observed and which artifacts mentioned it |
+| **Tables** | the 89 artifact grids, each sortable, with a row filter and a per-column filter that combine with AND |
 
-The severity chips in the header filter every view at once, so a technique cell counts what the chips are showing. `alt`-click a chip to isolate one severity. `1`–`5` switch views, `/` focuses the search box, `j`/`k` walk the finding list.
+The severity chips in the header filter every view at once, so a technique cell and a timeline column both count what the chips are showing. `alt`-click a chip to isolate one severity. `1`–`5` switch views, `/` focuses the search box, `j`/`k` walk the finding list.
 
-It carries the triage picture only — the 89 artifact tables stay in the `--export` browser, because folding a few million rows into this page would cost the instant open that makes it worth having.
+One file, no server, no network: the payload is embedded and the CSS and JS are inline, because the box that reads a triage collection is routinely the box that is not allowed to fetch anything.
 
 ## Hunting
 
