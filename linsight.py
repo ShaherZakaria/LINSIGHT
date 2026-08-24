@@ -14922,7 +14922,7 @@ def print_banner(color, stream=None):
         # normalised: one constant carries a leading newline and one does not,
         # and the masthead must not jump a line depending on the code page
         out.write("\n" + c(art.strip("\n"), "head", color) + "\n")
-        out.write(" %s  %s\n" % (scale, c("linux triage, ranked", "bold", color)))
+        out.write(" %s  %s\n" % (scale, c("parse deep. hunt the malicious.", "bold", color)))
         out.write(c(" v%s   developed by %s\n\n" % (VERSION, AUTHOR), "dim", color))
         out.flush()
     except Exception:
