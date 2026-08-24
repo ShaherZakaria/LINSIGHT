@@ -72,36 +72,4 @@ happened to capture.
    `live_response/process/` from a test collection costs 5 tables and 1
    finding; the run still exits 0 and the other 54 tables are byte-identical.
 
-## Reasons not to use it
 
-1. **No tests, no CI.** 15,428 lines of bespoke parsers for dozens of text
-   formats, with nothing automatically verifying any of it. A silent parsing
-   regression is the likeliest failure mode and the hardest to notice.
-2. **One author, v1.0, no external review.** Plaso's parsers have been wrong in
-   public and fixed in public for a decade. Nobody has tried to break this one.
-3. **Not validated for court.** If a finding has to survive an opposing expert,
-   corroborate it against the raw artifact before it reaches a report.
-4. **Findings are heuristics.** "Process running a deleted binary" is very
-   often a legitimate daemon that survived a package upgrade. Expect false
-   positives; a finding is a pointer, not a conclusion.
-5. **Linux only.** No memory analysis, no carving, no deleted-file recovery.
-6. **The Sigma engine is a faithful subset, not all of Sigma.** `|cidr`,
-   `|fieldref` and the numeric comparators are rejected rather than applied,
-   and Sigma correlation rules are unsupported. Rejected rules are listed in
-   `RULE_ERRORS` instead of silently matching nothing — but if your ruleset
-   leans on those modifiers, they will not fire.
-
-## Verdict
-
-**Use Dissect as the backbone. Use linsight for the half Dissect cannot see,
-and for the first-pass ranking.**
-
-They are complementary rather than competing. For the copied filesystem, disk
-images, or anything cross-platform, Dissect is tested, team-maintained and the
-better answer. For the volatile snapshot inside a UAC collection, and for being
-told where to start, this tool occupies a niche Dissect deliberately does not.
-
-The realistic workflow is linsight first to find where to look, the raw
-artifact to confirm each lead, and Plaso or Timesketch when the case needs a
-defensible deep timeline. It replaces the two hours of grepping, not the
-examination.
