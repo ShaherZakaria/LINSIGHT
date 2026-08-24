@@ -113,10 +113,21 @@ from datetime import datetime, timedelta, timezone
 VERSION = "1.0"
 AUTHOR = "Shaher Elrobaa"
 
-# Plain ASCII on purpose: a Windows console still running a legacy code page
-# raises UnicodeEncodeError on box-drawing characters, and a masthead that can
-# abort the run is worse than no masthead.
-BANNER = r"""
+# Two mastheads, because a Windows console still running a legacy code page
+# raises UnicodeEncodeError on block characters and a masthead that can abort
+# the run is worse than no masthead. The block form is used only when the
+# stream says it can encode it; print_banner() checks rather than guesses, so
+# the failure is never a half-written line.
+BANNER_BLOCK = """\
+ ██╗     ██╗███╗   ██╗███████╗██╗ ██████╗ ██╗  ██╗████████╗
+ ██║     ██║████╗  ██║██╔════╝██║██╔════╝ ██║  ██║╚══██╔══╝
+ ██║     ██║██╔██╗ ██║███████╗██║██║  ███╗███████║   ██║
+ ██║     ██║██║╚██╗██║╚════██║██║██║   ██║██╔══██║   ██║
+ ███████╗██║██║ ╚████║███████║██║╚██████╔╝██║  ██║   ██║
+ ╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝
+"""
+
+BANNER_ASCII = r"""
  _ _           _       _     _
 | (_)_ __  ___(_) __ _| |__ | |_
 | | | '_ \/ __| |/ _` | '_ \| __|
@@ -124,6 +135,11 @@ BANNER = r"""
 |_|_|_| |_|___/_|\__, |_| |_|\__|
                  |___/
 """
+
+# The severity scale, drawn - the same ranking the report is built on, and the
+# same palette the HTML report and the logo use.
+SCALE_BLOCK = "███"
+SCALE_ASCII = "==="
 
 # ---------------------------------------------------------------------------
 # severity / finding model
@@ -14865,6 +14881,23 @@ def c(text, style, enabled):
     return "%s%s%s" % (COLORS[style], text, COLORS["reset"]) if enabled else text
 
 
+def can_encode(stream, text):
+    """Whether `stream` can actually render `text` in its own encoding.
+
+    Asked before writing rather than caught after: a UnicodeEncodeError part
+    way through leaves half a masthead on the terminal, and a console on cp437
+    or cp1252 cannot draw block characters at all.
+    """
+    enc = getattr(stream, "encoding", None)
+    if not enc:
+        return False
+    try:
+        text.encode(enc)
+        return True
+    except (UnicodeEncodeError, LookupError, TypeError):
+        return False
+
+
 def print_banner(color, stream=None):
     """The mark, once, before any work - and never on stdout.
 
@@ -14880,10 +14913,17 @@ def print_banner(color, stream=None):
         color = color and out.isatty()
     except Exception:
         color = False
+
+    block = can_encode(out, BANNER_BLOCK)
+    art = BANNER_BLOCK if block else BANNER_ASCII
+    cell = SCALE_BLOCK if block else SCALE_ASCII
+    scale = "".join(c(cell, sev, color) for sev in SEVERITIES)
     try:
-        out.write(c(BANNER, "head", color))
-        out.write(c("  linux triage, ranked", "bold", color)
-                  + "   v%s   developed by %s\n\n" % (VERSION, AUTHOR))
+        # normalised: one constant carries a leading newline and one does not,
+        # and the masthead must not jump a line depending on the code page
+        out.write("\n" + c(art.strip("\n"), "head", color) + "\n")
+        out.write(" %s  %s\n" % (scale, c("linux triage, ranked", "bold", color)))
+        out.write(c(" v%s   developed by %s\n\n" % (VERSION, AUTHOR), "dim", color))
         out.flush()
     except Exception:
         pass          # a closed or undecodable stderr must not end the run
