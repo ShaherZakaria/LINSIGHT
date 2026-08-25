@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 linsight.py - parse a Linux triage collection and highlight the critical /
 interesting events.
@@ -81,6 +83,9 @@ layout, so /etc, /var/log, persistence, the histories and the YARA scan do not
 care which tool collected them.
 """
 
+# Built from src/linsight/ by tools/build.py. Edit the modules
+# there, then run 'python tools/build.py' to regenerate this.
+
 from __future__ import annotations
 
 import argparse
@@ -102,13 +107,15 @@ import shutil
 import sqlite3
 import struct
 import sys
-import time
 import tarfile
 import tempfile
+import time
 import urllib.parse
 import zipfile
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 
 VERSION = "1.0"
 AUTHOR = "Shaher Elrobaa"
@@ -140,6 +147,10 @@ BANNER_ASCII = r"""
 # same palette the HTML report and the logo use.
 SCALE_BLOCK = "███"
 SCALE_ASCII = "==="
+
+# -------------------------------------------------------------------------
+# severity / finding model
+# -------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # severity / finding model
@@ -238,6 +249,1156 @@ class Event:
             "source": self.source,
         }
 
+# -------------------------------------------------------------------------
+# console primitives: colour, status lines, progress
+# -------------------------------------------------------------------------
+
+def trunc(s, n=180):
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 3] + "..."
+_PROGRESS = []                  # the bars currently drawing, outermost first
+def status(msg, stream=None):
+    """A [*]/[!] line that does not land on top of the progress bar.
+
+    print() straight to stderr while a bar is drawn appends to it, which is how
+    '[ 92%] building tables sigma[*] sigma: 407 rule(s) loaded' happens. Erase
+    the bar first; the next step() redraws it.
+    """
+    for p in _PROGRESS:
+        p.erase()
+    print(msg, file=stream or sys.stderr)
+class Progress:
+    """A one-line percentage on stderr, rewritten in place.
+
+    Only when stderr is a terminal: redirected to a file, a carriage-return
+    progress bar turns one line into thousands and buries the [*] and [!] lines
+    that matter. Everything here is cosmetic, so it never raises - a broken
+    console must not end a parse that has run for four minutes.
+
+    A nested bar - Sigma runs inside the table build - renders its parent's
+    percentage alongside its own, because a bar that reads 92% and then 62% a
+    moment later looks like the run went backwards.
+    """
+
+    def __init__(self, total, label, enabled=True, stream=None, parent=None):
+        self.total = max(1, int(total or 1))
+        self.label = label
+        self.parent = parent
+        self.n = 0
+        self.width = 0
+        self.stream = stream or sys.stderr
+        try:
+            self.on = bool(enabled) and self.stream.isatty()
+        except Exception:
+            self.on = False
+
+    def pct(self):
+        return min(100, int(100.0 * self.n / self.total))
+
+    def step(self, name="", n=None):
+        self.n = self.n + 1 if n is None else n
+        if not self.on:
+            return
+        if self not in _PROGRESS:
+            _PROGRESS.append(self)
+        if self.parent is not None and self.parent.on:
+            line = "  [%3d%%] %s %s %d%% %s" % (
+                self.parent.pct(), self.parent.label, self.label,
+                self.pct(), trunc(str(name), 34))
+        else:
+            line = "  [%3d%%] %s %s" % (self.pct(), self.label,
+                                        trunc(str(name), 46))
+        try:
+            pad = max(0, self.width - len(line))
+            self.stream.write("\r" + line + " " * pad)
+            self.stream.flush()
+            self.width = len(line)
+        except Exception:
+            self.on = False
+
+    def erase(self):
+        """Blank the line but stay live, so status() can print over it."""
+        if not self.on or not self.width:
+            return
+        try:
+            self.stream.write("\r" + " " * self.width + "\r")
+            self.stream.flush()
+            self.width = 0
+        except Exception:
+            self.on = False
+
+    def done(self):
+        if self in _PROGRESS:
+            _PROGRESS.remove(self)
+        if not self.on:
+            return
+        self.erase()
+        self.on = False
+def c(text, style, enabled):
+    return "%s%s%s" % (COLORS[style], text, COLORS["reset"]) if enabled else text
+def can_encode(stream, text):
+    """Whether `stream` can actually render `text` in its own encoding.
+
+    Asked before writing rather than caught after: a UnicodeEncodeError part
+    way through leaves half a masthead on the terminal, and a console on cp437
+    or cp1252 cannot draw block characters at all.
+    """
+    enc = getattr(stream, "encoding", None)
+    if not enc:
+        return False
+    try:
+        text.encode(enc)
+        return True
+    except (UnicodeEncodeError, LookupError, TypeError):
+        return False
+
+# -------------------------------------------------------------------------
+# shared knowledge / heuristics
+# -------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# shared knowledge / heuristics
+# ---------------------------------------------------------------------------
+
+TMPFS_DIRS = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/dev/mqueue/")
+SYSTEM_BIN_DIRS = ("/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/",
+                   "/usr/local/sbin/", "/usr/lib/", "/lib/", "/lib64/", "/usr/lib64/")
+SYSTEM_CFG_DIRS = ("/etc/", "/boot/", "/usr/lib/systemd/", "/lib/systemd/")
+
+# ports commonly used by implants / handlers
+SUSPICIOUS_PORTS = {
+    23: "telnet", 1080: "socks proxy", 1337: "common backdoor", 2323: "telnet alt",
+    3333: "common backdoor/miner", 4444: "metasploit default", 4445: "metasploit alt",
+    5555: "common backdoor/adb", 6666: "IRC bot / backdoor", 6667: "IRC",
+    7777: "common backdoor", 8888: "common backdoor/proxy", 9001: "tor / backdoor",
+    9050: "tor socks", 9051: "tor control", 12345: "netbus/backdoor",
+    31337: "elite/backdoor", 54321: "backdoor", 14444: "miner pool",
+    3332: "miner pool", 5900: "vnc",
+}
+
+# baseline of SUID/SGID binaries shipped by mainstream Linux distributions
+BASELINE_SUID = {
+    "/usr/bin/sudo", "/usr/bin/su", "/usr/bin/passwd", "/usr/bin/gpasswd",
+    "/usr/bin/chfn", "/usr/bin/chsh", "/usr/bin/newgrp", "/usr/bin/mount",
+    "/usr/bin/umount", "/usr/bin/pkexec", "/usr/bin/fusermount", "/usr/bin/fusermount3",
+    "/usr/bin/ntfs-3g", "/usr/bin/at", "/usr/bin/crontab", "/usr/bin/expiry",
+    "/usr/bin/chage", "/usr/bin/wall", "/usr/bin/write", "/usr/bin/screen",
+    "/usr/bin/dotlockfile", "/usr/bin/ssh-agent", "/usr/bin/bwrap",
+    "/usr/bin/vmware-user-suid-wrapper", "/usr/bin/staprun", "/usr/bin/mount.nfs",
+    "/usr/lib/dbus-1.0/dbus-daemon-launch-helper", "/usr/lib/xorg/Xorg.wrap",
+    "/usr/lib/openssh/ssh-keysign", "/usr/lib/polkit-1/polkit-agent-helper-1",
+    "/usr/lib/eject/dmcrypt-get-device", "/usr/lib/snapd/snap-confine",
+    "/usr/lib/x86_64-linux-gnu/utempter/utempter",
+    "/usr/lib/x86_64-linux-gnu/lxc/lxc-user-nic",
+    "/usr/libexec/camel-lock-helper-1.2", "/usr/libexec/dbus-1/dbus-daemon-launch-helper",
+    "/usr/libexec/openssh/ssh-keysign", "/usr/libexec/polkit-agent-helper-1",
+    "/usr/libexec/utempter/utempter", "/usr/libexec/spice-gtk-x86_64/spice-client-glib-usb-acl-helper",
+    "/usr/sbin/pppd", "/usr/sbin/unix_chkpwd", "/usr/sbin/mount.nfs",
+    "/usr/sbin/pam_timestamp_check", "/usr/sbin/usernetctl", "/usr/sbin/exim4",
+    "/usr/sbin/postdrop", "/usr/sbin/postqueue", "/usr/sbin/grub2-set-bootflag",
+    "/bin/su", "/bin/mount", "/bin/umount", "/bin/ping", "/bin/ping6",
+    "/bin/fusermount", "/sbin/unix_chkpwd", "/sbin/mount.nfs", "/sbin/pam_timestamp_check",
+    "/usr/bin/ping", "/usr/bin/ping6", "/usr/bin/traceroute6.iputils",
+    "/usr/bin/arping", "/usr/bin/mtr-packet", "/usr/bin/kismet_cap_linux_bluetooth",
+}
+
+# interpreters / living-off-the-land binaries that must never be SUID
+DANGEROUS_SUID_NAMES = {
+    "bash", "sh", "dash", "zsh", "ksh", "csh", "tcsh", "python", "python2",
+    "python3", "perl", "ruby", "php", "lua", "node", "awk", "gawk", "mawk",
+    "find", "vim", "vi", "nano", "emacs", "less", "more", "man", "cp", "mv",
+    "dd", "tar", "zip", "unzip", "rsync", "nmap", "env", "docker", "systemctl",
+    "openssl", "socat", "nc", "ncat", "netcat", "busybox", "strace", "gdb",
+}
+
+# command fragments that are interesting in cron jobs, units, histories
+SUSPICIOUS_CMD_PATTERNS = [
+    (r"/dev/tcp/", "bash reverse shell primitive", "HIGH"),
+    (r"\bnc\b\s+(-[a-z]*e|.*\s-e\b)", "netcat with -e (reverse shell)", "CRITICAL"),
+    (r"\b(ncat|netcat|socat)\b", "netcat/socat usage", "HIGH"),
+    (r"\bbash\s+-i\b", "interactive shell spawn", "HIGH"),
+    (r"base64\s+(-d|--decode)", "base64 decoding of payload", "HIGH"),
+    (r"\becho\s+[A-Za-z0-9+/=]{40,}", "long encoded blob", "HIGH"),
+    (r"(curl|wget)[^|;\n]*\|\s*(ba)?sh", "download piped to shell", "CRITICAL"),
+    (r"\b(curl|wget)\b", "remote download", "MEDIUM"),
+    (r"python[0-9.]*\s+-c\b", "inline python", "HIGH"),
+    (r"perl\s+-e\b", "inline perl", "HIGH"),
+    # only the modes that matter: +x, world-writable 777, and setuid/setgid.
+    # 0755/0700 appear all over stock init scripts.
+    (r"\bchmod\s+(-R\s+)?(\+x|a\+x|u\+s|g\+s|0?777|[24][0-7]{3})\b",
+     "granting execute / world-write / setuid", "MEDIUM"),
+    (r"\bchattr\s+[+-]i\b", "immutable attribute change", "HIGH"),
+    (r"history\s+-c|>\s*~?/?\.bash_history|unset\s+HISTFILE|HISTFILE=/dev/null",
+     "shell history tampering", "HIGH"),
+    (r"\bshred\b|\bwipe\b|\bsrm\b", "secure deletion utility", "HIGH"),
+    (r"\bcrontab\s+-r\b", "crontab wipe", "HIGH"),
+    (r"\b(setenforce\s+0|systemctl\s+(stop|disable|mask)\s+(auditd|rsyslog|firewalld|ufw))",
+     "security control disabled", "HIGH"),
+    (r"iptables\s+-F|nft\s+flush", "firewall rules flushed", "HIGH"),
+    (r"\bldd\b.*ld\.so\.preload|ld\.so\.preload", "LD_PRELOAD persistence", "CRITICAL"),
+    (r"LD_PRELOAD=", "LD_PRELOAD injection", "CRITICAL"),
+    (r"\binsmod\b|\bmodprobe\b\s+[^-]", "kernel module load", "MEDIUM"),
+    (r"\bxmrig\b|stratum\+tcp|\bminerd\b|cryptonight", "cryptominer indicator", "CRITICAL"),
+    (r"\.onion\b|\btor2web\b|\bngrok\b|\bpastebin\.com\b|\btransfer\.sh\b",
+     "anonymising / paste service", "HIGH"),
+    # a temp path only matters when it is being *run*; distro scripts mention
+    # /tmp constantly in tests and variable assignments
+    (r"(?:^|[;&|`]\s*|\$\(\s*|\b(?:exec|source|\.|sh|bash|dash|zsh|sudo|nohup|setsid|python[0-9.]*|perl)\s+)"
+     r"(?:/tmp/|/var/tmp/|/dev/shm/|/run/shm/)\S+",
+     "execution from a world-writable dir", "HIGH"),
+    (r"\bnohup\b.*&|\bsetsid\b|\bdisown\b", "detached background execution", "MEDIUM"),
+    (r"\bssh\b.*-[fNL]\s|-R\s+\d+:", "ssh tunnel / port forward", "HIGH"),
+    (r"\bsshpass\b", "non-interactive ssh password use", "HIGH"),
+    (r"\buseradd\b|\badduser\b|\busermod\b.*-G", "account manipulation", "HIGH"),
+    (r"authorized_keys", "ssh key persistence", "HIGH"),
+]
+COMPILED_CMD_PATTERNS = [(re.compile(p, re.I), d, s) for p, d, s in SUSPICIOUS_CMD_PATTERNS]
+
+# Named offensive tooling, by what its presence would mean. ROOTKIT_NAMES below
+# covers kernel implants; this covers the userland toolkit an operator brings.
+#
+# Split into two tiers on purpose. UNAMBIGUOUS names are not words anyone uses
+# for anything else, so a hit anywhere - a log line, a filename, a package - is
+# worth reporting. AMBIGUOUS names are ordinary English or common binaries
+# ('john', 'empire', 'beacon', 'havoc', 'sliver'), and matching those in free
+# log text produces noise, not findings; they are only ever matched in a
+# command line or a path, where the word is naming something executable.
+HACKTOOL_UNAMBIGUOUS = {
+    "credential access": [
+        "mimikatz", "mimipenguin", "mimidump", "lazagne", "secretsdump",
+        "gosecretsdump", "hashdump", "pypykatz", "kerberoast", "asreproast",
+        "dumpert", "nanodump", "procdump", "keethief", "lsassy", "hekatomb",
+        "certipy", "gettgtpkinit", "krbrelayx", "ticketer", "getnpusers",
+        "getuserspns", "dcsync", "ntdsutil", "ntds.dit", "creddump7",
+        "chntpw", "unshadow", "hashcat", "johntheripper",
+    ],
+    "privilege escalation enumeration": [
+        "linpeas", "winpeas", "linenum", "lse.sh", "linux-smart-enumeration",
+        "unix-privesc-check", "linux-exploit-suggester", "les.sh", "pspy",
+        "gtfoblookup", "beroot", "privesccheck", "suid3num", "traitor",
+        "sudo_killer", "sudokiller",
+    ],
+    "active directory attack": [
+        "bloodhound", "sharphound", "azurehound", "rusthound", "soaphound",
+        "crackmapexec", "netexec", "smbmap", "smbexec", "wmiexec", "psexec",
+        "atexec", "dcomexec", "evil-winrm", "kerbrute", "rubeus", "impacket",
+        "responder", "ntlmrelayx", "mitm6", "petitpotam", "printnightmare",
+        "zerologon", "noPac", "adidnsdump", "windapsearch", "ldapdomaindump",
+    ],
+    "command and control": [
+        "meterpreter", "msfvenom", "msfconsole", "metasploit", "cobaltstrike",
+        "cobalt strike", "teamserver", "beacon.dll", "sliver-client",
+        "sliver-server", "mythic", "poshc2", "covenant", "brute ratel",
+        "bruteratel", "havoc-client", "merlin", "koadic", "pupy", "villain",
+        "hoaxshell", "chisel", "ligolo", "revsocks", "gost", "frpc", "frps",
+        "sshuttle", "ngrok", "cloudflared tunnel", "pivotnacci", "reGeorg",
+        "neo-regeorg", "tunna",
+    ],
+    "scanning and exploitation": [
+        "masscan", "zmap", "nuclei", "gobuster", "feroxbuster", "dirbuster",
+        "wfuzz", "sqlmap", "nikto", "wpscan", "joomscan", "commix", "xsstrike",
+        "searchsploit", "exploitdb", "routersploit", "arachni", "whatweb",
+        "enum4linux", "smbclient -N", "onesixtyone", "snmpwalk -c public",
+    ],
+    "webshell": [
+        "c99shell", "r57shell", "b374k", "weevely", "wso shell", "antsword",
+        "behinder", "godzilla webshell", "chinachopper", "china chopper",
+        "phpspy", "wsomanager", "indoxploit", "alfashell", "marijuana shell",
+    ],
+    "cryptomining": [
+        "xmrig", "minerd", "cpuminer", "nbminer", "phoenixminer", "ethminer",
+        "lolminer", "t-rex miner", "nanominer", "xmr-stak", "cgminer",
+    ],
+    "container escape": [
+        "deepce", "amicontained", "cdk-team", "botb ", "break-out-the-box",
+        "kubeletctl", "peirates",
+    ],
+    "exfiltration staging": [
+        "rclone copy", "megatools", "transfer.sh", "filebin", "0x0.st",
+        "termbin", "oshi.at",
+    ],
+}
+# ordinary words that are also tool names - command/path context only
+HACKTOOL_AMBIGUOUS = {
+    "credential access": ["john", "hydra", "medusa", "patator", "crowbar",
+                          "cewl", "ophcrack"],
+    "active directory attack": ["certify", "seatbelt", "sharpview"],
+    "command and control": ["empire", "sliver", "havoc", "merlin", "beacon",
+                            "silenttrinity", "quasar"],
+    "scanning and exploitation": ["nmap", "dirb", "ffuf", "amass", "subfinder",
+                                  "arjun", "dalfox"],
+    "container escape": ["cdk"],
+}
+
+
+def _tool_regex(groups):
+    """One alternation for the whole tier, so a cell costs a single pass.
+
+    This is what the function always claimed to do and did not: it compiled one
+    alternation *per category*, so every cell was scanned nine times for the
+    unambiguous tier and five for the ambiguous one. Nine passes over a web
+    server's three million log rows is 213 seconds to produce 38 findings -
+    over half the entire run. The cost driver is the number of cells, never the
+    number of tool names, which is the same lesson --pivot already learned when
+    it compiled 400 indicators into one alternation.
+
+    Returns (regex, name -> category), because the category can no longer come
+    from which pattern matched.
+    """
+    cats = {}
+    for cat, names in groups.items():
+        for n in names:
+            cats.setdefault(n.lower(), cat)
+    alt = "|".join(sorted((re.escape(n) for n in cats), key=len, reverse=True))
+    # Case-sensitive against already-lowercased names, with the caller
+    # lowercasing the cell once. re.I is not a free flag: it case-folds at
+    # every position of every alternative, and measured on this collection's
+    # log lines it costs 78us per line against 19us for one str.lower() plus a
+    # case-sensitive scan - the single biggest cost in the whole run.
+    #
+    # not preceded/followed by a word character, so 'john' does not fire on
+    # 'johnson' and 'cdk' does not fire on 'cdkit'; a leading '/' or '-' is
+    # fine because that is how these appear in paths and argv
+    return re.compile(r"(?<![\w.])(%s)(?![\w-])" % alt), cats
+
+
+HACKTOOL_RE, HACKTOOL_CAT = _tool_regex(HACKTOOL_UNAMBIGUOUS)
+HACKTOOL_CTX_RE, HACKTOOL_CTX_CAT = _tool_regex(HACKTOOL_AMBIGUOUS)
+# how bad a name is, before the context it was found in is considered
+HACKTOOL_SEVERITY = {
+    "credential access": "CRITICAL", "active directory attack": "HIGH",
+    "command and control": "CRITICAL", "privilege escalation enumeration": "HIGH",
+    "scanning and exploitation": "HIGH", "webshell": "CRITICAL",
+    "cryptomining": "CRITICAL", "container escape": "HIGH",
+    "exfiltration staging": "HIGH",
+}
+
+# known Linux rootkit / offensive tool module and file names
+ROOTKIT_NAMES = [
+    "diamorphine", "reptile", "suterusu", "adore", "adore-ng", "knark", "modhide",
+    "kbeast", "enyelkm", "sebek", "phalanx", "jynx", "azazel", "beurk", "vlany",
+    "bedevil", "bdvl", "umbreon", "rkduck", "syslogk", "pinkit", "khook",
+    "brootus", "nurupo", "wukong", "hiddenwasp", "drovorub", "symbiote",
+    "medusa", "tinyshell", "bpfdoor", "ebpfkit", "boopkit", "tripleCross",
+]
+
+BENIGN_HIDDEN = re.compile(
+    r"(^|/)\.(placeholder|updated|pwd\.lock|X11-unix|ICE-unix|XIM-unix|font-unix|"
+    r"Test-unix|cache|config|local|gnupg|ssh|profile|bashrc|bash_logout|bash_profile|"
+    r"face|face\.icon|nosearch|gsd-[a-z-]+\.settings-ported|os-release-stage|"
+    r"registry|features|dbus-keyrings|Xauthority|ICEauthority|wget-hsts|selected_editor|"
+    r"lesshst|viminfo|python_history|sudo_as_admin_successful|motd\.legacy)($|/)")
+
+def norm_ip(ip):
+    """Canonical text form so /proc/net, ss and lsof addresses compare equal."""
+    if ip is None:
+        return ""
+    ip = ip.strip().strip("[]")
+    if ip in ("*", ""):
+        return "0.0.0.0"
+    if "%" in ip:                       # scope id, e.g. fe80::1%eth0
+        ip = ip.split("%")[0]
+    try:
+        return str(ipaddress.ip_address(ip))
+    except ValueError:
+        return ip
+
+
+def is_private_ip(ip):
+    """True for anything that is not a routable public address."""
+    ip = norm_ip(ip)
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True                     # hostnames / '*' - not evidence of egress
+    return not addr.is_global
+
+
+def hexip_to_str(hexip):
+    """/proc/net/{tcp,udp} address (little-endian hex) -> canonical IP string."""
+    try:
+        if len(hexip) == 8:
+            raw = bytes.fromhex(hexip)[::-1]
+            return str(ipaddress.IPv4Address(raw))
+        if len(hexip) == 32:
+            words = [bytes.fromhex(hexip[i:i + 8])[::-1] for i in range(0, 32, 8)]
+            return str(ipaddress.IPv6Address(b"".join(words)))
+    except Exception:
+        pass
+    return hexip
+
+
+def split_hostport(addr):
+    """'127.0.0.1:3333' / '[::1]:22' / '*:22' -> (canonical host, port|None)."""
+    addr = (addr or "").strip()
+    if addr.startswith("["):
+        host, sep, port = addr.rpartition("]:")
+        if not sep:
+            return norm_ip(addr), None
+        return norm_ip(host), _port(port)
+    host, sep, port = addr.rpartition(":")
+    if not sep:
+        return norm_ip(addr), None
+    if host.count(":") >= 2:            # bare IPv6 without brackets
+        return norm_ip(addr), None
+    return norm_ip(host), _port(port)
+
+
+def _port(p):
+    try:
+        return int(p)
+    except (TypeError, ValueError):
+        return None
+
+
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+
+
+def parse_lstart(s):
+    """'Tue Mar 24 19:25:30 2026' -> naive-UTC-tagged datetime (host local clock)."""
+    m = re.match(r"\w{3}\s+(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})", s.strip())
+    if not m:
+        return None
+    mon = MONTHS.get(m.group(1))
+    if not mon:
+        return None
+    try:
+        return datetime(int(m.group(6)), mon, int(m.group(2)), int(m.group(3)),
+                        int(m.group(4)), int(m.group(5)), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def epoch(ts):
+    try:
+        # auditd stamps are 'seconds.milliseconds', so parse as float and let
+        # int() drop the fraction rather than rejecting the whole timestamp
+        v = int(float(ts))
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(v, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _printable(raw):
+    """Matched bytes rendered for a report: printable ASCII kept, rest hexed.
+
+    A YARA hit is often binary, and pasting raw bytes into a CSV produces a
+    cell no tool can display and some can't even quote. This keeps the part a
+    human can read and makes the rest explicit rather than mangled.
+    """
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "replace")
+    out = []
+    for b in raw:
+        out.append(chr(b) if 32 <= b < 127 else "\\x%02x" % b)
+    return "".join(out)
+
+
+
+
+# Groups whose membership is equivalent to root on most systems: sudo/wheel by
+# definition, docker/lxd because the daemon runs as root, disk/shadow because
+# they read the raw device and the hashes.
+PRIVILEGED_GROUPS = frozenset((
+    "sudo", "wheel", "admin", "adm", "root", "docker", "lxd", "lxc",
+    "disk", "shadow", "video", "kvm", "libvirt", "systemd-journal",
+    "sys", "staff", "operator"))
+
+
+# The daemons whose messages are privilege use. Matched against the syslog
+# identifier as well as the text, because a sudo record names the command it
+# ran but never the word "sudo".
+PRIV_HINT_RE = re.compile(
+    r"\b(sudo|su|pkexec|polkit|usermod|useradd|userdel|groupadd|groupdel|"
+    r"gpasswd|chage|passwd|visudo|run0)\b", re.I)
+
+
+# Message shapes that mean "authentication did not succeed", with the reason
+# named. FOR577 opens its account-attack section with "check for large numbers
+# of failed logins", so these feed both the FAILED_LOGINS table and the
+# brute-force analyzer and live at module scope for both to share.
+FAILED_LOGIN_RULES = [
+    ("bad password", re.compile(
+        r"Failed (?P<method>password) for (?:invalid user )?(?P<user>\S+)"
+        r" from (?P<ip>\S+)(?: port (?P<port>\d+))?")),
+    ("bad key", re.compile(
+        r"Failed (?P<method>publickey|none|keyboard-interactive\S*) for "
+        r"(?:invalid user )?(?P<user>\S+) from (?P<ip>\S+)"
+        r"(?: port (?P<port>\d+))?")),
+    ("unknown account", re.compile(
+        r"Invalid user (?P<user>\S*)\s*from (?P<ip>\S+)"
+        r"(?: port (?P<port>\d+))?")),
+    ("unknown account", re.compile(
+        r"(?:check pass; user unknown|"
+        r"illegal user (?P<user>\S+) from (?P<ip>\S+))")),
+    ("pam authentication failure", re.compile(
+        r"authentication failure;")),
+    ("too many attempts", re.compile(
+        r"(?:maximum authentication attempts exceeded|"
+        r"Too many authentication failures)(?: for (?P<user>\S+))?"
+        r"(?: from (?P<ip>\S+))?(?: port (?P<port>\d+))?")),
+    ("root login refused", re.compile(
+        r"(?:ROOT LOGIN REFUSED|Root login rejected|"
+        r"User root from (?P<ip>\S+) not allowed)")),
+    ("account not permitted", re.compile(
+        r"(?:User (?P<user>\S+) from (?P<ip>\S+) not allowed because|"
+        r"Authentication refused|pam_access\(.*\): access denied)")),
+    ("aborted before authenticating", re.compile(
+        r"(?:Connection closed by (?:authenticating|invalid) user "
+        r"(?P<user>\S+) (?P<ip>\S+)(?: port (?P<port>\d+))?|"
+        r"Received disconnect from (?P<ip2>\S+).*\[preauth\])")),
+    ("sudo password failure", re.compile(
+        r"^\s*(?P<user>\S+)\s*:\s*(?P<detail>\d+ incorrect password "
+        r"attempts?)")),
+    ("sudo not permitted", re.compile(
+        r"^\s*(?P<user>\S+)\s*:\s*(?P<detail>user NOT in sudoers|"
+        r"command not allowed)")),
+    ("su failure", re.compile(
+        r"FAILED su(?: \(to (?P<target>\S+)\))?(?: for (?P<target2>\S+))?"
+        r"(?: by (?P<user>\S+))?")),
+    ("failed login", re.compile(
+        r"(?:FAILED LOGIN|LOGIN FAILURE|authentication error)"
+        r"(?:.*?FROM (?P<ip>\S+))?(?:.*?FOR (?P<user>\S+))?")),
+]
+
+
+def match_failed_login(proc, msg):
+    """One log message -> (kind, user, ip, port, method, detail), or None."""
+    for label, erx in FAILED_LOGIN_RULES:
+        em = erx.search(msg)
+        if not em:
+            continue
+        if label.startswith("sudo") and "sudo" not in (proc or "").lower():
+            continue
+        g = em.groupdict()
+        pick = lambda *k: next((g[x].strip() for x in k
+                                if g.get(x) and g[x].strip()), "")
+        return (label, pick("user", "target", "target2"),
+                pick("ip", "ip2"), pick("port"), pick("method"),
+                pick("detail"))
+    return None
+
+
+# 'Accepted publickey for bob from 1.2.3.4 port 51004 ssh2'
+ACCEPTED_LOGIN_RE = re.compile(
+    r"Accepted (?P<method>\S+) for (?P<user>\S+) from (?P<ip>\S+)"
+    r"(?: port (?P<port>\d+))?")
+
+
+# every timestamp shape that turns up in a /var/log text file
+_TS_ISO_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ]\s*(\d\d):(\d\d):(\d\d)"
+                        r"(?:[.,]\d+)?\s*(Z|[+-]\d\d:?\d\d)?$")
+_TS_SYSLOG_RE = re.compile(r"^(\w{3})\s+(\d{1,2})\s+(\d\d):(\d\d):(\d\d)$")
+_TS_CLF_RE = re.compile(r"^(\d\d)/(\w{3})/(\d{4}):(\d\d):(\d\d):(\d\d)"
+                        r"\s*([+-]\d{4})?$")
+_TS_BANNER_RE = re.compile(r"^\w{3}\s+(\w{3})\s+(\d{1,2})\s+(\d\d):(\d\d):(\d\d)"
+                           r"\s+(?:\S+\s+)?(\d{4})$")
+
+
+def _tz_delta(z):
+    """'+0200' / '-04:00' / 'Z' -> timedelta of that offset from UTC."""
+    if not z or z == "Z":
+        return timedelta(0)
+    z = z.replace(":", "")
+    try:
+        sign = -1 if z[0] == "-" else 1
+        return sign * timedelta(hours=int(z[1:3]), minutes=int(z[3:5]))
+    except (ValueError, IndexError):
+        return timedelta(0)
+
+
+_TS_SPAN_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+
+
+def _ts_text(v):
+    """A datetime, an epoch or an already-UTC string -> 'YYYY-MM-DD HH:MM:SS'."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        # only a plausible epoch: a bare small integer reaching a finding is a
+        # count, a pid or a port far more often than it is a time
+        if v < 100000000 or v > 4102444800:
+            return ""
+        try:
+            return datetime.fromtimestamp(v, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    s = str(v).strip().replace("T", " ")
+    if s.endswith("Z"):
+        s = s[:-1].strip()
+    return s[:19] if _TS_SPAN_RE.match(s[:19]) else ""
+
+
+_IOC_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+_IOC_IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+_IOC_IPV6_RE = re.compile(r"^[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}$")
+_IOC_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)"
+                            r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+                            r"[A-Za-z]{2,24}$")
+_HASH_BY_LEN = {32: "md5", 40: "sha1", 64: "sha256"}
+
+
+def ioc_type(value):
+    """What kind of thing an indicator is - 'ipv4', 'sha256', 'path', ...
+
+    Shape only, and deliberately so: an indicator arrives as a bare string
+    from a --pivot list or from an analyzer, with nothing else to go on. The
+    point is a column an analyst can filter on, so an unrecognised shape says
+    'string' rather than being forced into a category it does not fit.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    for prefix, kind in (("port:", "port"), ("pid:", "pid")):
+        if low.startswith(prefix):
+            return kind
+    if "://" in s:
+        return "url"
+    if s.startswith("/"):
+        return "path"
+    if s.isdigit():
+        return "number"
+    if _IOC_HEX_RE.match(s):
+        # a hash is one of three lengths; anything else all-hex is only worth
+        # naming when it is long enough not to be an ordinary short word, and
+        # 'dead', 'added' and 'beef' are all valid hex
+        kind = _HASH_BY_LEN.get(len(s)) or ("hex string" if len(s) >= 16 else "")
+        if kind:
+            return kind
+    m = _IOC_IPV4_RE.match(s)
+    if m and all(int(g) < 256 for g in m.groups()):
+        return "ipv4"
+    if ":" in s and _IOC_IPV6_RE.match(s):
+        return "ipv6"
+    if "@" in s and _IOC_DOMAIN_RE.match(s.rsplit("@", 1)[-1]):
+        return "email"
+    if _IOC_DOMAIN_RE.match(s):
+        return "domain"
+    if "." in s and " " not in s and "/" not in s:
+        return "filename"
+    return "string"
+
+
+# Why an indicator was extracted -> the technique that makes it worth chasing.
+# Keyed on the provenance labels Triage.ioc() records, which is the only thing
+# that knows why a term is in the list at all: the term itself is a string. A
+# label with no entry - a plain --pivot value, a path a table happened to
+# mention - contributes nothing rather than a guessed technique.
+IOC_TECHNIQUES = (
+    ("/etc/ld.so.preload", "T1574.006 Hijack Execution Flow: LD_PRELOAD"),
+    ("hidden_pids", "T1564 Hide Artifacts / T1014 Rootkit"),
+    ("hidden ", "T1564.001 Hidden Files and Directories"),
+    ("regular file under /dev", "T1564 Hide Artifacts"),
+    ("bodyfile (executable in tmpfs)", "T1036 Masquerading"),
+    ("running process pid", "T1059 Command and Scripting Interpreter"),
+    ("running-process hash", "T1070.004 Indicator Removal: File Deletion"),
+    ("hash mismatch", "T1554 Compromise Host Software Binary"),
+    ("listening socket", "T1571 Non-Standard Port"),
+    ("network connection", "T1071 Application Layer Protocol"),
+    ("outbound admin protocol", "T1021 Remote Services"),
+    ("authorized_keys", "T1098.004 SSH Authorized Keys"),
+    ("interactive login", "T1078 Valid Accounts"),
+    ("failed authentication source", "T1110 Brute Force"),
+    ("password spraying source", "T1110.003 Password Spraying"),
+    ("systemd unit", "T1543.002 Systemd Service"),
+    ("suid", "T1548.001 Setuid and Setgid"),
+    ("sgid", "T1548.001 Setuid and Setgid"),
+    ("hacktool:", "T1588.002 Obtain Capabilities: Tool"),
+)
+
+
+def ioc_mitre(labels):
+    """ATT&CK technique(s) implied by where an indicator was picked up."""
+    out = []
+    for label in sorted(labels or ()):
+        for prefix, tech in IOC_TECHNIQUES:
+            if label.startswith(prefix):
+                if tech not in out:
+                    out.append(tech)
+                break
+    return "; ".join(out)
+
+
+def span_add(span, ts):
+    """Fold one timestamp into a mutable ['first', 'last'] pair, in place.
+
+    The counterpart to span_of for the sweeps: a pivot term or a noisy Sigma
+    rule can match six figures of rows, and only the two ends are ever wanted.
+    """
+    if ts:
+        if not span[0] or ts < span[0]:
+            span[0] = ts
+        if not span[1] or ts > span[1]:
+            span[1] = ts
+    return span
+
+
+# Distinct reference strings kept per tool per table before the tail is folded
+# into one overflow row. A tool named in BODYFILE matches a different path on
+# nearly every row it hits, and an unbounded dict there is a copy of the
+# filesystem in memory; 200 is already past the point a breakdown reads.
+HACKTOOL_VARIANT_CAP = 200
+HACKTOOL_VARIANT_OTHER = "(further distinct references, not itemised)"
+
+
+def variant_add(bag, val, column, ts):
+    """Fold one hit into a {reference text: [count, span, columns]} bag.
+
+    The per-hit rows keep twelve samples per table, so they cannot be counted
+    after the fact - and the count is the point: masscan/1.0 and masscan/1.3
+    are two scanners wearing one tool name, and how often each was seen is
+    only knowable while every row is still going past.
+    """
+    text = trunc(str(val), 200)
+    rec = bag.get(text)
+    if rec is None:
+        if len(bag) >= HACKTOOL_VARIANT_CAP:
+            text = HACKTOOL_VARIANT_OTHER
+            rec = bag.get(text)
+        if rec is None:
+            rec = bag[text] = [0, ["", ""], set()]
+    rec[0] += 1
+    span_add(rec[1], ts)
+    if column:
+        rec[2].add(column)
+    return bag
+
+
+def span_of(times):
+    """(first, last) as 'YYYY-MM-DD HH:MM:SS' UTC over a bag of timestamps.
+
+    Everything an analyzer holds is already UTC - the datetimes it puts on the
+    timeline are aware, its strings came back from norm_log_ts - so the span is
+    a plain min/max and no conversion happens here. Unparseable entries drop
+    out instead of skewing the span, and an empty input gives an empty span,
+    which every renderer prints as nothing at all.
+    """
+    vals = sorted(v for v in (_ts_text(t) for t in (times or [])) if v)
+    return (vals[0], vals[-1]) if vals else ("", "")
+
+
+def norm_log_ts(text, tz_offset=None, year_hint=None):
+    """Any log timestamp -> 'YYYY-MM-DD HH:MM:SS' UTC, or '' if unparseable.
+
+    A stamp that carries its own offset is converted with it.  A naive stamp is
+    the host's local wall clock, so tz_offset (host local - UTC) is subtracted -
+    the same normalisation the timeline already applies.  Syslog's 'Mar 24
+    15:47:28' carries no year; year_hint supplies one so rotations do not all
+    collapse onto 1900.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    off = tz_offset or timedelta(0)
+    m = _TS_ISO_RE.match(s)
+    if m:
+        try:
+            dt = datetime(*(int(m.group(i)) for i in range(1, 7)),
+                          tzinfo=timezone.utc)
+        except ValueError:
+            return ""
+        dt -= _tz_delta(m.group(7)) if m.group(7) else off
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    m = _TS_CLF_RE.match(s)
+    if m:
+        mon = MONTHS.get(m.group(2))
+        if not mon:
+            return ""
+        try:
+            dt = datetime(int(m.group(3)), mon, int(m.group(1)), int(m.group(4)),
+                          int(m.group(5)), int(m.group(6)), tzinfo=timezone.utc)
+        except ValueError:
+            return ""
+        return (dt - _tz_delta(m.group(7))).strftime("%Y-%m-%d %H:%M:%S")
+    m = _TS_BANNER_RE.match(s)
+    if m:
+        mon = MONTHS.get(m.group(1))
+        if not mon:
+            return ""
+        try:
+            dt = datetime(int(m.group(6)), mon, int(m.group(2)), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5)), tzinfo=timezone.utc)
+        except ValueError:
+            return ""
+        return (dt - off).strftime("%Y-%m-%d %H:%M:%S")
+    m = _TS_SYSLOG_RE.match(s)
+    if m:
+        mon = MONTHS.get(m.group(1))
+        if not mon or not year_hint:
+            return ""
+        try:
+            dt = datetime(int(year_hint), mon, int(m.group(2)), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5)), tzinfo=timezone.utc)
+        except ValueError:
+            return ""
+        return (dt - off).strftime("%Y-%m-%d %H:%M:%S")
+    return ""
+def human_size(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%.0f %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+    return ""
+NDJSON_TIME_COLUMNS = ("timestamp_utc", "timestamp", "start_utc",
+                       "last_utc", "first_utc")
+
+# -------------------------------------------------------------------------
+# log decoders: compressed text, utmp/lastlog, the journal
+# -------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# log decoders: compressed text, utmp/lastlog, and the systemd journal
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+COMPRESSED_EXT = (".gz", ".bz2", ".xz", ".lzma", ".zst", ".zstd", ".lz4")
+
+
+def zstd_decompress(raw):
+    """zstd via the 3.14 stdlib module, else the third-party package, else None."""
+    try:
+        from compression import zstd          # Python 3.14+
+        return zstd.decompress(raw)
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+    except Exception:
+        return None
+
+
+def lz4_block_decompress(src):
+    """LZ4 block format - systemd's default journal compression on many distros.
+
+    Pure Python so the script keeps working with no third-party module; journal
+    payloads are small enough that speed does not matter here.
+    """
+    out = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]; i += 1
+        lit = token >> 4
+        if lit == 15:
+            while i < n:
+                c = src[i]; i += 1; lit += c
+                if c != 255:
+                    break
+        out += src[i:i + lit]; i += lit
+        if i >= n - 1:
+            break
+        offset = src[i] | (src[i + 1] << 8); i += 2
+        if offset == 0:
+            return None
+        match = token & 15
+        if match == 15:
+            while i < n:
+                c = src[i]; i += 1; match += c
+                if c != 255:
+                    break
+        match += 4
+        start = len(out) - offset
+        if start < 0:
+            return None
+        for k in range(match):
+            out.append(out[start + k])
+    return bytes(out)
+
+
+def decompress_bytes(name, raw):
+    """Transparently expand a rotated log. Returns None if we cannot."""
+    if raw is None:
+        return None
+    low = name.lower()
+    try:
+        if low.endswith(".gz") or raw[:2] == b"\x1f\x8b":
+            return gzip.decompress(raw)
+        if low.endswith(".bz2") or raw[:3] == b"BZh":
+            return bz2.decompress(raw)
+        if low.endswith((".xz", ".lzma")) or raw[:6] == b"\xfd7zXZ\x00":
+            return lzma.decompress(raw)
+        if low.endswith((".zst", ".zstd")) or raw[:4] == b"\x28\xb5\x2f\xfd":
+            return zstd_decompress(raw)
+    except Exception:
+        return None
+    return raw
+
+
+# -- utmp / wtmp / btmp ------------------------------------------------------
+
+UTMP_FMT = "<ii32s4s32s256shhiii4i20s"      # Linux x86_64, 384 bytes per record
+UTMP_SIZE = struct.calcsize(UTMP_FMT)
+UTMP_TYPES = {0: "EMPTY", 1: "RUN_LVL", 2: "BOOT_TIME", 3: "NEW_TIME",
+              4: "OLD_TIME", 5: "INIT_PROCESS", 6: "LOGIN_PROCESS",
+              7: "USER_PROCESS", 8: "DEAD_PROCESS", 9: "ACCOUNTING"}
+
+
+def _cstr(b):
+    return b.split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+
+def parse_utmp(raw):
+    """Yield dicts from a wtmp/btmp/utmp file."""
+    if not raw or len(raw) < UTMP_SIZE:
+        return
+    for off in range(0, len(raw) - UTMP_SIZE + 1, UTMP_SIZE):
+        f = struct.unpack_from(UTMP_FMT, raw, off)
+        ut_type, pid, line, uid_str, user, host = f[0], f[1], f[2], f[3], f[4], f[5]
+        sec, usec = f[9], f[10]
+        addr = f[11:15]
+        if ut_type == 0 and not sec:
+            continue
+        ip = ""
+        if addr[0]:
+            try:
+                ip = str(ipaddress.ip_address(struct.pack("<I", addr[0] & 0xFFFFFFFF)))
+            except Exception:
+                ip = ""
+        yield {
+            "type": UTMP_TYPES.get(ut_type, str(ut_type)),
+            "pid": pid,
+            "line": _cstr(line),
+            "id": _cstr(uid_str),
+            "user": _cstr(user),
+            "host": _cstr(host),
+            "ip": ip,
+            "time": (datetime.fromtimestamp(sec, timezone.utc) if sec else None),
+        }
+
+
+LASTLOG_FMT = "<i32s256s"                    # ll_time, ll_line, ll_host
+LASTLOG_SIZE = struct.calcsize(LASTLOG_FMT)
+
+# struct faillog: short fail_cnt, short fail_max, char fail_line[12],
+# time_t fail_time, long fail_locktime. fail_line ends at offset 16, which is
+# already 8-aligned, so there is no padding: 32 bytes on 64-bit builds and 24
+# on 32-bit ones. The file size decides which layout applies.
+FAILLOG_FMT_64 = "<hh12sqq"
+FAILLOG_FMT_32 = "<hh12sll"
+FAILLOG_SIZE_64 = struct.calcsize(FAILLOG_FMT_64)
+FAILLOG_SIZE_32 = struct.calcsize(FAILLOG_FMT_32)
+
+
+def parse_faillog(raw):
+    """faillog is a flat array indexed by uid, like lastlog.
+
+    FOR577 rates it unreliable - it is only written by tools that bother to,
+    and it is trivially reset - but a non-zero counter is still a record of
+    failed authentication for that account, so it is decoded and labelled.
+    """
+    if not raw:
+        return
+    for size, fmt in ((FAILLOG_SIZE_64, FAILLOG_FMT_64),
+                      (FAILLOG_SIZE_32, FAILLOG_FMT_32)):
+        if len(raw) % size:
+            continue
+        for uid in range(len(raw) // size):
+            cnt, mx, line, when, lock = struct.unpack_from(fmt, raw, uid * size)
+            if not cnt and not when:
+                continue
+            yield {"uid": uid, "count": cnt, "max": mx, "line": _cstr(line),
+                   "time": (datetime.fromtimestamp(when, timezone.utc)
+                            if 0 < when < (1 << 62) else None),
+                   "locktime": lock}
+        return
+
+
+def parse_lastlog(raw):
+    """lastlog is a flat array indexed by uid; yields only populated slots."""
+    if not raw:
+        return
+    for uid in range(len(raw) // LASTLOG_SIZE):
+        t, line, host = struct.unpack_from(LASTLOG_FMT, raw, uid * LASTLOG_SIZE)
+        if not t:
+            continue
+        yield {"uid": uid, "time": datetime.fromtimestamp(t, timezone.utc),
+               "line": _cstr(line), "host": _cstr(host)}
+
+
+# -- systemd journal ---------------------------------------------------------
+
+JOURNAL_MAGIC = b"LPKSHHRH"
+_J_OBJ_DATA, _J_OBJ_ENTRY = 1, 3
+_J_INC_COMPACT = 16
+_J_OF_XZ, _J_OF_LZ4, _J_OF_ZSTD = 1, 2, 4
+
+SYSLOG_PRIORITY = {0: "emerg", 1: "alert", 2: "crit", 3: "err", 4: "warning",
+                   5: "notice", 6: "info", 7: "debug"}
+
+
+def parse_journal(raw):
+    """Decode a binary systemd journal file into entry dicts.
+
+    Walks the object arena directly rather than following the entry-array
+    chain: a truncated or actively-written journal (the '.journal~' rotations
+    UAC copies) still yields every entry object that made it to disk.
+    Returns (entries, stats).
+    """
+    stats = {"entries": 0, "undecodable_fields": 0, "compression": set()}
+    if not raw or raw[:8] != JOURNAL_MAGIC or len(raw) < 272:
+        return [], stats
+    incompatible = struct.unpack_from("<I", raw, 12)[0]
+    header_size = struct.unpack_from("<Q", raw, 88)[0]
+    compact = bool(incompatible & _J_INC_COMPACT)
+    n = len(raw)
+    # DATA object: header(16) + hash,next_hash,next_field,entry,entry_array,
+    # n_entries (6 x le64), plus 2 x le32 tail-entry-array fields when COMPACT
+    data_skip = 16 + 8 * 6 + (8 if compact else 0)
+
+    def payload(off):
+        if off <= 0 or off + 16 > n:
+            return None
+        if raw[off] != _J_OBJ_DATA:
+            return None
+        flags = raw[off + 1]
+        size = struct.unpack_from("<Q", raw, off + 8)[0]
+        if size < data_skip or off + size > n:
+            return None
+        blob = raw[off + data_skip: off + size]
+        if flags & _J_OF_ZSTD:
+            stats["compression"].add("zstd")
+            return zstd_decompress(blob)
+        if flags & _J_OF_XZ:
+            stats["compression"].add("xz")
+            try:
+                return lzma.decompress(blob)
+            except Exception:
+                return None
+        if flags & _J_OF_LZ4:
+            stats["compression"].add("lz4")
+            return lz4_block_decompress(blob[8:]) if len(blob) >= 8 else None
+        return blob
+
+    entries = []
+    off = header_size
+    while off + 16 <= n:
+        otype = raw[off]
+        size = struct.unpack_from("<Q", raw, off + 8)[0]
+        if size < 16 or off + size > n:
+            break
+        if otype == _J_OBJ_ENTRY:
+            realtime = struct.unpack_from("<Q", raw, off + 24)[0]
+            # seqnum(8) realtime(8) monotonic(8) boot_id(16) xor_hash(8)
+            items_at = off + 16 + 48
+            item_size = 4 if compact else 16
+            fields = {}
+            for k in range((off + size - items_at) // item_size):
+                at = items_at + k * item_size
+                doff = (struct.unpack_from("<I", raw, at)[0] if compact
+                        else struct.unpack_from("<Q", raw, at)[0])
+                p = payload(doff)
+                if p is None:
+                    stats["undecodable_fields"] += 1
+                    continue
+                key, sep, val = p.partition(b"=")
+                if sep:
+                    fields[key.decode("utf-8", "replace")] = \
+                        val.decode("utf-8", "replace")
+            if fields:
+                fields["__REALTIME"] = realtime
+                entries.append(fields)
+                stats["entries"] += 1
+        off += (size + 7) & ~7          # objects are 8-byte aligned
+    return entries, stats
+
+
+# 'Mar 24 15:47:28 host proc[123]: message' or an ISO variant
+SYSLOG_RE = re.compile(
+    r"^(?P<ts>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}[T ]\S+)\s+"
+    r"(?P<host>\S+)\s+(?P<proc>[^\s:\[]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$")
+
+# the installer and busybox syslogd omit the hostname: 'Mar 24 15:47:28 proc: msg'
+SYSLOG_NOHOST_RE = re.compile(
+    r"^(?P<ts>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}[T ]\S+)\s+"
+    r"(?P<proc>[^\s:\[]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$")
+
+# dpkg.log and friends: 'YYYY-MM-DD HH:MM:SS rest of line'
+ISO_TS_RE = re.compile(r"^(?P<ts>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)\s+(?P<msg>.*)$")
+
+# 'update-alternatives 2026-03-24 15:48:15: run with ...'
+TOOL_TS_RE = re.compile(
+    r"^(?P<proc>\S+)\s+(?P<ts>\d{4}-\d\d-\d\d\s+\d\d:\d\d:\d\d):\s*(?P<msg>.*)$")
+
+# boot.log banner: '------------ Tue Mar 24 11:53:47 EDT 2026 ------------'
+BANNER_TS_RE = re.compile(
+    r"^-{3,}\s*(?P<ts>\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d:\d\d\s+\S*\s*\d{4})\s*-{3,}$")
+
+# 'Log started: 2026-03-24  15:48:35' in apt/term.log
+LOGSTART_RE = re.compile(r"^(?P<msg>Log (?:started|ended)):\s*(?P<ts>.+)$")
+
+# cups: 'E [24/Mar/2026:19:16:30 -0400] message'
+CUPS_RE = re.compile(
+    r"^(?P<level>[EWIDN])\s+\[(?P<ts>\d{2}/\w{3}/\d{4}:\d\d:\d\d:\d\d\s*[+-]?\d*)\]"
+    r"\s*(?P<msg>.*)$")
+CUPS_LEVELS = {"E": "error", "W": "warning", "I": "info", "D": "debug",
+               "N": "notice"}
+
+# common / combined access log
+ACCESS_RE = re.compile(
+    r'^(?P<host>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+\[(?P<ts>[^\]]+)\]\s+'
+    r'"(?P<req>[^"]*)"\s+(?P<status>\d{3})\s+(?P<size>\S+)')
+
+
+def split_log_line(ln):
+    """Best-effort (timestamp, host, process, pid, message) for one log line.
+
+    Tried most-specific first. Falls back to the raw line with an empty
+    timestamp rather than guessing, so an unmatched row is visibly unmatched.
+    """
+    m = SYSLOG_RE.match(ln)
+    if m:
+        return (m.group("ts"), m.group("host"), m.group("proc"),
+                m.group("pid") or "", m.group("msg"))
+    a = ACCESS_RE.match(ln)
+    if a:
+        return (a.group("ts"), a.group("host"), "http", "",
+                "%s -> %s (%s bytes) user=%s" % (a.group("req"), a.group("status"),
+                                                 a.group("size"), a.group("user")))
+    m = CUPS_RE.match(ln)
+    if m:
+        return (m.group("ts"), "", CUPS_LEVELS.get(m.group("level"), m.group("level")),
+                "", m.group("msg"))
+    m = TOOL_TS_RE.match(ln)
+    if m:
+        return m.group("ts"), "", m.group("proc"), "", m.group("msg")
+    m = SYSLOG_NOHOST_RE.match(ln)
+    if m:
+        return (m.group("ts"), "", m.group("proc"), m.group("pid") or "",
+                m.group("msg"))
+    m = BANNER_TS_RE.match(ln)
+    if m:
+        return m.group("ts"), "", "", "", ln.strip()
+    m = LOGSTART_RE.match(ln)
+    if m:
+        return m.group("ts"), "", "", "", m.group("msg")
+    m = ISO_TS_RE.match(ln)
+    if m:
+        return m.group("ts"), "", "", "", m.group("msg")
+    return "", "", "", "", ln.rstrip()
+
+# -------------------------------------------------------------------------
+# collection access (directory / tar / zip backends)
+# -------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # collection access (directory / tar / zip backends)
@@ -1132,697 +2293,9 @@ def velo_time(value):
     except (OverflowError, OSError, ValueError):
         return None
 
-
-# ---------------------------------------------------------------------------
-# shared knowledge / heuristics
-# ---------------------------------------------------------------------------
-
-TMPFS_DIRS = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/dev/mqueue/")
-SYSTEM_BIN_DIRS = ("/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/",
-                   "/usr/local/sbin/", "/usr/lib/", "/lib/", "/lib64/", "/usr/lib64/")
-SYSTEM_CFG_DIRS = ("/etc/", "/boot/", "/usr/lib/systemd/", "/lib/systemd/")
-
-# ports commonly used by implants / handlers
-SUSPICIOUS_PORTS = {
-    23: "telnet", 1080: "socks proxy", 1337: "common backdoor", 2323: "telnet alt",
-    3333: "common backdoor/miner", 4444: "metasploit default", 4445: "metasploit alt",
-    5555: "common backdoor/adb", 6666: "IRC bot / backdoor", 6667: "IRC",
-    7777: "common backdoor", 8888: "common backdoor/proxy", 9001: "tor / backdoor",
-    9050: "tor socks", 9051: "tor control", 12345: "netbus/backdoor",
-    31337: "elite/backdoor", 54321: "backdoor", 14444: "miner pool",
-    3332: "miner pool", 5900: "vnc",
-}
-
-# baseline of SUID/SGID binaries shipped by mainstream Linux distributions
-BASELINE_SUID = {
-    "/usr/bin/sudo", "/usr/bin/su", "/usr/bin/passwd", "/usr/bin/gpasswd",
-    "/usr/bin/chfn", "/usr/bin/chsh", "/usr/bin/newgrp", "/usr/bin/mount",
-    "/usr/bin/umount", "/usr/bin/pkexec", "/usr/bin/fusermount", "/usr/bin/fusermount3",
-    "/usr/bin/ntfs-3g", "/usr/bin/at", "/usr/bin/crontab", "/usr/bin/expiry",
-    "/usr/bin/chage", "/usr/bin/wall", "/usr/bin/write", "/usr/bin/screen",
-    "/usr/bin/dotlockfile", "/usr/bin/ssh-agent", "/usr/bin/bwrap",
-    "/usr/bin/vmware-user-suid-wrapper", "/usr/bin/staprun", "/usr/bin/mount.nfs",
-    "/usr/lib/dbus-1.0/dbus-daemon-launch-helper", "/usr/lib/xorg/Xorg.wrap",
-    "/usr/lib/openssh/ssh-keysign", "/usr/lib/polkit-1/polkit-agent-helper-1",
-    "/usr/lib/eject/dmcrypt-get-device", "/usr/lib/snapd/snap-confine",
-    "/usr/lib/x86_64-linux-gnu/utempter/utempter",
-    "/usr/lib/x86_64-linux-gnu/lxc/lxc-user-nic",
-    "/usr/libexec/camel-lock-helper-1.2", "/usr/libexec/dbus-1/dbus-daemon-launch-helper",
-    "/usr/libexec/openssh/ssh-keysign", "/usr/libexec/polkit-agent-helper-1",
-    "/usr/libexec/utempter/utempter", "/usr/libexec/spice-gtk-x86_64/spice-client-glib-usb-acl-helper",
-    "/usr/sbin/pppd", "/usr/sbin/unix_chkpwd", "/usr/sbin/mount.nfs",
-    "/usr/sbin/pam_timestamp_check", "/usr/sbin/usernetctl", "/usr/sbin/exim4",
-    "/usr/sbin/postdrop", "/usr/sbin/postqueue", "/usr/sbin/grub2-set-bootflag",
-    "/bin/su", "/bin/mount", "/bin/umount", "/bin/ping", "/bin/ping6",
-    "/bin/fusermount", "/sbin/unix_chkpwd", "/sbin/mount.nfs", "/sbin/pam_timestamp_check",
-    "/usr/bin/ping", "/usr/bin/ping6", "/usr/bin/traceroute6.iputils",
-    "/usr/bin/arping", "/usr/bin/mtr-packet", "/usr/bin/kismet_cap_linux_bluetooth",
-}
-
-# interpreters / living-off-the-land binaries that must never be SUID
-DANGEROUS_SUID_NAMES = {
-    "bash", "sh", "dash", "zsh", "ksh", "csh", "tcsh", "python", "python2",
-    "python3", "perl", "ruby", "php", "lua", "node", "awk", "gawk", "mawk",
-    "find", "vim", "vi", "nano", "emacs", "less", "more", "man", "cp", "mv",
-    "dd", "tar", "zip", "unzip", "rsync", "nmap", "env", "docker", "systemctl",
-    "openssl", "socat", "nc", "ncat", "netcat", "busybox", "strace", "gdb",
-}
-
-# command fragments that are interesting in cron jobs, units, histories
-SUSPICIOUS_CMD_PATTERNS = [
-    (r"/dev/tcp/", "bash reverse shell primitive", "HIGH"),
-    (r"\bnc\b\s+(-[a-z]*e|.*\s-e\b)", "netcat with -e (reverse shell)", "CRITICAL"),
-    (r"\b(ncat|netcat|socat)\b", "netcat/socat usage", "HIGH"),
-    (r"\bbash\s+-i\b", "interactive shell spawn", "HIGH"),
-    (r"base64\s+(-d|--decode)", "base64 decoding of payload", "HIGH"),
-    (r"\becho\s+[A-Za-z0-9+/=]{40,}", "long encoded blob", "HIGH"),
-    (r"(curl|wget)[^|;\n]*\|\s*(ba)?sh", "download piped to shell", "CRITICAL"),
-    (r"\b(curl|wget)\b", "remote download", "MEDIUM"),
-    (r"python[0-9.]*\s+-c\b", "inline python", "HIGH"),
-    (r"perl\s+-e\b", "inline perl", "HIGH"),
-    # only the modes that matter: +x, world-writable 777, and setuid/setgid.
-    # 0755/0700 appear all over stock init scripts.
-    (r"\bchmod\s+(-R\s+)?(\+x|a\+x|u\+s|g\+s|0?777|[24][0-7]{3})\b",
-     "granting execute / world-write / setuid", "MEDIUM"),
-    (r"\bchattr\s+[+-]i\b", "immutable attribute change", "HIGH"),
-    (r"history\s+-c|>\s*~?/?\.bash_history|unset\s+HISTFILE|HISTFILE=/dev/null",
-     "shell history tampering", "HIGH"),
-    (r"\bshred\b|\bwipe\b|\bsrm\b", "secure deletion utility", "HIGH"),
-    (r"\bcrontab\s+-r\b", "crontab wipe", "HIGH"),
-    (r"\b(setenforce\s+0|systemctl\s+(stop|disable|mask)\s+(auditd|rsyslog|firewalld|ufw))",
-     "security control disabled", "HIGH"),
-    (r"iptables\s+-F|nft\s+flush", "firewall rules flushed", "HIGH"),
-    (r"\bldd\b.*ld\.so\.preload|ld\.so\.preload", "LD_PRELOAD persistence", "CRITICAL"),
-    (r"LD_PRELOAD=", "LD_PRELOAD injection", "CRITICAL"),
-    (r"\binsmod\b|\bmodprobe\b\s+[^-]", "kernel module load", "MEDIUM"),
-    (r"\bxmrig\b|stratum\+tcp|\bminerd\b|cryptonight", "cryptominer indicator", "CRITICAL"),
-    (r"\.onion\b|\btor2web\b|\bngrok\b|\bpastebin\.com\b|\btransfer\.sh\b",
-     "anonymising / paste service", "HIGH"),
-    # a temp path only matters when it is being *run*; distro scripts mention
-    # /tmp constantly in tests and variable assignments
-    (r"(?:^|[;&|`]\s*|\$\(\s*|\b(?:exec|source|\.|sh|bash|dash|zsh|sudo|nohup|setsid|python[0-9.]*|perl)\s+)"
-     r"(?:/tmp/|/var/tmp/|/dev/shm/|/run/shm/)\S+",
-     "execution from a world-writable dir", "HIGH"),
-    (r"\bnohup\b.*&|\bsetsid\b|\bdisown\b", "detached background execution", "MEDIUM"),
-    (r"\bssh\b.*-[fNL]\s|-R\s+\d+:", "ssh tunnel / port forward", "HIGH"),
-    (r"\bsshpass\b", "non-interactive ssh password use", "HIGH"),
-    (r"\buseradd\b|\badduser\b|\busermod\b.*-G", "account manipulation", "HIGH"),
-    (r"authorized_keys", "ssh key persistence", "HIGH"),
-]
-COMPILED_CMD_PATTERNS = [(re.compile(p, re.I), d, s) for p, d, s in SUSPICIOUS_CMD_PATTERNS]
-
-# Named offensive tooling, by what its presence would mean. ROOTKIT_NAMES below
-# covers kernel implants; this covers the userland toolkit an operator brings.
-#
-# Split into two tiers on purpose. UNAMBIGUOUS names are not words anyone uses
-# for anything else, so a hit anywhere - a log line, a filename, a package - is
-# worth reporting. AMBIGUOUS names are ordinary English or common binaries
-# ('john', 'empire', 'beacon', 'havoc', 'sliver'), and matching those in free
-# log text produces noise, not findings; they are only ever matched in a
-# command line or a path, where the word is naming something executable.
-HACKTOOL_UNAMBIGUOUS = {
-    "credential access": [
-        "mimikatz", "mimipenguin", "mimidump", "lazagne", "secretsdump",
-        "gosecretsdump", "hashdump", "pypykatz", "kerberoast", "asreproast",
-        "dumpert", "nanodump", "procdump", "keethief", "lsassy", "hekatomb",
-        "certipy", "gettgtpkinit", "krbrelayx", "ticketer", "getnpusers",
-        "getuserspns", "dcsync", "ntdsutil", "ntds.dit", "creddump7",
-        "chntpw", "unshadow", "hashcat", "johntheripper",
-    ],
-    "privilege escalation enumeration": [
-        "linpeas", "winpeas", "linenum", "lse.sh", "linux-smart-enumeration",
-        "unix-privesc-check", "linux-exploit-suggester", "les.sh", "pspy",
-        "gtfoblookup", "beroot", "privesccheck", "suid3num", "traitor",
-        "sudo_killer", "sudokiller",
-    ],
-    "active directory attack": [
-        "bloodhound", "sharphound", "azurehound", "rusthound", "soaphound",
-        "crackmapexec", "netexec", "smbmap", "smbexec", "wmiexec", "psexec",
-        "atexec", "dcomexec", "evil-winrm", "kerbrute", "rubeus", "impacket",
-        "responder", "ntlmrelayx", "mitm6", "petitpotam", "printnightmare",
-        "zerologon", "noPac", "adidnsdump", "windapsearch", "ldapdomaindump",
-    ],
-    "command and control": [
-        "meterpreter", "msfvenom", "msfconsole", "metasploit", "cobaltstrike",
-        "cobalt strike", "teamserver", "beacon.dll", "sliver-client",
-        "sliver-server", "mythic", "poshc2", "covenant", "brute ratel",
-        "bruteratel", "havoc-client", "merlin", "koadic", "pupy", "villain",
-        "hoaxshell", "chisel", "ligolo", "revsocks", "gost", "frpc", "frps",
-        "sshuttle", "ngrok", "cloudflared tunnel", "pivotnacci", "reGeorg",
-        "neo-regeorg", "tunna",
-    ],
-    "scanning and exploitation": [
-        "masscan", "zmap", "nuclei", "gobuster", "feroxbuster", "dirbuster",
-        "wfuzz", "sqlmap", "nikto", "wpscan", "joomscan", "commix", "xsstrike",
-        "searchsploit", "exploitdb", "routersploit", "arachni", "whatweb",
-        "enum4linux", "smbclient -N", "onesixtyone", "snmpwalk -c public",
-    ],
-    "webshell": [
-        "c99shell", "r57shell", "b374k", "weevely", "wso shell", "antsword",
-        "behinder", "godzilla webshell", "chinachopper", "china chopper",
-        "phpspy", "wsomanager", "indoxploit", "alfashell", "marijuana shell",
-    ],
-    "cryptomining": [
-        "xmrig", "minerd", "cpuminer", "nbminer", "phoenixminer", "ethminer",
-        "lolminer", "t-rex miner", "nanominer", "xmr-stak", "cgminer",
-    ],
-    "container escape": [
-        "deepce", "amicontained", "cdk-team", "botb ", "break-out-the-box",
-        "kubeletctl", "peirates",
-    ],
-    "exfiltration staging": [
-        "rclone copy", "megatools", "transfer.sh", "filebin", "0x0.st",
-        "termbin", "oshi.at",
-    ],
-}
-# ordinary words that are also tool names - command/path context only
-HACKTOOL_AMBIGUOUS = {
-    "credential access": ["john", "hydra", "medusa", "patator", "crowbar",
-                          "cewl", "ophcrack"],
-    "active directory attack": ["certify", "seatbelt", "sharpview"],
-    "command and control": ["empire", "sliver", "havoc", "merlin", "beacon",
-                            "silenttrinity", "quasar"],
-    "scanning and exploitation": ["nmap", "dirb", "ffuf", "amass", "subfinder",
-                                  "arjun", "dalfox"],
-    "container escape": ["cdk"],
-}
-
-
-def _tool_regex(groups):
-    """One alternation for the whole tier, so a cell costs a single pass.
-
-    This is what the function always claimed to do and did not: it compiled one
-    alternation *per category*, so every cell was scanned nine times for the
-    unambiguous tier and five for the ambiguous one. Nine passes over a web
-    server's three million log rows is 213 seconds to produce 38 findings -
-    over half the entire run. The cost driver is the number of cells, never the
-    number of tool names, which is the same lesson --pivot already learned when
-    it compiled 400 indicators into one alternation.
-
-    Returns (regex, name -> category), because the category can no longer come
-    from which pattern matched.
-    """
-    cats = {}
-    for cat, names in groups.items():
-        for n in names:
-            cats.setdefault(n.lower(), cat)
-    alt = "|".join(sorted((re.escape(n) for n in cats), key=len, reverse=True))
-    # Case-sensitive against already-lowercased names, with the caller
-    # lowercasing the cell once. re.I is not a free flag: it case-folds at
-    # every position of every alternative, and measured on this collection's
-    # log lines it costs 78us per line against 19us for one str.lower() plus a
-    # case-sensitive scan - the single biggest cost in the whole run.
-    #
-    # not preceded/followed by a word character, so 'john' does not fire on
-    # 'johnson' and 'cdk' does not fire on 'cdkit'; a leading '/' or '-' is
-    # fine because that is how these appear in paths and argv
-    return re.compile(r"(?<![\w.])(%s)(?![\w-])" % alt), cats
-
-
-HACKTOOL_RE, HACKTOOL_CAT = _tool_regex(HACKTOOL_UNAMBIGUOUS)
-HACKTOOL_CTX_RE, HACKTOOL_CTX_CAT = _tool_regex(HACKTOOL_AMBIGUOUS)
-# how bad a name is, before the context it was found in is considered
-HACKTOOL_SEVERITY = {
-    "credential access": "CRITICAL", "active directory attack": "HIGH",
-    "command and control": "CRITICAL", "privilege escalation enumeration": "HIGH",
-    "scanning and exploitation": "HIGH", "webshell": "CRITICAL",
-    "cryptomining": "CRITICAL", "container escape": "HIGH",
-    "exfiltration staging": "HIGH",
-}
-
-# known Linux rootkit / offensive tool module and file names
-ROOTKIT_NAMES = [
-    "diamorphine", "reptile", "suterusu", "adore", "adore-ng", "knark", "modhide",
-    "kbeast", "enyelkm", "sebek", "phalanx", "jynx", "azazel", "beurk", "vlany",
-    "bedevil", "bdvl", "umbreon", "rkduck", "syslogk", "pinkit", "khook",
-    "brootus", "nurupo", "wukong", "hiddenwasp", "drovorub", "symbiote",
-    "medusa", "tinyshell", "bpfdoor", "ebpfkit", "boopkit", "tripleCross",
-]
-
-BENIGN_HIDDEN = re.compile(
-    r"(^|/)\.(placeholder|updated|pwd\.lock|X11-unix|ICE-unix|XIM-unix|font-unix|"
-    r"Test-unix|cache|config|local|gnupg|ssh|profile|bashrc|bash_logout|bash_profile|"
-    r"face|face\.icon|nosearch|gsd-[a-z-]+\.settings-ported|os-release-stage|"
-    r"registry|features|dbus-keyrings|Xauthority|ICEauthority|wget-hsts|selected_editor|"
-    r"lesshst|viminfo|python_history|sudo_as_admin_successful|motd\.legacy)($|/)")
-
-def norm_ip(ip):
-    """Canonical text form so /proc/net, ss and lsof addresses compare equal."""
-    if ip is None:
-        return ""
-    ip = ip.strip().strip("[]")
-    if ip in ("*", ""):
-        return "0.0.0.0"
-    if "%" in ip:                       # scope id, e.g. fe80::1%eth0
-        ip = ip.split("%")[0]
-    try:
-        return str(ipaddress.ip_address(ip))
-    except ValueError:
-        return ip
-
-
-def is_private_ip(ip):
-    """True for anything that is not a routable public address."""
-    ip = norm_ip(ip)
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return True                     # hostnames / '*' - not evidence of egress
-    return not addr.is_global
-
-
-def hexip_to_str(hexip):
-    """/proc/net/{tcp,udp} address (little-endian hex) -> canonical IP string."""
-    try:
-        if len(hexip) == 8:
-            raw = bytes.fromhex(hexip)[::-1]
-            return str(ipaddress.IPv4Address(raw))
-        if len(hexip) == 32:
-            words = [bytes.fromhex(hexip[i:i + 8])[::-1] for i in range(0, 32, 8)]
-            return str(ipaddress.IPv6Address(b"".join(words)))
-    except Exception:
-        pass
-    return hexip
-
-
-def split_hostport(addr):
-    """'127.0.0.1:3333' / '[::1]:22' / '*:22' -> (canonical host, port|None)."""
-    addr = (addr or "").strip()
-    if addr.startswith("["):
-        host, sep, port = addr.rpartition("]:")
-        if not sep:
-            return norm_ip(addr), None
-        return norm_ip(host), _port(port)
-    host, sep, port = addr.rpartition(":")
-    if not sep:
-        return norm_ip(addr), None
-    if host.count(":") >= 2:            # bare IPv6 without brackets
-        return norm_ip(addr), None
-    return norm_ip(host), _port(port)
-
-
-def _port(p):
-    try:
-        return int(p)
-    except (TypeError, ValueError):
-        return None
-
-
-MONTHS = {m: i + 1 for i, m in enumerate(
-    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
-
-
-def parse_lstart(s):
-    """'Tue Mar 24 19:25:30 2026' -> naive-UTC-tagged datetime (host local clock)."""
-    m = re.match(r"\w{3}\s+(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})", s.strip())
-    if not m:
-        return None
-    mon = MONTHS.get(m.group(1))
-    if not mon:
-        return None
-    try:
-        return datetime(int(m.group(6)), mon, int(m.group(2)), int(m.group(3)),
-                        int(m.group(4)), int(m.group(5)), tzinfo=timezone.utc)
-    except ValueError:
-        return None
-
-
-def epoch(ts):
-    try:
-        # auditd stamps are 'seconds.milliseconds', so parse as float and let
-        # int() drop the fraction rather than rejecting the whole timestamp
-        v = int(float(ts))
-    except (TypeError, ValueError):
-        return None
-    if v <= 0:
-        return None
-    try:
-        return datetime.fromtimestamp(v, timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
-def _printable(raw):
-    """Matched bytes rendered for a report: printable ASCII kept, rest hexed.
-
-    A YARA hit is often binary, and pasting raw bytes into a CSV produces a
-    cell no tool can display and some can't even quote. This keeps the part a
-    human can read and makes the rest explicit rather than mangled.
-    """
-    if isinstance(raw, str):
-        raw = raw.encode("utf-8", "replace")
-    out = []
-    for b in raw:
-        out.append(chr(b) if 32 <= b < 127 else "\\x%02x" % b)
-    return "".join(out)
-
-
-def trunc(s, n=180):
-    s = s.strip()
-    return s if len(s) <= n else s[: n - 3] + "..."
-
-
-# Groups whose membership is equivalent to root on most systems: sudo/wheel by
-# definition, docker/lxd because the daemon runs as root, disk/shadow because
-# they read the raw device and the hashes.
-PRIVILEGED_GROUPS = frozenset((
-    "sudo", "wheel", "admin", "adm", "root", "docker", "lxd", "lxc",
-    "disk", "shadow", "video", "kvm", "libvirt", "systemd-journal",
-    "sys", "staff", "operator"))
-
-
-# The daemons whose messages are privilege use. Matched against the syslog
-# identifier as well as the text, because a sudo record names the command it
-# ran but never the word "sudo".
-PRIV_HINT_RE = re.compile(
-    r"\b(sudo|su|pkexec|polkit|usermod|useradd|userdel|groupadd|groupdel|"
-    r"gpasswd|chage|passwd|visudo|run0)\b", re.I)
-
-
-# Message shapes that mean "authentication did not succeed", with the reason
-# named. FOR577 opens its account-attack section with "check for large numbers
-# of failed logins", so these feed both the FAILED_LOGINS table and the
-# brute-force analyzer and live at module scope for both to share.
-FAILED_LOGIN_RULES = [
-    ("bad password", re.compile(
-        r"Failed (?P<method>password) for (?:invalid user )?(?P<user>\S+)"
-        r" from (?P<ip>\S+)(?: port (?P<port>\d+))?")),
-    ("bad key", re.compile(
-        r"Failed (?P<method>publickey|none|keyboard-interactive\S*) for "
-        r"(?:invalid user )?(?P<user>\S+) from (?P<ip>\S+)"
-        r"(?: port (?P<port>\d+))?")),
-    ("unknown account", re.compile(
-        r"Invalid user (?P<user>\S*)\s*from (?P<ip>\S+)"
-        r"(?: port (?P<port>\d+))?")),
-    ("unknown account", re.compile(
-        r"(?:check pass; user unknown|"
-        r"illegal user (?P<user>\S+) from (?P<ip>\S+))")),
-    ("pam authentication failure", re.compile(
-        r"authentication failure;")),
-    ("too many attempts", re.compile(
-        r"(?:maximum authentication attempts exceeded|"
-        r"Too many authentication failures)(?: for (?P<user>\S+))?"
-        r"(?: from (?P<ip>\S+))?(?: port (?P<port>\d+))?")),
-    ("root login refused", re.compile(
-        r"(?:ROOT LOGIN REFUSED|Root login rejected|"
-        r"User root from (?P<ip>\S+) not allowed)")),
-    ("account not permitted", re.compile(
-        r"(?:User (?P<user>\S+) from (?P<ip>\S+) not allowed because|"
-        r"Authentication refused|pam_access\(.*\): access denied)")),
-    ("aborted before authenticating", re.compile(
-        r"(?:Connection closed by (?:authenticating|invalid) user "
-        r"(?P<user>\S+) (?P<ip>\S+)(?: port (?P<port>\d+))?|"
-        r"Received disconnect from (?P<ip2>\S+).*\[preauth\])")),
-    ("sudo password failure", re.compile(
-        r"^\s*(?P<user>\S+)\s*:\s*(?P<detail>\d+ incorrect password "
-        r"attempts?)")),
-    ("sudo not permitted", re.compile(
-        r"^\s*(?P<user>\S+)\s*:\s*(?P<detail>user NOT in sudoers|"
-        r"command not allowed)")),
-    ("su failure", re.compile(
-        r"FAILED su(?: \(to (?P<target>\S+)\))?(?: for (?P<target2>\S+))?"
-        r"(?: by (?P<user>\S+))?")),
-    ("failed login", re.compile(
-        r"(?:FAILED LOGIN|LOGIN FAILURE|authentication error)"
-        r"(?:.*?FROM (?P<ip>\S+))?(?:.*?FOR (?P<user>\S+))?")),
-]
-
-
-def match_failed_login(proc, msg):
-    """One log message -> (kind, user, ip, port, method, detail), or None."""
-    for label, erx in FAILED_LOGIN_RULES:
-        em = erx.search(msg)
-        if not em:
-            continue
-        if label.startswith("sudo") and "sudo" not in (proc or "").lower():
-            continue
-        g = em.groupdict()
-        pick = lambda *k: next((g[x].strip() for x in k
-                                if g.get(x) and g[x].strip()), "")
-        return (label, pick("user", "target", "target2"),
-                pick("ip", "ip2"), pick("port"), pick("method"),
-                pick("detail"))
-    return None
-
-
-# 'Accepted publickey for bob from 1.2.3.4 port 51004 ssh2'
-ACCEPTED_LOGIN_RE = re.compile(
-    r"Accepted (?P<method>\S+) for (?P<user>\S+) from (?P<ip>\S+)"
-    r"(?: port (?P<port>\d+))?")
-
-
-# every timestamp shape that turns up in a /var/log text file
-_TS_ISO_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ]\s*(\d\d):(\d\d):(\d\d)"
-                        r"(?:[.,]\d+)?\s*(Z|[+-]\d\d:?\d\d)?$")
-_TS_SYSLOG_RE = re.compile(r"^(\w{3})\s+(\d{1,2})\s+(\d\d):(\d\d):(\d\d)$")
-_TS_CLF_RE = re.compile(r"^(\d\d)/(\w{3})/(\d{4}):(\d\d):(\d\d):(\d\d)"
-                        r"\s*([+-]\d{4})?$")
-_TS_BANNER_RE = re.compile(r"^\w{3}\s+(\w{3})\s+(\d{1,2})\s+(\d\d):(\d\d):(\d\d)"
-                           r"\s+(?:\S+\s+)?(\d{4})$")
-
-
-def _tz_delta(z):
-    """'+0200' / '-04:00' / 'Z' -> timedelta of that offset from UTC."""
-    if not z or z == "Z":
-        return timedelta(0)
-    z = z.replace(":", "")
-    try:
-        sign = -1 if z[0] == "-" else 1
-        return sign * timedelta(hours=int(z[1:3]), minutes=int(z[3:5]))
-    except (ValueError, IndexError):
-        return timedelta(0)
-
-
-_TS_SPAN_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
-
-
-def _ts_text(v):
-    """A datetime, an epoch or an already-UTC string -> 'YYYY-MM-DD HH:MM:SS'."""
-    if v is None or v == "":
-        return ""
-    if isinstance(v, datetime):
-        return v.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        # only a plausible epoch: a bare small integer reaching a finding is a
-        # count, a pid or a port far more often than it is a time
-        if v < 100000000 or v > 4102444800:
-            return ""
-        try:
-            return datetime.fromtimestamp(v, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        except (OverflowError, OSError, ValueError):
-            return ""
-    s = str(v).strip().replace("T", " ")
-    if s.endswith("Z"):
-        s = s[:-1].strip()
-    return s[:19] if _TS_SPAN_RE.match(s[:19]) else ""
-
-
-_IOC_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
-_IOC_IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
-_IOC_IPV6_RE = re.compile(r"^[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}$")
-_IOC_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)"
-                            r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
-                            r"[A-Za-z]{2,24}$")
-_HASH_BY_LEN = {32: "md5", 40: "sha1", 64: "sha256"}
-
-
-def ioc_type(value):
-    """What kind of thing an indicator is - 'ipv4', 'sha256', 'path', ...
-
-    Shape only, and deliberately so: an indicator arrives as a bare string
-    from a --pivot list or from an analyzer, with nothing else to go on. The
-    point is a column an analyst can filter on, so an unrecognised shape says
-    'string' rather than being forced into a category it does not fit.
-    """
-    s = str(value or "").strip()
-    if not s:
-        return ""
-    low = s.lower()
-    for prefix, kind in (("port:", "port"), ("pid:", "pid")):
-        if low.startswith(prefix):
-            return kind
-    if "://" in s:
-        return "url"
-    if s.startswith("/"):
-        return "path"
-    if s.isdigit():
-        return "number"
-    if _IOC_HEX_RE.match(s):
-        # a hash is one of three lengths; anything else all-hex is only worth
-        # naming when it is long enough not to be an ordinary short word, and
-        # 'dead', 'added' and 'beef' are all valid hex
-        kind = _HASH_BY_LEN.get(len(s)) or ("hex string" if len(s) >= 16 else "")
-        if kind:
-            return kind
-    m = _IOC_IPV4_RE.match(s)
-    if m and all(int(g) < 256 for g in m.groups()):
-        return "ipv4"
-    if ":" in s and _IOC_IPV6_RE.match(s):
-        return "ipv6"
-    if "@" in s and _IOC_DOMAIN_RE.match(s.rsplit("@", 1)[-1]):
-        return "email"
-    if _IOC_DOMAIN_RE.match(s):
-        return "domain"
-    if "." in s and " " not in s and "/" not in s:
-        return "filename"
-    return "string"
-
-
-# Why an indicator was extracted -> the technique that makes it worth chasing.
-# Keyed on the provenance labels Triage.ioc() records, which is the only thing
-# that knows why a term is in the list at all: the term itself is a string. A
-# label with no entry - a plain --pivot value, a path a table happened to
-# mention - contributes nothing rather than a guessed technique.
-IOC_TECHNIQUES = (
-    ("/etc/ld.so.preload", "T1574.006 Hijack Execution Flow: LD_PRELOAD"),
-    ("hidden_pids", "T1564 Hide Artifacts / T1014 Rootkit"),
-    ("hidden ", "T1564.001 Hidden Files and Directories"),
-    ("regular file under /dev", "T1564 Hide Artifacts"),
-    ("bodyfile (executable in tmpfs)", "T1036 Masquerading"),
-    ("running process pid", "T1059 Command and Scripting Interpreter"),
-    ("running-process hash", "T1070.004 Indicator Removal: File Deletion"),
-    ("hash mismatch", "T1554 Compromise Host Software Binary"),
-    ("listening socket", "T1571 Non-Standard Port"),
-    ("network connection", "T1071 Application Layer Protocol"),
-    ("outbound admin protocol", "T1021 Remote Services"),
-    ("authorized_keys", "T1098.004 SSH Authorized Keys"),
-    ("interactive login", "T1078 Valid Accounts"),
-    ("failed authentication source", "T1110 Brute Force"),
-    ("password spraying source", "T1110.003 Password Spraying"),
-    ("systemd unit", "T1543.002 Systemd Service"),
-    ("suid", "T1548.001 Setuid and Setgid"),
-    ("sgid", "T1548.001 Setuid and Setgid"),
-    ("hacktool:", "T1588.002 Obtain Capabilities: Tool"),
-)
-
-
-def ioc_mitre(labels):
-    """ATT&CK technique(s) implied by where an indicator was picked up."""
-    out = []
-    for label in sorted(labels or ()):
-        for prefix, tech in IOC_TECHNIQUES:
-            if label.startswith(prefix):
-                if tech not in out:
-                    out.append(tech)
-                break
-    return "; ".join(out)
-
-
-def span_add(span, ts):
-    """Fold one timestamp into a mutable ['first', 'last'] pair, in place.
-
-    The counterpart to span_of for the sweeps: a pivot term or a noisy Sigma
-    rule can match six figures of rows, and only the two ends are ever wanted.
-    """
-    if ts:
-        if not span[0] or ts < span[0]:
-            span[0] = ts
-        if not span[1] or ts > span[1]:
-            span[1] = ts
-    return span
-
-
-# Distinct reference strings kept per tool per table before the tail is folded
-# into one overflow row. A tool named in BODYFILE matches a different path on
-# nearly every row it hits, and an unbounded dict there is a copy of the
-# filesystem in memory; 200 is already past the point a breakdown reads.
-HACKTOOL_VARIANT_CAP = 200
-HACKTOOL_VARIANT_OTHER = "(further distinct references, not itemised)"
-
-
-def variant_add(bag, val, column, ts):
-    """Fold one hit into a {reference text: [count, span, columns]} bag.
-
-    The per-hit rows keep twelve samples per table, so they cannot be counted
-    after the fact - and the count is the point: masscan/1.0 and masscan/1.3
-    are two scanners wearing one tool name, and how often each was seen is
-    only knowable while every row is still going past.
-    """
-    text = trunc(str(val), 200)
-    rec = bag.get(text)
-    if rec is None:
-        if len(bag) >= HACKTOOL_VARIANT_CAP:
-            text = HACKTOOL_VARIANT_OTHER
-            rec = bag.get(text)
-        if rec is None:
-            rec = bag[text] = [0, ["", ""], set()]
-    rec[0] += 1
-    span_add(rec[1], ts)
-    if column:
-        rec[2].add(column)
-    return bag
-
-
-def span_of(times):
-    """(first, last) as 'YYYY-MM-DD HH:MM:SS' UTC over a bag of timestamps.
-
-    Everything an analyzer holds is already UTC - the datetimes it puts on the
-    timeline are aware, its strings came back from norm_log_ts - so the span is
-    a plain min/max and no conversion happens here. Unparseable entries drop
-    out instead of skewing the span, and an empty input gives an empty span,
-    which every renderer prints as nothing at all.
-    """
-    vals = sorted(v for v in (_ts_text(t) for t in (times or [])) if v)
-    return (vals[0], vals[-1]) if vals else ("", "")
-
-
-def norm_log_ts(text, tz_offset=None, year_hint=None):
-    """Any log timestamp -> 'YYYY-MM-DD HH:MM:SS' UTC, or '' if unparseable.
-
-    A stamp that carries its own offset is converted with it.  A naive stamp is
-    the host's local wall clock, so tz_offset (host local - UTC) is subtracted -
-    the same normalisation the timeline already applies.  Syslog's 'Mar 24
-    15:47:28' carries no year; year_hint supplies one so rotations do not all
-    collapse onto 1900.
-    """
-    s = (text or "").strip()
-    if not s:
-        return ""
-    off = tz_offset or timedelta(0)
-    m = _TS_ISO_RE.match(s)
-    if m:
-        try:
-            dt = datetime(*(int(m.group(i)) for i in range(1, 7)),
-                          tzinfo=timezone.utc)
-        except ValueError:
-            return ""
-        dt -= _tz_delta(m.group(7)) if m.group(7) else off
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    m = _TS_CLF_RE.match(s)
-    if m:
-        mon = MONTHS.get(m.group(2))
-        if not mon:
-            return ""
-        try:
-            dt = datetime(int(m.group(3)), mon, int(m.group(1)), int(m.group(4)),
-                          int(m.group(5)), int(m.group(6)), tzinfo=timezone.utc)
-        except ValueError:
-            return ""
-        return (dt - _tz_delta(m.group(7))).strftime("%Y-%m-%d %H:%M:%S")
-    m = _TS_BANNER_RE.match(s)
-    if m:
-        mon = MONTHS.get(m.group(1))
-        if not mon:
-            return ""
-        try:
-            dt = datetime(int(m.group(6)), mon, int(m.group(2)), int(m.group(3)),
-                          int(m.group(4)), int(m.group(5)), tzinfo=timezone.utc)
-        except ValueError:
-            return ""
-        return (dt - off).strftime("%Y-%m-%d %H:%M:%S")
-    m = _TS_SYSLOG_RE.match(s)
-    if m:
-        mon = MONTHS.get(m.group(1))
-        if not mon or not year_hint:
-            return ""
-        try:
-            dt = datetime(int(year_hint), mon, int(m.group(2)), int(m.group(3)),
-                          int(m.group(4)), int(m.group(5)), tzinfo=timezone.utc)
-        except ValueError:
-            return ""
-        return (dt - off).strftime("%Y-%m-%d %H:%M:%S")
-    return ""
-
+# -------------------------------------------------------------------------
+# detection rules: a YARA subset and a Sigma subset
+# -------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # detection rules: a YARA subset and a Sigma subset, both pure stdlib
@@ -3001,6 +3474,8 @@ def sigma_rule_wanted(text):
     want = ls.get("service") or ls.get("category") or ""
     if not want:                        # a bare 'product: linux' rule
         return True
+    # imported here rather than at module scope: the table layer is built
+    # on top of the rule engine, so naming it up there would close the loop
     for _tname, aliases, _ts in TableBuilder.SIGMA_STREAMS:
         for alias in aliases:
             if want == alias or want in alias or alias in want:
@@ -3271,6 +3746,9 @@ def update_sigma_rules(dest, source=None, keep_all=False, timeout=60, quiet=Fals
               "builds no table for)" % seen if kept < seen else ""))
     return kept
 
+# -------------------------------------------------------------------------
+# the triage engine
+# -------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # the triage engine
@@ -6669,422 +7147,9 @@ class Triage:
         self.events.sort(key=lambda e: e.ts)
         return self.findings
 
-
-# ---------------------------------------------------------------------------
-# log decoders: compressed text, utmp/lastlog, and the systemd journal
-# ---------------------------------------------------------------------------
-
-_PROGRESS = []                  # the bars currently drawing, outermost first
-
-
-def status(msg, stream=None):
-    """A [*]/[!] line that does not land on top of the progress bar.
-
-    print() straight to stderr while a bar is drawn appends to it, which is how
-    '[ 92%] building tables sigma[*] sigma: 407 rule(s) loaded' happens. Erase
-    the bar first; the next step() redraws it.
-    """
-    for p in _PROGRESS:
-        p.erase()
-    print(msg, file=stream or sys.stderr)
-
-
-class Progress:
-    """A one-line percentage on stderr, rewritten in place.
-
-    Only when stderr is a terminal: redirected to a file, a carriage-return
-    progress bar turns one line into thousands and buries the [*] and [!] lines
-    that matter. Everything here is cosmetic, so it never raises - a broken
-    console must not end a parse that has run for four minutes.
-
-    A nested bar - Sigma runs inside the table build - renders its parent's
-    percentage alongside its own, because a bar that reads 92% and then 62% a
-    moment later looks like the run went backwards.
-    """
-
-    def __init__(self, total, label, enabled=True, stream=None, parent=None):
-        self.total = max(1, int(total or 1))
-        self.label = label
-        self.parent = parent
-        self.n = 0
-        self.width = 0
-        self.stream = stream or sys.stderr
-        try:
-            self.on = bool(enabled) and self.stream.isatty()
-        except Exception:
-            self.on = False
-
-    def pct(self):
-        return min(100, int(100.0 * self.n / self.total))
-
-    def step(self, name="", n=None):
-        self.n = self.n + 1 if n is None else n
-        if not self.on:
-            return
-        if self not in _PROGRESS:
-            _PROGRESS.append(self)
-        if self.parent is not None and self.parent.on:
-            line = "  [%3d%%] %s %s %d%% %s" % (
-                self.parent.pct(), self.parent.label, self.label,
-                self.pct(), trunc(str(name), 34))
-        else:
-            line = "  [%3d%%] %s %s" % (self.pct(), self.label,
-                                        trunc(str(name), 46))
-        try:
-            pad = max(0, self.width - len(line))
-            self.stream.write("\r" + line + " " * pad)
-            self.stream.flush()
-            self.width = len(line)
-        except Exception:
-            self.on = False
-
-    def erase(self):
-        """Blank the line but stay live, so status() can print over it."""
-        if not self.on or not self.width:
-            return
-        try:
-            self.stream.write("\r" + " " * self.width + "\r")
-            self.stream.flush()
-            self.width = 0
-        except Exception:
-            self.on = False
-
-    def done(self):
-        if self in _PROGRESS:
-            _PROGRESS.remove(self)
-        if not self.on:
-            return
-        self.erase()
-        self.on = False
-
-
-COMPRESSED_EXT = (".gz", ".bz2", ".xz", ".lzma", ".zst", ".zstd", ".lz4")
-
-
-def zstd_decompress(raw):
-    """zstd via the 3.14 stdlib module, else the third-party package, else None."""
-    try:
-        from compression import zstd          # Python 3.14+
-        return zstd.decompress(raw)
-    except ImportError:
-        pass
-    except Exception:
-        return None
-    try:
-        import zstandard
-        return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
-    except Exception:
-        return None
-
-
-def lz4_block_decompress(src):
-    """LZ4 block format - systemd's default journal compression on many distros.
-
-    Pure Python so the script keeps working with no third-party module; journal
-    payloads are small enough that speed does not matter here.
-    """
-    out = bytearray()
-    i, n = 0, len(src)
-    while i < n:
-        token = src[i]; i += 1
-        lit = token >> 4
-        if lit == 15:
-            while i < n:
-                c = src[i]; i += 1; lit += c
-                if c != 255:
-                    break
-        out += src[i:i + lit]; i += lit
-        if i >= n - 1:
-            break
-        offset = src[i] | (src[i + 1] << 8); i += 2
-        if offset == 0:
-            return None
-        match = token & 15
-        if match == 15:
-            while i < n:
-                c = src[i]; i += 1; match += c
-                if c != 255:
-                    break
-        match += 4
-        start = len(out) - offset
-        if start < 0:
-            return None
-        for k in range(match):
-            out.append(out[start + k])
-    return bytes(out)
-
-
-def decompress_bytes(name, raw):
-    """Transparently expand a rotated log. Returns None if we cannot."""
-    if raw is None:
-        return None
-    low = name.lower()
-    try:
-        if low.endswith(".gz") or raw[:2] == b"\x1f\x8b":
-            return gzip.decompress(raw)
-        if low.endswith(".bz2") or raw[:3] == b"BZh":
-            return bz2.decompress(raw)
-        if low.endswith((".xz", ".lzma")) or raw[:6] == b"\xfd7zXZ\x00":
-            return lzma.decompress(raw)
-        if low.endswith((".zst", ".zstd")) or raw[:4] == b"\x28\xb5\x2f\xfd":
-            return zstd_decompress(raw)
-    except Exception:
-        return None
-    return raw
-
-
-# -- utmp / wtmp / btmp ------------------------------------------------------
-
-UTMP_FMT = "<ii32s4s32s256shhiii4i20s"      # Linux x86_64, 384 bytes per record
-UTMP_SIZE = struct.calcsize(UTMP_FMT)
-UTMP_TYPES = {0: "EMPTY", 1: "RUN_LVL", 2: "BOOT_TIME", 3: "NEW_TIME",
-              4: "OLD_TIME", 5: "INIT_PROCESS", 6: "LOGIN_PROCESS",
-              7: "USER_PROCESS", 8: "DEAD_PROCESS", 9: "ACCOUNTING"}
-
-
-def _cstr(b):
-    return b.split(b"\x00", 1)[0].decode("utf-8", "replace")
-
-
-def parse_utmp(raw):
-    """Yield dicts from a wtmp/btmp/utmp file."""
-    if not raw or len(raw) < UTMP_SIZE:
-        return
-    for off in range(0, len(raw) - UTMP_SIZE + 1, UTMP_SIZE):
-        f = struct.unpack_from(UTMP_FMT, raw, off)
-        ut_type, pid, line, uid_str, user, host = f[0], f[1], f[2], f[3], f[4], f[5]
-        sec, usec = f[9], f[10]
-        addr = f[11:15]
-        if ut_type == 0 and not sec:
-            continue
-        ip = ""
-        if addr[0]:
-            try:
-                ip = str(ipaddress.ip_address(struct.pack("<I", addr[0] & 0xFFFFFFFF)))
-            except Exception:
-                ip = ""
-        yield {
-            "type": UTMP_TYPES.get(ut_type, str(ut_type)),
-            "pid": pid,
-            "line": _cstr(line),
-            "id": _cstr(uid_str),
-            "user": _cstr(user),
-            "host": _cstr(host),
-            "ip": ip,
-            "time": (datetime.fromtimestamp(sec, timezone.utc) if sec else None),
-        }
-
-
-LASTLOG_FMT = "<i32s256s"                    # ll_time, ll_line, ll_host
-LASTLOG_SIZE = struct.calcsize(LASTLOG_FMT)
-
-# struct faillog: short fail_cnt, short fail_max, char fail_line[12],
-# time_t fail_time, long fail_locktime. fail_line ends at offset 16, which is
-# already 8-aligned, so there is no padding: 32 bytes on 64-bit builds and 24
-# on 32-bit ones. The file size decides which layout applies.
-FAILLOG_FMT_64 = "<hh12sqq"
-FAILLOG_FMT_32 = "<hh12sll"
-FAILLOG_SIZE_64 = struct.calcsize(FAILLOG_FMT_64)
-FAILLOG_SIZE_32 = struct.calcsize(FAILLOG_FMT_32)
-
-
-def parse_faillog(raw):
-    """faillog is a flat array indexed by uid, like lastlog.
-
-    FOR577 rates it unreliable - it is only written by tools that bother to,
-    and it is trivially reset - but a non-zero counter is still a record of
-    failed authentication for that account, so it is decoded and labelled.
-    """
-    if not raw:
-        return
-    for size, fmt in ((FAILLOG_SIZE_64, FAILLOG_FMT_64),
-                      (FAILLOG_SIZE_32, FAILLOG_FMT_32)):
-        if len(raw) % size:
-            continue
-        for uid in range(len(raw) // size):
-            cnt, mx, line, when, lock = struct.unpack_from(fmt, raw, uid * size)
-            if not cnt and not when:
-                continue
-            yield {"uid": uid, "count": cnt, "max": mx, "line": _cstr(line),
-                   "time": (datetime.fromtimestamp(when, timezone.utc)
-                            if 0 < when < (1 << 62) else None),
-                   "locktime": lock}
-        return
-
-
-def parse_lastlog(raw):
-    """lastlog is a flat array indexed by uid; yields only populated slots."""
-    if not raw:
-        return
-    for uid in range(len(raw) // LASTLOG_SIZE):
-        t, line, host = struct.unpack_from(LASTLOG_FMT, raw, uid * LASTLOG_SIZE)
-        if not t:
-            continue
-        yield {"uid": uid, "time": datetime.fromtimestamp(t, timezone.utc),
-               "line": _cstr(line), "host": _cstr(host)}
-
-
-# -- systemd journal ---------------------------------------------------------
-
-JOURNAL_MAGIC = b"LPKSHHRH"
-_J_OBJ_DATA, _J_OBJ_ENTRY = 1, 3
-_J_INC_COMPACT = 16
-_J_OF_XZ, _J_OF_LZ4, _J_OF_ZSTD = 1, 2, 4
-
-SYSLOG_PRIORITY = {0: "emerg", 1: "alert", 2: "crit", 3: "err", 4: "warning",
-                   5: "notice", 6: "info", 7: "debug"}
-
-
-def parse_journal(raw):
-    """Decode a binary systemd journal file into entry dicts.
-
-    Walks the object arena directly rather than following the entry-array
-    chain: a truncated or actively-written journal (the '.journal~' rotations
-    UAC copies) still yields every entry object that made it to disk.
-    Returns (entries, stats).
-    """
-    stats = {"entries": 0, "undecodable_fields": 0, "compression": set()}
-    if not raw or raw[:8] != JOURNAL_MAGIC or len(raw) < 272:
-        return [], stats
-    incompatible = struct.unpack_from("<I", raw, 12)[0]
-    header_size = struct.unpack_from("<Q", raw, 88)[0]
-    compact = bool(incompatible & _J_INC_COMPACT)
-    n = len(raw)
-    # DATA object: header(16) + hash,next_hash,next_field,entry,entry_array,
-    # n_entries (6 x le64), plus 2 x le32 tail-entry-array fields when COMPACT
-    data_skip = 16 + 8 * 6 + (8 if compact else 0)
-
-    def payload(off):
-        if off <= 0 or off + 16 > n:
-            return None
-        if raw[off] != _J_OBJ_DATA:
-            return None
-        flags = raw[off + 1]
-        size = struct.unpack_from("<Q", raw, off + 8)[0]
-        if size < data_skip or off + size > n:
-            return None
-        blob = raw[off + data_skip: off + size]
-        if flags & _J_OF_ZSTD:
-            stats["compression"].add("zstd")
-            return zstd_decompress(blob)
-        if flags & _J_OF_XZ:
-            stats["compression"].add("xz")
-            try:
-                return lzma.decompress(blob)
-            except Exception:
-                return None
-        if flags & _J_OF_LZ4:
-            stats["compression"].add("lz4")
-            return lz4_block_decompress(blob[8:]) if len(blob) >= 8 else None
-        return blob
-
-    entries = []
-    off = header_size
-    while off + 16 <= n:
-        otype = raw[off]
-        size = struct.unpack_from("<Q", raw, off + 8)[0]
-        if size < 16 or off + size > n:
-            break
-        if otype == _J_OBJ_ENTRY:
-            realtime = struct.unpack_from("<Q", raw, off + 24)[0]
-            # seqnum(8) realtime(8) monotonic(8) boot_id(16) xor_hash(8)
-            items_at = off + 16 + 48
-            item_size = 4 if compact else 16
-            fields = {}
-            for k in range((off + size - items_at) // item_size):
-                at = items_at + k * item_size
-                doff = (struct.unpack_from("<I", raw, at)[0] if compact
-                        else struct.unpack_from("<Q", raw, at)[0])
-                p = payload(doff)
-                if p is None:
-                    stats["undecodable_fields"] += 1
-                    continue
-                key, sep, val = p.partition(b"=")
-                if sep:
-                    fields[key.decode("utf-8", "replace")] = \
-                        val.decode("utf-8", "replace")
-            if fields:
-                fields["__REALTIME"] = realtime
-                entries.append(fields)
-                stats["entries"] += 1
-        off += (size + 7) & ~7          # objects are 8-byte aligned
-    return entries, stats
-
-
-# 'Mar 24 15:47:28 host proc[123]: message' or an ISO variant
-SYSLOG_RE = re.compile(
-    r"^(?P<ts>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}[T ]\S+)\s+"
-    r"(?P<host>\S+)\s+(?P<proc>[^\s:\[]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$")
-
-# the installer and busybox syslogd omit the hostname: 'Mar 24 15:47:28 proc: msg'
-SYSLOG_NOHOST_RE = re.compile(
-    r"^(?P<ts>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}[T ]\S+)\s+"
-    r"(?P<proc>[^\s:\[]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$")
-
-# dpkg.log and friends: 'YYYY-MM-DD HH:MM:SS rest of line'
-ISO_TS_RE = re.compile(r"^(?P<ts>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)\s+(?P<msg>.*)$")
-
-# 'update-alternatives 2026-03-24 15:48:15: run with ...'
-TOOL_TS_RE = re.compile(
-    r"^(?P<proc>\S+)\s+(?P<ts>\d{4}-\d\d-\d\d\s+\d\d:\d\d:\d\d):\s*(?P<msg>.*)$")
-
-# boot.log banner: '------------ Tue Mar 24 11:53:47 EDT 2026 ------------'
-BANNER_TS_RE = re.compile(
-    r"^-{3,}\s*(?P<ts>\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d:\d\d\s+\S*\s*\d{4})\s*-{3,}$")
-
-# 'Log started: 2026-03-24  15:48:35' in apt/term.log
-LOGSTART_RE = re.compile(r"^(?P<msg>Log (?:started|ended)):\s*(?P<ts>.+)$")
-
-# cups: 'E [24/Mar/2026:19:16:30 -0400] message'
-CUPS_RE = re.compile(
-    r"^(?P<level>[EWIDN])\s+\[(?P<ts>\d{2}/\w{3}/\d{4}:\d\d:\d\d:\d\d\s*[+-]?\d*)\]"
-    r"\s*(?P<msg>.*)$")
-CUPS_LEVELS = {"E": "error", "W": "warning", "I": "info", "D": "debug",
-               "N": "notice"}
-
-# common / combined access log
-ACCESS_RE = re.compile(
-    r'^(?P<host>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+\[(?P<ts>[^\]]+)\]\s+'
-    r'"(?P<req>[^"]*)"\s+(?P<status>\d{3})\s+(?P<size>\S+)')
-
-
-def split_log_line(ln):
-    """Best-effort (timestamp, host, process, pid, message) for one log line.
-
-    Tried most-specific first. Falls back to the raw line with an empty
-    timestamp rather than guessing, so an unmatched row is visibly unmatched.
-    """
-    m = SYSLOG_RE.match(ln)
-    if m:
-        return (m.group("ts"), m.group("host"), m.group("proc"),
-                m.group("pid") or "", m.group("msg"))
-    a = ACCESS_RE.match(ln)
-    if a:
-        return (a.group("ts"), a.group("host"), "http", "",
-                "%s -> %s (%s bytes) user=%s" % (a.group("req"), a.group("status"),
-                                                 a.group("size"), a.group("user")))
-    m = CUPS_RE.match(ln)
-    if m:
-        return (m.group("ts"), "", CUPS_LEVELS.get(m.group("level"), m.group("level")),
-                "", m.group("msg"))
-    m = TOOL_TS_RE.match(ln)
-    if m:
-        return m.group("ts"), "", m.group("proc"), "", m.group("msg")
-    m = SYSLOG_NOHOST_RE.match(ln)
-    if m:
-        return (m.group("ts"), "", m.group("proc"), m.group("pid") or "",
-                m.group("msg"))
-    m = BANNER_TS_RE.match(ln)
-    if m:
-        return m.group("ts"), "", "", "", ln.strip()
-    m = LOGSTART_RE.match(ln)
-    if m:
-        return m.group("ts"), "", "", "", m.group("msg")
-    m = ISO_TS_RE.match(ln)
-    if m:
-        return m.group("ts"), "", "", "", m.group("msg")
-    return "", "", "", "", ln.rstrip()
-
+# -------------------------------------------------------------------------
+# artifact tables - every artifact as a browsable grid
+# -------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # artifact tables - normalise every interesting artifact into a browsable grid
@@ -14703,715 +14768,9 @@ class TableBuilder:
             self.tables = [t for t in self.tables if len(t)]
         return self.tables
 
-
-def human_size(n):
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return ""
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return "%.0f %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
-        n /= 1024.0
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# table writers: CSV, JSON, HTML browser
-# ---------------------------------------------------------------------------
-
-def write_tables_csv(tables, dirpath):
-    os.makedirs(dirpath, exist_ok=True)
-    index = os.path.join(dirpath, "00_INDEX.csv")
-    with open(index, "w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
-        w.writerow(["table", "title", "category", "rows", "columns", "csv_file",
-                    "description"])
-        for t in tables:
-            w.writerow([t.name, t.title, t.category, len(t), len(t.columns),
-                        t.name + ".csv", t.description])
-    for t in tables:
-        path = os.path.join(dirpath, t.name + ".csv")
-        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
-            w = csv.writer(fh)
-            w.writerow(t.columns)
-            for row in t.iter_rows():
-                w.writerow([_s(v) for v in row])
-    return len(tables) + 1
-
-
-def _table_json_body(t, fh):
-    """One table as a JSON object, streamed row by row.
-
-    Never json.dumps the whole table: BODYFILE and the log tables run to
-    hundreds of thousands of rows, and building the string first doubles the
-    peak for no benefit when the rows are written once and never re-read.
-    """
-    fh.write('{\n "name": %s,\n "title": %s,\n "category": %s,\n'
-             % (json.dumps(t.name), json.dumps(t.title), json.dumps(t.category)))
-    fh.write(' "description": %s,\n' % json.dumps(t.description))
-    fh.write(' "sources": %s,\n' % json.dumps(t.sources))
-    fh.write(' "columns": %s,\n' % json.dumps(t.columns))
-    fh.write(' "row_count": %d,\n "rows": [' % len(t))
-    for j, row in enumerate(t.iter_rows()):
-        fh.write("%s%s" % ("," if j else "", json.dumps([_s(v) for v in row])))
-    fh.write("]\n}\n")
-
-
-# Columns a table may carry its event time in, best first.
-NDJSON_TIME_COLUMNS = ("timestamp_utc", "timestamp", "start_utc",
-                       "last_utc", "first_utc")
-
-# A row's own moment, for the console's time window - and deliberately only
-# the two columns that mean "this row IS a thing that happened".
-#
-# The window narrows what happened, never what exists. Half the tables here
-# carry a timestamp that is an attribute of a standing thing rather than an
-# event: USERS.last_login_utc (2 of 33 accounts have one), SUID_SGID.mtime_utc,
-# PROCESS_MASTER.start_utc. Filtering those on a one-hour window deletes the
-# account list, every suid binary, and every process that was already running
-# when the hour began - which is not a narrower answer, it is a wrong one.
-#
-# A table with neither column is left alone entirely, and the console says so
-# rather than showing an empty grid. Ordered by preference: a table carrying
-# both a stamp of its own and a first/last span is filtered on the stamp,
-# because that is when the row happened rather than when the thing it belongs
-# to was first seen.
-CONSOLE_TIME_COLUMNS = ("timestamp_utc", "timestamp")
-
-# Context added to every event. Prefixed because the row's own fields win and
-# must: SIGMA_MATCHES and HACKTOOL_HITS both have a column literally called
-# 'table', and an unprefixed context field would overwrite the evidence with
-# the name of the file it came from.
-NDJSON_PREFIX = "triage_"
-
-
-def _epoch_utc(text):
-    """'2026-08-17 09:41:02' or ISO8601 -> epoch seconds, or None.
-
-    Splunk takes _time as epoch. Emitting it beats leaving Splunk to guess from
-    the raw line, which on a row whose first field is a pid picks up a number
-    that is not a time at all.
-    """
-    s = str(text or "").strip()
-    if not s:
-        return None
-    s = s.replace("T", " ").replace("Z", "").split("+")[0].split(".")[0].strip()
-    try:
-        dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
-    return dt.replace(tzinfo=timezone.utc).timestamp()
-
-
-def write_tables_ndjson(tables, dirpath, meta=None):
-    """One JSON object per row - newline-delimited, one file per table.
-
-    A self-describing JSON document per table cannot be ingested by Splunk (or
-    anything else that reads a line at a time): the whole table is one event,
-    the rows array runs to 43 MB on a single line for BODYFILE against a
-    default TRUNCATE of 10,000 bytes, and positional row arrays leave every
-    field unnamed. One object per line fixes all three, and the per-table
-    metadata that the document used to carry moves to 00_INDEX.json.
-
-    Empty values are omitted rather than written as "": an absent field costs
-    nothing to search and keeps the events small, which is the convention every
-    log platform expects.
-    """
-    os.makedirs(dirpath, exist_ok=True)
-    meta = meta or {}
-    ctx = {}
-    for key, val in ((NDJSON_PREFIX + "host", meta.get("hostname")),
-                     (NDJSON_PREFIX + "collected", meta.get("collected")),
-                     (NDJSON_PREFIX + "collection",
-                      os.path.basename(str(meta.get("collection") or ""))),
-                     (NDJSON_PREFIX + "layout", meta.get("layout"))):
-        if val:
-            ctx[key] = val
-
-    index = [{"name": t.name, "title": t.title, "category": t.category,
-              "rows": len(t), "columns": t.columns, "description": t.description,
-              "sources": t.sources, "ndjson_file": t.name + ".ndjson"}
-             for t in tables]
-    with open(os.path.join(dirpath, "00_INDEX.json"), "w", encoding="utf-8") as fh:
-        json.dump({"tool": "linsight.py", "version": VERSION,
-                   "generated_from": meta, "tables": index}, fh, indent=1)
-
-    for t in tables:
-        cols = [str(c) for c in t.columns]
-        ncol = len(cols)
-        ti = next((cols.index(c) for c in NDJSON_TIME_COLUMNS if c in cols), -1)
-        path = os.path.join(dirpath, t.name + ".ndjson")
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            for row in t.iter_rows():
-                ev = {NDJSON_PREFIX + "table": t.name}
-                ev.update(ctx)
-                for i in range(min(ncol, len(row))):
-                    v = row[i]
-                    if v not in (None, ""):
-                        ev[cols[i]] = _s(v)
-                if 0 <= ti < len(row):
-                    epoch = _epoch_utc(row[ti])
-                    if epoch is not None:
-                        ev["_time"] = epoch
-                fh.write(json.dumps(ev, ensure_ascii=False,
-                                    separators=(",", ":"), default=str) + "\n")
-    return len(tables) + 1
-
-
-def write_tables_json(tables, path, meta=None):
-    """Streamed - the bodyfile table alone can be a couple of hundred thousand rows."""
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write('{\n"tool": "linsight.py",\n"version": %s,\n' % json.dumps(VERSION))
-        fh.write('"generated_from": %s,\n' % json.dumps(meta or {}))
-        fh.write('"index": %s,\n' % json.dumps(
-            [{"name": t.name, "title": t.title, "category": t.category,
-              "rows": len(t), "columns": t.columns, "description": t.description}
-             for t in tables], indent=1))
-        fh.write('"tables": {\n')
-        for i, t in enumerate(tables):
-            fh.write("%s%s: {\n" % (",\n" if i else "", json.dumps(t.name)))
-            fh.write('  "title": %s,\n  "category": %s,\n  "description": %s,\n'
-                     % (json.dumps(t.title), json.dumps(t.category),
-                        json.dumps(t.description)))
-            fh.write('  "sources": %s,\n' % json.dumps(t.sources))
-            fh.write('  "columns": %s,\n' % json.dumps(t.columns))
-            fh.write('  "row_count": %d,\n  "rows": [' % len(t))
-            for j, row in enumerate(t.iter_rows()):
-                fh.write("%s%s" % ("," if j else "",
-                                   json.dumps([_s(v) for v in row])))
-            fh.write("]\n }")
-        fh.write("\n}\n}\n")
-
-
-# -- HTML browser ------------------------------------------------------------
-
-
-def _script_json(obj):
-    """JSON safe to embed inside a <script> element.
-
-    json.dumps leaves '<' alone, so a cell containing '</script>' closes the
-    script early and the rest of the payload is parsed as HTML: the page ends
-    up with dozens of script elements, __TABLES__ never gets assigned and the
-    browser renders an empty shell. A forensic export is exactly the input that
-    hits this - the collection had a saved GitHub page sitting in /etc/php, and
-    the artifact tables carry web content, log lines and shell history verbatim
-    by design.
-
-    Escaping every '<' as \\u003c is still valid JSON (the parser decodes it
-    back to '<') and removes the whole class of hazard at once: </script>,
-    <!-- and <script all stop being HTML tokens. '<' only ever appears inside
-    string values here, so nothing structural is touched.
-    """
-    return json.dumps(obj).replace("<", "\\u003c")
-
-
-# Artifact tables the console lists above the per-category nav, in this order.
-# "is any of the known toolkit on this host at all" is the first question asked
-# of a triage collection, and the answer was three categories down the sidebar
-# under D for Detection - far enough that it read as a footnote to the parsing
-# rather than as the point of it.
-PINNED_TABLES = ("HACKTOOL_HITS", "HACKTOOL_VARIANTS")
-
-
-def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
-                      opts=None):
-    """The console: triage views and every artifact table in one page.
-
-    Self-contained by design - no server, no CDN, no fetch. The box that reads
-    a triage collection is routinely the box that is not allowed to fetch
-    anything, so the payload is embedded and the CSS and JS are inline.
-
-    `tri` is optional: without it the page is the artifact browser alone, which
-    is what a single-table export (--process-map p.html) should still produce.
-    """
-    esc = htmllib.escape
-    index, tbls = [], {}
-    for t in tables:
-        index.append({"name": t.name, "title": t.title,
-                      "category": t.category or "Other", "rows": len(t)})
-        d = t.as_dict(limit=html_cap)
-        d["cap"] = 500          # rows rendered at once in the DOM
-        tbls[t.name] = d
-
-    # Which table each console view reads. A view whose table was not built -
-    # a single-table export - simply does not appear in the nav.
-    views = {v: n for v, n in (("findings", "FINDINGS"),
-                               ("timeline", "TIMELINE"))
-             if n in tbls}
-    payload = {"meta": [], "tactics": ATTACK_TACTICS, "order": ATTACK_ORDER,
-               "version": VERSION, "index": index, "tables": tbls,
-               "views": views,
-               "pinned": [n for n in PINNED_TABLES if n in tbls],
-               # what the console reads a row's clock out of, in preference
-               # order. Shared with the NDJSON exporter rather than restated:
-               # two lists of time columns would disagree the first time one
-               # gained a column.
-               "tcols": list(CONSOLE_TIME_COLUMNS),
-               "spancols": ["first_utc", "last_utc"]}
-    if tri is not None:
-        payload.update(_triage_payload(tri, opts))
-    elif meta:
-        payload["meta"] = [[k, str(v)] for k, v in meta.items() if v]
-
-    host = (tri.meta.get("Hostname") if tri is not None else None) or            (meta or {}).get("Hostname") or "collection"
-    src = tri.col.path if tri is not None else (meta or {}).get("Collection", "")
-
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("<!doctype html><html><head><meta charset='utf-8'>"
-                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                 "<title>linsight - %s</title><style>%s</style></head><body>"
-                 % (esc(str(host)), APP_CSS))
-        fh.write("<header><div class='brand'><b>linsight</b>"
-                 "<span>PARSE LINUX DEEP. HUNT THE MALICIOUS.</span></div>"
-                 "<div class='host'><b>%s</b> &nbsp;<code>%s</code></div>"
-                 "<div class='tf'>"
-                 "<input id='t0' type='search' placeholder='from'"
-                 " title='click for a calendar - or type YYYY-MM-DD, "
-                 "YYYY-MM-DD HH:MM, -24h, -7d'>"
-                 "<span class='ar'>&rarr;</span>"
-                 "<input id='t1' type='search' placeholder='to'"
-                 " title='click for a calendar - or type YYYY-MM-DD, "
-                 "YYYY-MM-DD HH:MM, -24h, -7d'>"
-                 "<button class='clr' id='tclr' title='clear the time window'>"
-                 "&times;</button></div>"
-                 "<div class='chips' id='chips'></div></header>"
-                 "<div class='cal' id='cal'></div>"
-                 % (esc(str(host)), esc(str(src))))
-        fh.write("<div class='layout'><nav id='nav'></nav>"
-                 "<main id='main'></main></div>")
-        fh.write("<script>window.__LINSIGHT__=%s;</script>" % _script_json(payload))
-        fh.write("<script>%s</script></body></html>" % APP_JS)
-
-
-def write_single_table(table, path, html_cap=100000):
-    """Write one table to one file; the format follows the extension."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".json":
-        write_tables_json([table], path)
-    elif ext in (".html", ".htm"):
-        write_tables_html([table], path, html_cap)
-    else:
-        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
-            w = csv.writer(fh)
-            w.writerow(table.columns)
-            for row in table.iter_rows():
-                w.writerow([_s(v) for v in row])
-    return ext or ".csv"
-
-
-def _check_output_paths(col, opts):
-    """Never write output into the evidence.
-
-    It contaminates the collection, and the next run would then parse the
-    previous run's own tables back in as artifacts.
-    """
-    if col.kind != "dir":
-        return
-    base = os.path.abspath(col.path)
-    for path in (opts.export, opts.csv_dir, opts.tables_json, opts.tables_html,
-                 opts.json, opts.html, opts.timeline, opts.process_map):
-        if not path:
-            continue
-        full = os.path.abspath(path)
-        if full == base or full.startswith(base + os.sep):
-            raise SystemExit(
-                "[!] refusing to write inside the collection:\n"
-                "      %s\n"
-                "    output would become part of the evidence - choose a path "
-                "outside\n      %s" % (full, base))
-
-
-def export_tables(tri, col, opts, tb=None):
-    """Build every table once, then write whichever formats were requested."""
-    _check_output_paths(col, opts)          # fail before a minute of parsing
-    prebuilt = tb is not None
-    tb = tb or TableBuilder(col, tri)
-
-    # --process-map on its own only needs the one extractor, not all 60
-    only_map = opts.process_map and not any(
-        (opts.export, opts.csv_dir, opts.tables_json, opts.tables_html))
-    if only_map:
-        # a prebuilt builder already has it; rebuilding would append a second
-        # PROCESS_MASTER to the same builder and re-do the correlation
-        if not prebuilt:
-            tb.build(only=["t_process_master"], verbose=not opts.quiet)
-        master = next((t for t in tb.tables if t.name == "PROCESS_MASTER"), None)
-        if master is None:
-            raise SystemExit("[!] no process artifacts found in this collection")
-        ext = write_single_table(master, opts.process_map, opts.html_rows)
-        print("[+] process map written to %s (%d processes, %d columns, %s)"
-              % (opts.process_map, len(master), len(master.columns), ext),
-              file=sys.stderr)
-        return [master]
-
-    scope = getattr(opts, "scope", "full")
-    # rules were run before the console report, so the tables already exist -
-    # rebuilding would re-scan every artifact and double every rule finding
-    tables = tb.tables if prebuilt else tb.build(verbose=not opts.quiet,
-                                                 scope=scope)
-    meta = {
-        "collection": col.path,
-        "hostname": tri.meta.get("Hostname", tri.meta.get("hostname", "")),
-        "collected": tri.meta.get("Collection finished", ""),
-        "scope": scope,
-        "layout": col.layout,
-        "tables": len(tables),
-        "rows_total": sum(len(t) for t in tables),
-    }
-    status("[*] built %d tables, %s rows total%s"
-          % (len(tables), "{:,}".format(meta["rows_total"]),
-             "" if scope == "full" else
-             " (--scope %s: %s artifacts only)"
-             % (scope, "live response" if scope == "live" else "on-disk")))
-
-    outdir = opts.export
-    csv_dir = opts.csv_dir or (os.path.join(outdir, "csv") if outdir else None)
-    # --export writes one .json per table, mirroring the CSV directory.
-    # --tables-json FILE still writes the single combined document, for a
-    # consumer that wants one file to load.
-    json_dir = os.path.join(outdir, "json") if outdir else None
-    json_path = opts.tables_json
-    html_path = opts.tables_html or (os.path.join(outdir, "browser.html") if outdir else None)
-
-    if outdir:
-        os.makedirs(outdir, exist_ok=True)
-    writer_times = []
-    if csv_dir:
-        t0 = time.perf_counter()
-        n = write_tables_csv(tables, csv_dir)
-        writer_times.append(("write CSV", time.perf_counter() - t0))
-        print("[+] %d CSV files written to %s" % (n, csv_dir), file=sys.stderr)
-    if json_dir:
-        t0 = time.perf_counter()
-        n = write_tables_ndjson(tables, json_dir, meta)
-        writer_times.append(("write NDJSON (per table)", time.perf_counter() - t0))
-        status("[+] %d NDJSON files written to %s (one JSON object per row)"
-               % (n, json_dir))
-    if json_path:
-        t0 = time.perf_counter()
-        write_tables_json(tables, json_path, meta)
-        writer_times.append(("write JSON (combined)", time.perf_counter() - t0))
-        print("[+] combined table JSON written to %s" % json_path, file=sys.stderr)
-    if html_path:
-        t0 = time.perf_counter()
-        write_tables_html(tables, html_path, opts.html_rows, meta, tri, opts)
-        writer_times.append(("write HTML browser", time.perf_counter() - t0))
-        print("[+] console written to %s (%d findings, %d tables)"
-              % (html_path, len(tri.findings), len(tables)), file=sys.stderr)
-    if opts.process_map:
-        master = next((t for t in tables if t.name == "PROCESS_MASTER"), None)
-        if master is None:
-            status("[!] no PROCESS_MASTER table to write")
-        else:
-            ext = write_single_table(master, opts.process_map, opts.html_rows)
-            print("[+] process map written to %s (%d processes, %d columns, %s)"
-                  % (opts.process_map, len(master), len(master.columns), ext),
-                  file=sys.stderr)
-    if getattr(opts, "timing", False):
-        print_timing(tb, writer_times)
-    return tables
-
-
-def print_timing(tb, writer_times, top=15):
-    """Where the run actually went, per extractor and per writer.
-
-    A collection that takes minutes is usually one artifact, not the tool being
-    slow overall, and the answer changes per collection - a web server's
-    access_log, a host with a year of journal. Guessing which costs a rerun;
-    this prints it.
-    """
-    rows = ([(lab, sec, n) for lab, sec, n in tb.timings]
-            + [(lab, sec, None) for lab, sec in writer_times])
-    total = sum(r[1] for r in rows)
-    rows.sort(key=lambda r: -r[1])
-    print("\n[*] timing: %.1fs accounted for, slowest %d:"
-          % (total, min(top, len(rows))), file=sys.stderr)
-    for lab, sec, n in rows[:top]:
-        if sec < 0.05:
-            break
-        share = "%5.1f%%" % (100 * sec / total) if total else "     "
-        print("      %-24s %7.2fs %s%s"
-              % (lab, sec, share,
-                 "" if n is None else "  %s rows" % format(n, ",")),
-              file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# reporting
-# ---------------------------------------------------------------------------
-
-def c(text, style, enabled):
-    return "%s%s%s" % (COLORS[style], text, COLORS["reset"]) if enabled else text
-
-
-def can_encode(stream, text):
-    """Whether `stream` can actually render `text` in its own encoding.
-
-    Asked before writing rather than caught after: a UnicodeEncodeError part
-    way through leaves half a masthead on the terminal, and a console on cp437
-    or cp1252 cannot draw block characters at all.
-    """
-    enc = getattr(stream, "encoding", None)
-    if not enc:
-        return False
-    try:
-        text.encode(enc)
-        return True
-    except (UnicodeEncodeError, LookupError, TypeError):
-        return False
-
-
-def print_banner(color, stream=None):
-    """The mark, once, before any work - and never on stdout.
-
-    stdout carries the report; a caller redirecting it to a file wants the
-    findings in that file, not a masthead, and one piping it into another tool
-    wants it even less. stderr is where the [*] status lines already go.
-    """
-    out = stream or sys.stderr
-    # opts.color is decided by stdout, and this writes to stderr: one can be a
-    # terminal while the other is a pipe, and colouring a pipe puts raw escape
-    # sequences in whatever reads it.
-    try:
-        color = color and out.isatty()
-    except Exception:
-        color = False
-
-    block = can_encode(out, BANNER_BLOCK)
-    art = BANNER_BLOCK if block else BANNER_ASCII
-    cell = SCALE_BLOCK if block else SCALE_ASCII
-    scale = "".join(c(cell, sev, color) for sev in SEVERITIES)
-    try:
-        # normalised: one constant carries a leading newline and one does not,
-        # and the masthead must not jump a line depending on the code page
-        out.write("\n" + c(art.strip("\n"), "head", color) + "\n")
-        out.write(" %s  %s\n" % (scale, c("parse linux deep. hunt the malicious.", "bold", color)))
-        out.write(c(" v%s   developed by %s\n\n" % (VERSION, AUTHOR), "dim", color))
-        out.flush()
-    except Exception:
-        pass          # a closed or undecodable stderr must not end the run
-
-
-def print_console(tri, opts):
-    color = opts.color
-    out = sys.stdout
-    findings = [f for f in tri.findings if SEV_RANK[f.severity] <= SEV_RANK[opts.min_severity]]
-    counts = defaultdict(int)
-    for f in tri.findings:
-        counts[f.severity] += 1
-
-    out.write("\n" + c("=" * 100, "head", color) + "\n")
-    out.write(c("  LINUX TRIAGE REPORT", "bold", color) + "   v%s\n" % VERSION)
-    out.write("  %-14s : %s\n" % ("collection", tri.col.path))
-    out.write("  %-14s : %s\n" % ("layout", {"uac": "UAC",
-                                             "velociraptor": "Velociraptor offline collector"}
-                                  .get(tri.col.layout, tri.col.layout)))
-    for k, label in (("Hostname", "hostname"),
-                     ("Hostname (from archive name)", "hostname"),
-                     ("uname", "kernel"),
-                     ("Operating system", "os"), ("System architecture", "arch"),
-                     ("Collection finished", "collected"), ("Host UTC offset", "host offset"),
-                     ("Time zone", "time zone"), ("Command line", "collector command")):
-        if tri.meta.get(k):
-            out.write("  %-14s : %s\n" % (label, trunc(str(tri.meta[k]), 110)))
-    out.write(c("=" * 100, "head", color) + "\n\n")
-
-    out.write(c("  FINDING SUMMARY", "bold", color) + "\n")
-    for sev in SEVERITIES:
-        if counts[sev]:
-            out.write("    %s  %d\n" % (c("%-9s" % sev, sev, color), counts[sev]))
-    out.write("    %-9s  %d\n" % ("TOTAL", len(tri.findings)))
-
-    top = [f for f in tri.findings if f.severity in ("CRITICAL", "HIGH")]
-    if top:
-        out.write("\n" + c("  HEADLINES", "bold", color) + "\n")
-        for f in top[:12]:
-            out.write("    %s %s\n" % (c("[%s]" % f.severity, f.severity, color), f.title))
-    out.write("\n")
-
-    for sev in SEVERITIES:
-        block = [f for f in findings if f.severity == sev]
-        if not block:
-            continue
-        out.write(c("-" * 100, "head", color) + "\n")
-        out.write(c(" %s FINDINGS (%d)" % (sev, len(block)), sev, color) + "\n")
-        out.write(c("-" * 100, "head", color) + "\n")
-        for i, f in enumerate(block, 1):
-            out.write("\n%s %s\n" % (c("[%s/%s]" % (sev[:4], i), sev, color),
-                                     c(f.title, "bold", color)))
-            out.write("    category : %s\n" % f.category)
-            if f.mitre:
-                out.write("    att&ck   : %s\n" % f.mitre)
-            if f.source:
-                out.write("    artifact : %s\n" % f.source)
-            seen = f.seen_text()
-            if seen:
-                out.write("    seen     : %s\n" % seen)
-            if f.detail:
-                for line in wrap(f.detail, 92):
-                    out.write("    %s\n" % c(line, "dim", color))
-            shown = f.evidence[: opts.max_evidence]
-            for e in shown:
-                out.write("      | %s\n" % e)
-            if len(f.evidence) > len(shown):
-                out.write("      | ... %d more (use --max-evidence or --json)\n"
-                          % (len(f.evidence) - len(shown)))
-        out.write("\n")
-
-    if opts.show_timeline and tri.events:
-        # a console timeline is only useful if it fits on a screen: prefer the
-        # events that were scored above INFO, and fall back when there are none
-        notable = [e for e in tri.events if e.severity != "INFO"]
-        shown_events = notable if len(notable) >= 10 else tri.events
-        label = "notable events" if shown_events is notable else "events"
-        out.write(c("-" * 100, "head", color) + "\n")
-        out.write(c(" EVENT TIMELINE (last %d of %d %s; full list via --timeline)"
-                    % (min(len(shown_events), opts.timeline_show), len(shown_events), label),
-                    "head", color) + "\n")
-        out.write(c("-" * 100, "head", color) + "\n")
-        for e in shown_events[-opts.timeline_show:]:
-            out.write("  %s  %-9s %-10s %s\n" % (
-                e.ts.strftime("%Y-%m-%d %H:%M:%S"),
-                c("%-9s" % e.severity, e.severity, color) if e.severity != "INFO" else "%-9s" % "",
-                e.category, trunc(e.description, 110)))
-        out.write("\n")
-
-
-def wrap(text, width):
-    out = []
-    for para in text.split("\n"):
-        line = ""
-        for word in para.split():
-            if len(line) + len(word) + 1 > width:
-                out.append(line)
-                line = word
-            else:
-                line = (line + " " + word).strip()
-        out.append(line)
-    return out
-
-
-def write_json(tri, path):
-    data = {
-        "tool": "linsight.py", "version": VERSION,
-        "collection": tri.col.path,
-        "metadata": tri.meta,
-        "summary": {s: sum(1 for f in tri.findings if f.severity == s) for s in SEVERITIES},
-        "findings": [f.as_dict() for f in tri.findings],
-        "events": [e.as_dict() for e in tri.events],
-        "iocs": {k: sorted(v) for k, v in sorted(tri.iocs.items())},
-    }
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-    print("[+] JSON written to %s" % path, file=sys.stderr)
-
-
-def write_timeline(tri, path):
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["timestamp_utc", "severity", "category", "description", "source"])
-        for e in tri.events:
-            w.writerow([e.ts.strftime("%Y-%m-%d %H:%M:%S"), e.severity, e.category,
-                        e.description, e.source])
-    print("[+] timeline (%d events) written to %s" % (len(tri.events), path), file=sys.stderr)
-
-
-HTML_CSS = """
-:root{--bg:#f7f8fa;--fg:#1b1f24;--card:#fff;--line:#e3e6ea;--muted:#5b6570}
-@media (prefers-color-scheme:dark){:root{--bg:#14171b;--fg:#e6e9ed;--card:#1c2026;--line:#2b3138;--muted:#98a2ad}}
-*{box-sizing:border-box}
-body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
- font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;margin:28px 0 10px}
-.meta{color:var(--muted);font-size:13px;margin-bottom:18px}
-.meta code{font-size:12px}
-.cards{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 26px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:8px;
- padding:10px 16px;min-width:104px}
-.card b{display:block;font-size:22px;line-height:1.1}
-.card span{font-size:11px;letter-spacing:.06em;color:var(--muted)}
-.f{background:var(--card);border:1px solid var(--line);border-left-width:5px;
- border-radius:8px;margin:0 0 10px;padding:12px 16px}
-.f>summary{cursor:pointer;font-weight:600;list-style:none;display:flex;gap:10px;align-items:baseline}
-.f>summary::-webkit-details-marker{display:none}
-.tag{font-size:10px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border-radius:4px;
- color:#fff;white-space:nowrap}
-.CRITICAL{border-left-color:#b3132a}.CRITICAL .tag{background:#b3132a}
-.HIGH{border-left-color:#d9531e}.HIGH .tag{background:#d9531e}
-.MEDIUM{border-left-color:#c99700}.MEDIUM .tag{background:#c99700}
-.LOW{border-left-color:#2b7fb8}.LOW .tag{background:#2b7fb8}
-.INFO{border-left-color:#6b7684}.INFO .tag{background:#6b7684}
-.detail{color:var(--muted);margin:8px 0}
-.kv{font-size:12px;color:var(--muted);margin:2px 0}
-pre{background:rgba(127,127,127,.09);border-radius:6px;padding:10px;overflow-x:auto;
- font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;margin:8px 0 0}
-table{border-collapse:collapse;width:100%;font-size:12.5px;display:block;overflow-x:auto}
-th,td{text-align:left;padding:5px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
-th{color:var(--muted);font-weight:600}
-td.d{white-space:normal}
-"""
-
-
-def write_html(tri, path, opts):
-    esc = htmllib.escape
-    counts = {s: sum(1 for f in tri.findings if f.severity == s) for s in SEVERITIES}
-    parts = ["<!doctype html><html><head><meta charset='utf-8'>",
-             "<meta name='viewport' content='width=device-width,initial-scale=1'>",
-             "<title>UAC triage - %s</title><style>%s</style></head><body>"
-             % (esc(tri.meta.get("Hostname", "collection")), HTML_CSS)]
-    parts.append("<h1>UAC triage report</h1><div class='meta'>")
-    parts.append("<div><code>%s</code></div>" % esc(tri.col.path))
-    for k, v in tri.meta.items():
-        if v:
-            parts.append("<div>%s: <code>%s</code></div>" % (esc(k), esc(str(v))))
-    parts.append("</div><div class='cards'>")
-    for s in SEVERITIES:
-        parts.append("<div class='card %s'><b>%d</b><span>%s</span></div>" % (s, counts[s], s))
-    parts.append("</div>")
-
-    for sev in SEVERITIES:
-        block = [f for f in tri.findings if f.severity == sev]
-        if not block:
-            continue
-        parts.append("<h2>%s findings (%d)</h2>" % (sev.title(), len(block)))
-        for f in block:
-            openattr = " open" if sev in ("CRITICAL", "HIGH") else ""
-            parts.append("<details class='f %s'%s><summary><span class='tag'>%s</span>%s</summary>"
-                         % (sev, openattr, sev, esc(f.title)))
-            if f.detail:
-                parts.append("<div class='detail'>%s</div>" % esc(f.detail))
-            parts.append("<div class='kv'>category: %s" % esc(f.category))
-            if f.mitre:
-                parts.append(" &nbsp;|&nbsp; ATT&amp;CK: %s" % esc(f.mitre))
-            if f.source:
-                parts.append(" &nbsp;|&nbsp; artifact: <code>%s</code>" % esc(f.source))
-            parts.append("</div>")
-            seen = f.seen_text()
-            if seen:
-                parts.append("<div class='kv'>seen: %s</div>" % esc(seen))
-            if f.evidence:
-                shown = f.evidence[:400]
-                parts.append("<pre>%s</pre>" % esc("\n".join(shown)))
-                if len(f.evidence) > len(shown):
-                    parts.append("<div class='kv'>... %d more lines</div>"
-                                 % (len(f.evidence) - len(shown)))
-            parts.append("</details>")
-
-    if tri.events:
-        parts.append("<h2>Event timeline (%d)</h2><table><tr><th>time (UTC)</th><th>sev</th>"
-                     "<th>category</th><th>event</th></tr>" % len(tri.events))
-        for e in tri.events[-opts.timeline_limit:]:
-            parts.append("<tr><td>%s</td><td>%s</td><td>%s</td><td class='d'>%s</td></tr>"
-                         % (e.ts.strftime("%Y-%m-%d %H:%M:%S"), e.severity,
-                            esc(e.category), esc(trunc(e.description, 300))))
-        parts.append("</table>")
-
-    parts.append("<p class='kv'>generated by linsight.py v%s</p></body></html>" % VERSION)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("".join(parts))
-    print("[+] HTML report written to %s" % path, file=sys.stderr)
-
+# -------------------------------------------------------------------------
+# the GUI: one self-contained page carrying the triage picture
+# -------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # The GUI: one self-contained page that carries the triage picture.
@@ -17001,6 +16360,693 @@ def _triage_payload(tri, opts):
     """
     return {"meta": [[k, str(v)] for k, v in tri.meta.items() if v]}
 
+# -------------------------------------------------------------------------
+# table writers: CSV, JSON, HTML browser
+# -------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# table writers: CSV, JSON, HTML browser
+# ---------------------------------------------------------------------------
+
+def write_tables_csv(tables, dirpath):
+    os.makedirs(dirpath, exist_ok=True)
+    index = os.path.join(dirpath, "00_INDEX.csv")
+    with open(index, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(["table", "title", "category", "rows", "columns", "csv_file",
+                    "description"])
+        for t in tables:
+            w.writerow([t.name, t.title, t.category, len(t), len(t.columns),
+                        t.name + ".csv", t.description])
+    for t in tables:
+        path = os.path.join(dirpath, t.name + ".csv")
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(t.columns)
+            for row in t.iter_rows():
+                w.writerow([_s(v) for v in row])
+    return len(tables) + 1
+
+
+def _table_json_body(t, fh):
+    """One table as a JSON object, streamed row by row.
+
+    Never json.dumps the whole table: BODYFILE and the log tables run to
+    hundreds of thousands of rows, and building the string first doubles the
+    peak for no benefit when the rows are written once and never re-read.
+    """
+    fh.write('{\n "name": %s,\n "title": %s,\n "category": %s,\n'
+             % (json.dumps(t.name), json.dumps(t.title), json.dumps(t.category)))
+    fh.write(' "description": %s,\n' % json.dumps(t.description))
+    fh.write(' "sources": %s,\n' % json.dumps(t.sources))
+    fh.write(' "columns": %s,\n' % json.dumps(t.columns))
+    fh.write(' "row_count": %d,\n "rows": [' % len(t))
+    for j, row in enumerate(t.iter_rows()):
+        fh.write("%s%s" % ("," if j else "", json.dumps([_s(v) for v in row])))
+    fh.write("]\n}\n")
+
+
+# Columns a table may carry its event time in, best first.
+
+# A row's own moment, for the console's time window - and deliberately only
+# the two columns that mean "this row IS a thing that happened".
+#
+# The window narrows what happened, never what exists. Half the tables here
+# carry a timestamp that is an attribute of a standing thing rather than an
+# event: USERS.last_login_utc (2 of 33 accounts have one), SUID_SGID.mtime_utc,
+# PROCESS_MASTER.start_utc. Filtering those on a one-hour window deletes the
+# account list, every suid binary, and every process that was already running
+# when the hour began - which is not a narrower answer, it is a wrong one.
+#
+# A table with neither column is left alone entirely, and the console says so
+# rather than showing an empty grid. Ordered by preference: a table carrying
+# both a stamp of its own and a first/last span is filtered on the stamp,
+# because that is when the row happened rather than when the thing it belongs
+# to was first seen.
+CONSOLE_TIME_COLUMNS = ("timestamp_utc", "timestamp")
+
+# Context added to every event. Prefixed because the row's own fields win and
+# must: SIGMA_MATCHES and HACKTOOL_HITS both have a column literally called
+# 'table', and an unprefixed context field would overwrite the evidence with
+# the name of the file it came from.
+NDJSON_PREFIX = "triage_"
+
+
+def _epoch_utc(text):
+    """'2026-08-17 09:41:02' or ISO8601 -> epoch seconds, or None.
+
+    Splunk takes _time as epoch. Emitting it beats leaving Splunk to guess from
+    the raw line, which on a row whose first field is a pid picks up a number
+    that is not a time at all.
+    """
+    s = str(text or "").strip()
+    if not s:
+        return None
+    s = s.replace("T", " ").replace("Z", "").split("+")[0].split(".")[0].strip()
+    try:
+        dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc).timestamp()
+
+
+def write_tables_ndjson(tables, dirpath, meta=None):
+    """One JSON object per row - newline-delimited, one file per table.
+
+    A self-describing JSON document per table cannot be ingested by Splunk (or
+    anything else that reads a line at a time): the whole table is one event,
+    the rows array runs to 43 MB on a single line for BODYFILE against a
+    default TRUNCATE of 10,000 bytes, and positional row arrays leave every
+    field unnamed. One object per line fixes all three, and the per-table
+    metadata that the document used to carry moves to 00_INDEX.json.
+
+    Empty values are omitted rather than written as "": an absent field costs
+    nothing to search and keeps the events small, which is the convention every
+    log platform expects.
+    """
+    os.makedirs(dirpath, exist_ok=True)
+    meta = meta or {}
+    ctx = {}
+    for key, val in ((NDJSON_PREFIX + "host", meta.get("hostname")),
+                     (NDJSON_PREFIX + "collected", meta.get("collected")),
+                     (NDJSON_PREFIX + "collection",
+                      os.path.basename(str(meta.get("collection") or ""))),
+                     (NDJSON_PREFIX + "layout", meta.get("layout"))):
+        if val:
+            ctx[key] = val
+
+    index = [{"name": t.name, "title": t.title, "category": t.category,
+              "rows": len(t), "columns": t.columns, "description": t.description,
+              "sources": t.sources, "ndjson_file": t.name + ".ndjson"}
+             for t in tables]
+    with open(os.path.join(dirpath, "00_INDEX.json"), "w", encoding="utf-8") as fh:
+        json.dump({"tool": "linsight.py", "version": VERSION,
+                   "generated_from": meta, "tables": index}, fh, indent=1)
+
+    for t in tables:
+        cols = [str(c) for c in t.columns]
+        ncol = len(cols)
+        ti = next((cols.index(c) for c in NDJSON_TIME_COLUMNS if c in cols), -1)
+        path = os.path.join(dirpath, t.name + ".ndjson")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            for row in t.iter_rows():
+                ev = {NDJSON_PREFIX + "table": t.name}
+                ev.update(ctx)
+                for i in range(min(ncol, len(row))):
+                    v = row[i]
+                    if v not in (None, ""):
+                        ev[cols[i]] = _s(v)
+                if 0 <= ti < len(row):
+                    epoch = _epoch_utc(row[ti])
+                    if epoch is not None:
+                        ev["_time"] = epoch
+                fh.write(json.dumps(ev, ensure_ascii=False,
+                                    separators=(",", ":"), default=str) + "\n")
+    return len(tables) + 1
+
+
+def write_tables_json(tables, path, meta=None):
+    """Streamed - the bodyfile table alone can be a couple of hundred thousand rows."""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{\n"tool": "linsight.py",\n"version": %s,\n' % json.dumps(VERSION))
+        fh.write('"generated_from": %s,\n' % json.dumps(meta or {}))
+        fh.write('"index": %s,\n' % json.dumps(
+            [{"name": t.name, "title": t.title, "category": t.category,
+              "rows": len(t), "columns": t.columns, "description": t.description}
+             for t in tables], indent=1))
+        fh.write('"tables": {\n')
+        for i, t in enumerate(tables):
+            fh.write("%s%s: {\n" % (",\n" if i else "", json.dumps(t.name)))
+            fh.write('  "title": %s,\n  "category": %s,\n  "description": %s,\n'
+                     % (json.dumps(t.title), json.dumps(t.category),
+                        json.dumps(t.description)))
+            fh.write('  "sources": %s,\n' % json.dumps(t.sources))
+            fh.write('  "columns": %s,\n' % json.dumps(t.columns))
+            fh.write('  "row_count": %d,\n  "rows": [' % len(t))
+            for j, row in enumerate(t.iter_rows()):
+                fh.write("%s%s" % ("," if j else "",
+                                   json.dumps([_s(v) for v in row])))
+            fh.write("]\n }")
+        fh.write("\n}\n}\n")
+
+
+# -- HTML browser ------------------------------------------------------------
+
+
+def _script_json(obj):
+    """JSON safe to embed inside a <script> element.
+
+    json.dumps leaves '<' alone, so a cell containing '</script>' closes the
+    script early and the rest of the payload is parsed as HTML: the page ends
+    up with dozens of script elements, __TABLES__ never gets assigned and the
+    browser renders an empty shell. A forensic export is exactly the input that
+    hits this - the collection had a saved GitHub page sitting in /etc/php, and
+    the artifact tables carry web content, log lines and shell history verbatim
+    by design.
+
+    Escaping every '<' as \\u003c is still valid JSON (the parser decodes it
+    back to '<') and removes the whole class of hazard at once: </script>,
+    <!-- and <script all stop being HTML tokens. '<' only ever appears inside
+    string values here, so nothing structural is touched.
+    """
+    return json.dumps(obj).replace("<", "\\u003c")
+
+
+# Artifact tables the console lists above the per-category nav, in this order.
+# "is any of the known toolkit on this host at all" is the first question asked
+# of a triage collection, and the answer was three categories down the sidebar
+# under D for Detection - far enough that it read as a footnote to the parsing
+# rather than as the point of it.
+PINNED_TABLES = ("HACKTOOL_HITS", "HACKTOOL_VARIANTS")
+
+
+def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
+                      opts=None):
+    """The console: triage views and every artifact table in one page.
+
+    Self-contained by design - no server, no CDN, no fetch. The box that reads
+    a triage collection is routinely the box that is not allowed to fetch
+    anything, so the payload is embedded and the CSS and JS are inline.
+
+    `tri` is optional: without it the page is the artifact browser alone, which
+    is what a single-table export (--process-map p.html) should still produce.
+    """
+    esc = htmllib.escape
+    index, tbls = [], {}
+    for t in tables:
+        index.append({"name": t.name, "title": t.title,
+                      "category": t.category or "Other", "rows": len(t)})
+        d = t.as_dict(limit=html_cap)
+        d["cap"] = 500          # rows rendered at once in the DOM
+        tbls[t.name] = d
+
+    # Which table each console view reads. A view whose table was not built -
+    # a single-table export - simply does not appear in the nav.
+    views = {v: n for v, n in (("findings", "FINDINGS"),
+                               ("timeline", "TIMELINE"))
+             if n in tbls}
+    payload = {"meta": [], "tactics": ATTACK_TACTICS, "order": ATTACK_ORDER,
+               "version": VERSION, "index": index, "tables": tbls,
+               "views": views,
+               "pinned": [n for n in PINNED_TABLES if n in tbls],
+               # what the console reads a row's clock out of, in preference
+               # order. Shared with the NDJSON exporter rather than restated:
+               # two lists of time columns would disagree the first time one
+               # gained a column.
+               "tcols": list(CONSOLE_TIME_COLUMNS),
+               "spancols": ["first_utc", "last_utc"]}
+    if tri is not None:
+        payload.update(_triage_payload(tri, opts))
+    elif meta:
+        payload["meta"] = [[k, str(v)] for k, v in meta.items() if v]
+
+    host = (tri.meta.get("Hostname") if tri is not None else None) or            (meta or {}).get("Hostname") or "collection"
+    src = tri.col.path if tri is not None else (meta or {}).get("Collection", "")
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("<!doctype html><html><head><meta charset='utf-8'>"
+                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                 "<title>linsight - %s</title><style>%s</style></head><body>"
+                 % (esc(str(host)), APP_CSS))
+        fh.write("<header><div class='brand'><b>linsight</b>"
+                 "<span>PARSE LINUX DEEP. HUNT THE MALICIOUS.</span></div>"
+                 "<div class='host'><b>%s</b> &nbsp;<code>%s</code></div>"
+                 "<div class='tf'>"
+                 "<input id='t0' type='search' placeholder='from'"
+                 " title='click for a calendar - or type YYYY-MM-DD, "
+                 "YYYY-MM-DD HH:MM, -24h, -7d'>"
+                 "<span class='ar'>&rarr;</span>"
+                 "<input id='t1' type='search' placeholder='to'"
+                 " title='click for a calendar - or type YYYY-MM-DD, "
+                 "YYYY-MM-DD HH:MM, -24h, -7d'>"
+                 "<button class='clr' id='tclr' title='clear the time window'>"
+                 "&times;</button></div>"
+                 "<div class='chips' id='chips'></div></header>"
+                 "<div class='cal' id='cal'></div>"
+                 % (esc(str(host)), esc(str(src))))
+        fh.write("<div class='layout'><nav id='nav'></nav>"
+                 "<main id='main'></main></div>")
+        fh.write("<script>window.__LINSIGHT__=%s;</script>" % _script_json(payload))
+        fh.write("<script>%s</script></body></html>" % APP_JS)
+
+
+def write_single_table(table, path, html_cap=100000):
+    """Write one table to one file; the format follows the extension."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".json":
+        write_tables_json([table], path)
+    elif ext in (".html", ".htm"):
+        write_tables_html([table], path, html_cap)
+    else:
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(table.columns)
+            for row in table.iter_rows():
+                w.writerow([_s(v) for v in row])
+    return ext or ".csv"
+
+
+def _check_output_paths(col, opts):
+    """Never write output into the evidence.
+
+    It contaminates the collection, and the next run would then parse the
+    previous run's own tables back in as artifacts.
+    """
+    if col.kind != "dir":
+        return
+    base = os.path.abspath(col.path)
+    for path in (opts.export, opts.csv_dir, opts.tables_json, opts.tables_html,
+                 opts.json, opts.html, opts.timeline, opts.process_map):
+        if not path:
+            continue
+        full = os.path.abspath(path)
+        if full == base or full.startswith(base + os.sep):
+            raise SystemExit(
+                "[!] refusing to write inside the collection:\n"
+                "      %s\n"
+                "    output would become part of the evidence - choose a path "
+                "outside\n      %s" % (full, base))
+
+
+def export_tables(tri, col, opts, tb=None):
+    """Build every table once, then write whichever formats were requested."""
+    _check_output_paths(col, opts)          # fail before a minute of parsing
+    prebuilt = tb is not None
+    tb = tb or TableBuilder(col, tri)
+
+    # --process-map on its own only needs the one extractor, not all 60
+    only_map = opts.process_map and not any(
+        (opts.export, opts.csv_dir, opts.tables_json, opts.tables_html))
+    if only_map:
+        # a prebuilt builder already has it; rebuilding would append a second
+        # PROCESS_MASTER to the same builder and re-do the correlation
+        if not prebuilt:
+            tb.build(only=["t_process_master"], verbose=not opts.quiet)
+        master = next((t for t in tb.tables if t.name == "PROCESS_MASTER"), None)
+        if master is None:
+            raise SystemExit("[!] no process artifacts found in this collection")
+        ext = write_single_table(master, opts.process_map, opts.html_rows)
+        print("[+] process map written to %s (%d processes, %d columns, %s)"
+              % (opts.process_map, len(master), len(master.columns), ext),
+              file=sys.stderr)
+        return [master]
+
+    scope = getattr(opts, "scope", "full")
+    # rules were run before the console report, so the tables already exist -
+    # rebuilding would re-scan every artifact and double every rule finding
+    tables = tb.tables if prebuilt else tb.build(verbose=not opts.quiet,
+                                                 scope=scope)
+    meta = {
+        "collection": col.path,
+        "hostname": tri.meta.get("Hostname", tri.meta.get("hostname", "")),
+        "collected": tri.meta.get("Collection finished", ""),
+        "scope": scope,
+        "layout": col.layout,
+        "tables": len(tables),
+        "rows_total": sum(len(t) for t in tables),
+    }
+    status("[*] built %d tables, %s rows total%s"
+          % (len(tables), "{:,}".format(meta["rows_total"]),
+             "" if scope == "full" else
+             " (--scope %s: %s artifacts only)"
+             % (scope, "live response" if scope == "live" else "on-disk")))
+
+    outdir = opts.export
+    csv_dir = opts.csv_dir or (os.path.join(outdir, "csv") if outdir else None)
+    # --export writes one .json per table, mirroring the CSV directory.
+    # --tables-json FILE still writes the single combined document, for a
+    # consumer that wants one file to load.
+    json_dir = os.path.join(outdir, "json") if outdir else None
+    json_path = opts.tables_json
+    html_path = opts.tables_html or (os.path.join(outdir, "browser.html") if outdir else None)
+
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+    writer_times = []
+    if csv_dir:
+        t0 = time.perf_counter()
+        n = write_tables_csv(tables, csv_dir)
+        writer_times.append(("write CSV", time.perf_counter() - t0))
+        print("[+] %d CSV files written to %s" % (n, csv_dir), file=sys.stderr)
+    if json_dir:
+        t0 = time.perf_counter()
+        n = write_tables_ndjson(tables, json_dir, meta)
+        writer_times.append(("write NDJSON (per table)", time.perf_counter() - t0))
+        status("[+] %d NDJSON files written to %s (one JSON object per row)"
+               % (n, json_dir))
+    if json_path:
+        t0 = time.perf_counter()
+        write_tables_json(tables, json_path, meta)
+        writer_times.append(("write JSON (combined)", time.perf_counter() - t0))
+        print("[+] combined table JSON written to %s" % json_path, file=sys.stderr)
+    if html_path:
+        t0 = time.perf_counter()
+        write_tables_html(tables, html_path, opts.html_rows, meta, tri, opts)
+        writer_times.append(("write HTML browser", time.perf_counter() - t0))
+        print("[+] console written to %s (%d findings, %d tables)"
+              % (html_path, len(tri.findings), len(tables)), file=sys.stderr)
+    if opts.process_map:
+        master = next((t for t in tables if t.name == "PROCESS_MASTER"), None)
+        if master is None:
+            status("[!] no PROCESS_MASTER table to write")
+        else:
+            ext = write_single_table(master, opts.process_map, opts.html_rows)
+            print("[+] process map written to %s (%d processes, %d columns, %s)"
+                  % (opts.process_map, len(master), len(master.columns), ext),
+                  file=sys.stderr)
+    if getattr(opts, "timing", False):
+        print_timing(tb, writer_times)
+    return tables
+
+
+def print_timing(tb, writer_times, top=15):
+    """Where the run actually went, per extractor and per writer.
+
+    A collection that takes minutes is usually one artifact, not the tool being
+    slow overall, and the answer changes per collection - a web server's
+    access_log, a host with a year of journal. Guessing which costs a rerun;
+    this prints it.
+    """
+    rows = ([(lab, sec, n) for lab, sec, n in tb.timings]
+            + [(lab, sec, None) for lab, sec in writer_times])
+    total = sum(r[1] for r in rows)
+    rows.sort(key=lambda r: -r[1])
+    print("\n[*] timing: %.1fs accounted for, slowest %d:"
+          % (total, min(top, len(rows))), file=sys.stderr)
+    for lab, sec, n in rows[:top]:
+        if sec < 0.05:
+            break
+        share = "%5.1f%%" % (100 * sec / total) if total else "     "
+        print("      %-24s %7.2fs %s%s"
+              % (lab, sec, share,
+                 "" if n is None else "  %s rows" % format(n, ",")),
+              file=sys.stderr)
+
+# -------------------------------------------------------------------------
+# reporting
+# -------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# reporting
+# ---------------------------------------------------------------------------
+
+
+
+
+
+def print_banner(color, stream=None):
+    """The mark, once, before any work - and never on stdout.
+
+    stdout carries the report; a caller redirecting it to a file wants the
+    findings in that file, not a masthead, and one piping it into another tool
+    wants it even less. stderr is where the [*] status lines already go.
+    """
+    out = stream or sys.stderr
+    # opts.color is decided by stdout, and this writes to stderr: one can be a
+    # terminal while the other is a pipe, and colouring a pipe puts raw escape
+    # sequences in whatever reads it.
+    try:
+        color = color and out.isatty()
+    except Exception:
+        color = False
+
+    block = can_encode(out, BANNER_BLOCK)
+    art = BANNER_BLOCK if block else BANNER_ASCII
+    cell = SCALE_BLOCK if block else SCALE_ASCII
+    scale = "".join(c(cell, sev, color) for sev in SEVERITIES)
+    try:
+        # normalised: one constant carries a leading newline and one does not,
+        # and the masthead must not jump a line depending on the code page
+        out.write("\n" + c(art.strip("\n"), "head", color) + "\n")
+        out.write(" %s  %s\n" % (scale, c("parse linux deep. hunt the malicious.", "bold", color)))
+        out.write(c(" v%s   developed by %s\n\n" % (VERSION, AUTHOR), "dim", color))
+        out.flush()
+    except Exception:
+        pass          # a closed or undecodable stderr must not end the run
+
+
+def print_console(tri, opts):
+    color = opts.color
+    out = sys.stdout
+    findings = [f for f in tri.findings if SEV_RANK[f.severity] <= SEV_RANK[opts.min_severity]]
+    counts = defaultdict(int)
+    for f in tri.findings:
+        counts[f.severity] += 1
+
+    out.write("\n" + c("=" * 100, "head", color) + "\n")
+    out.write(c("  LINUX TRIAGE REPORT", "bold", color) + "   v%s\n" % VERSION)
+    out.write("  %-14s : %s\n" % ("collection", tri.col.path))
+    out.write("  %-14s : %s\n" % ("layout", {"uac": "UAC",
+                                             "velociraptor": "Velociraptor offline collector"}
+                                  .get(tri.col.layout, tri.col.layout)))
+    for k, label in (("Hostname", "hostname"),
+                     ("Hostname (from archive name)", "hostname"),
+                     ("uname", "kernel"),
+                     ("Operating system", "os"), ("System architecture", "arch"),
+                     ("Collection finished", "collected"), ("Host UTC offset", "host offset"),
+                     ("Time zone", "time zone"), ("Command line", "collector command")):
+        if tri.meta.get(k):
+            out.write("  %-14s : %s\n" % (label, trunc(str(tri.meta[k]), 110)))
+    out.write(c("=" * 100, "head", color) + "\n\n")
+
+    out.write(c("  FINDING SUMMARY", "bold", color) + "\n")
+    for sev in SEVERITIES:
+        if counts[sev]:
+            out.write("    %s  %d\n" % (c("%-9s" % sev, sev, color), counts[sev]))
+    out.write("    %-9s  %d\n" % ("TOTAL", len(tri.findings)))
+
+    top = [f for f in tri.findings if f.severity in ("CRITICAL", "HIGH")]
+    if top:
+        out.write("\n" + c("  HEADLINES", "bold", color) + "\n")
+        for f in top[:12]:
+            out.write("    %s %s\n" % (c("[%s]" % f.severity, f.severity, color), f.title))
+    out.write("\n")
+
+    for sev in SEVERITIES:
+        block = [f for f in findings if f.severity == sev]
+        if not block:
+            continue
+        out.write(c("-" * 100, "head", color) + "\n")
+        out.write(c(" %s FINDINGS (%d)" % (sev, len(block)), sev, color) + "\n")
+        out.write(c("-" * 100, "head", color) + "\n")
+        for i, f in enumerate(block, 1):
+            out.write("\n%s %s\n" % (c("[%s/%s]" % (sev[:4], i), sev, color),
+                                     c(f.title, "bold", color)))
+            out.write("    category : %s\n" % f.category)
+            if f.mitre:
+                out.write("    att&ck   : %s\n" % f.mitre)
+            if f.source:
+                out.write("    artifact : %s\n" % f.source)
+            seen = f.seen_text()
+            if seen:
+                out.write("    seen     : %s\n" % seen)
+            if f.detail:
+                for line in wrap(f.detail, 92):
+                    out.write("    %s\n" % c(line, "dim", color))
+            shown = f.evidence[: opts.max_evidence]
+            for e in shown:
+                out.write("      | %s\n" % e)
+            if len(f.evidence) > len(shown):
+                out.write("      | ... %d more (use --max-evidence or --json)\n"
+                          % (len(f.evidence) - len(shown)))
+        out.write("\n")
+
+    if opts.show_timeline and tri.events:
+        # a console timeline is only useful if it fits on a screen: prefer the
+        # events that were scored above INFO, and fall back when there are none
+        notable = [e for e in tri.events if e.severity != "INFO"]
+        shown_events = notable if len(notable) >= 10 else tri.events
+        label = "notable events" if shown_events is notable else "events"
+        out.write(c("-" * 100, "head", color) + "\n")
+        out.write(c(" EVENT TIMELINE (last %d of %d %s; full list via --timeline)"
+                    % (min(len(shown_events), opts.timeline_show), len(shown_events), label),
+                    "head", color) + "\n")
+        out.write(c("-" * 100, "head", color) + "\n")
+        for e in shown_events[-opts.timeline_show:]:
+            out.write("  %s  %-9s %-10s %s\n" % (
+                e.ts.strftime("%Y-%m-%d %H:%M:%S"),
+                c("%-9s" % e.severity, e.severity, color) if e.severity != "INFO" else "%-9s" % "",
+                e.category, trunc(e.description, 110)))
+        out.write("\n")
+
+
+def wrap(text, width):
+    out = []
+    for para in text.split("\n"):
+        line = ""
+        for word in para.split():
+            if len(line) + len(word) + 1 > width:
+                out.append(line)
+                line = word
+            else:
+                line = (line + " " + word).strip()
+        out.append(line)
+    return out
+
+
+def write_json(tri, path):
+    data = {
+        "tool": "linsight.py", "version": VERSION,
+        "collection": tri.col.path,
+        "metadata": tri.meta,
+        "summary": {s: sum(1 for f in tri.findings if f.severity == s) for s in SEVERITIES},
+        "findings": [f.as_dict() for f in tri.findings],
+        "events": [e.as_dict() for e in tri.events],
+        "iocs": {k: sorted(v) for k, v in sorted(tri.iocs.items())},
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    print("[+] JSON written to %s" % path, file=sys.stderr)
+
+
+def write_timeline(tri, path):
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["timestamp_utc", "severity", "category", "description", "source"])
+        for e in tri.events:
+            w.writerow([e.ts.strftime("%Y-%m-%d %H:%M:%S"), e.severity, e.category,
+                        e.description, e.source])
+    print("[+] timeline (%d events) written to %s" % (len(tri.events), path), file=sys.stderr)
+
+
+HTML_CSS = """
+:root{--bg:#f7f8fa;--fg:#1b1f24;--card:#fff;--line:#e3e6ea;--muted:#5b6570}
+@media (prefers-color-scheme:dark){:root{--bg:#14171b;--fg:#e6e9ed;--card:#1c2026;--line:#2b3138;--muted:#98a2ad}}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
+ font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;margin:28px 0 10px}
+.meta{color:var(--muted);font-size:13px;margin-bottom:18px}
+.meta code{font-size:12px}
+.cards{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 26px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;
+ padding:10px 16px;min-width:104px}
+.card b{display:block;font-size:22px;line-height:1.1}
+.card span{font-size:11px;letter-spacing:.06em;color:var(--muted)}
+.f{background:var(--card);border:1px solid var(--line);border-left-width:5px;
+ border-radius:8px;margin:0 0 10px;padding:12px 16px}
+.f>summary{cursor:pointer;font-weight:600;list-style:none;display:flex;gap:10px;align-items:baseline}
+.f>summary::-webkit-details-marker{display:none}
+.tag{font-size:10px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border-radius:4px;
+ color:#fff;white-space:nowrap}
+.CRITICAL{border-left-color:#b3132a}.CRITICAL .tag{background:#b3132a}
+.HIGH{border-left-color:#d9531e}.HIGH .tag{background:#d9531e}
+.MEDIUM{border-left-color:#c99700}.MEDIUM .tag{background:#c99700}
+.LOW{border-left-color:#2b7fb8}.LOW .tag{background:#2b7fb8}
+.INFO{border-left-color:#6b7684}.INFO .tag{background:#6b7684}
+.detail{color:var(--muted);margin:8px 0}
+.kv{font-size:12px;color:var(--muted);margin:2px 0}
+pre{background:rgba(127,127,127,.09);border-radius:6px;padding:10px;overflow-x:auto;
+ font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;margin:8px 0 0}
+table{border-collapse:collapse;width:100%;font-size:12.5px;display:block;overflow-x:auto}
+th,td{text-align:left;padding:5px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:600}
+td.d{white-space:normal}
+"""
+
+
+def write_html(tri, path, opts):
+    esc = htmllib.escape
+    counts = {s: sum(1 for f in tri.findings if f.severity == s) for s in SEVERITIES}
+    parts = ["<!doctype html><html><head><meta charset='utf-8'>",
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+             "<title>UAC triage - %s</title><style>%s</style></head><body>"
+             % (esc(tri.meta.get("Hostname", "collection")), HTML_CSS)]
+    parts.append("<h1>UAC triage report</h1><div class='meta'>")
+    parts.append("<div><code>%s</code></div>" % esc(tri.col.path))
+    for k, v in tri.meta.items():
+        if v:
+            parts.append("<div>%s: <code>%s</code></div>" % (esc(k), esc(str(v))))
+    parts.append("</div><div class='cards'>")
+    for s in SEVERITIES:
+        parts.append("<div class='card %s'><b>%d</b><span>%s</span></div>" % (s, counts[s], s))
+    parts.append("</div>")
+
+    for sev in SEVERITIES:
+        block = [f for f in tri.findings if f.severity == sev]
+        if not block:
+            continue
+        parts.append("<h2>%s findings (%d)</h2>" % (sev.title(), len(block)))
+        for f in block:
+            openattr = " open" if sev in ("CRITICAL", "HIGH") else ""
+            parts.append("<details class='f %s'%s><summary><span class='tag'>%s</span>%s</summary>"
+                         % (sev, openattr, sev, esc(f.title)))
+            if f.detail:
+                parts.append("<div class='detail'>%s</div>" % esc(f.detail))
+            parts.append("<div class='kv'>category: %s" % esc(f.category))
+            if f.mitre:
+                parts.append(" &nbsp;|&nbsp; ATT&amp;CK: %s" % esc(f.mitre))
+            if f.source:
+                parts.append(" &nbsp;|&nbsp; artifact: <code>%s</code>" % esc(f.source))
+            parts.append("</div>")
+            seen = f.seen_text()
+            if seen:
+                parts.append("<div class='kv'>seen: %s</div>" % esc(seen))
+            if f.evidence:
+                shown = f.evidence[:400]
+                parts.append("<pre>%s</pre>" % esc("\n".join(shown)))
+                if len(f.evidence) > len(shown):
+                    parts.append("<div class='kv'>... %d more lines</div>"
+                                 % (len(f.evidence) - len(shown)))
+            parts.append("</details>")
+
+    if tri.events:
+        parts.append("<h2>Event timeline (%d)</h2><table><tr><th>time (UTC)</th><th>sev</th>"
+                     "<th>category</th><th>event</th></tr>" % len(tri.events))
+        for e in tri.events[-opts.timeline_limit:]:
+            parts.append("<tr><td>%s</td><td>%s</td><td>%s</td><td class='d'>%s</td></tr>"
+                         % (e.ts.strftime("%Y-%m-%d %H:%M:%S"), e.severity,
+                            esc(e.category), esc(trunc(e.description, 300))))
+        parts.append("</table>")
+
+    parts.append("<p class='kv'>generated by linsight.py v%s</p></body></html>" % VERSION)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("".join(parts))
+    print("[+] HTML report written to %s" % path, file=sys.stderr)
+
+# -------------------------------------------------------------------------
+# the command line
+# -------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 
@@ -17296,6 +17342,10 @@ def main(argv=None):
     crit = sum(1 for f in tri.findings if f.severity == "CRITICAL")
     high = sum(1 for f in tri.findings if f.severity == "HIGH")
     return 2 if crit else (1 if high else 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 
 if __name__ == "__main__":
