@@ -243,6 +243,152 @@ class Event:
 # collection access (directory / tar / zip backends)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# loose files: --file, for when there is no collection at all
+# ---------------------------------------------------------------------------
+#
+# Where a loose file has to sit for the parsers to find it. Every entry is
+# (basename pattern, destination). A destination starting with '/' is a host
+# absolute path and is mounted under the synthetic [root]; one that does not
+# is a collection-relative command-output path, which is where UAC puts the
+# artifacts that never existed as files on the host at all.
+#
+# '{name}' keeps the file's own name, and that is what makes rotations work:
+# the parsers glob '/var/log/auth.log*', so auth.log.1 and auth.log.2.gz have
+# to arrive under their own names instead of being flattened onto auth.log. A
+# literal destination is used in the two cases where the name is not free -
+# where a parser wants one exact path (/etc/passwd), and where the name has to
+# match a command glob it would not otherwise match ('ps*.txt').
+#
+# Most log-shaped files need no entry more specific than the directory: the
+# sweep in _log_files() hands everything under /var/log to VAR_LOG, JOURNAL,
+# LOGIN_RECORDS, LASTLOG and WTMPDB, which pick their own by basename. The
+# entries below exist for the files that would otherwise be routed somewhere
+# useless, not to re-state that routing.
+ARTIFACT_ROUTES = (
+    # -- /var/log ----------------------------------------------------------
+    (r"^auth\.log", "/var/log/{name}"),
+    (r"^secure($|[._-])", "/var/log/{name}"),
+    (r"^syslog", "/var/log/{name}"),
+    (r"^messages($|[._-])", "/var/log/{name}"),
+    (r"^kern\.log", "/var/log/{name}"),
+    (r"^daemon\.log", "/var/log/{name}"),
+    (r"^debug($|[._-])", "/var/log/{name}"),
+    (r"^cron($|[._-])", "/var/log/{name}"),
+    (r"^boot\.log", "/var/log/{name}"),
+    (r"^(mail\.log|maillog)", "/var/log/{name}"),
+    (r"^ufw\.log", "/var/log/{name}"),
+    (r"^dpkg\.log", "/var/log/{name}"),
+    (r"^(yum|dnf)\.log", "/var/log/{name}"),
+    (r"^audit\.log", "/var/log/audit/{name}"),
+    # apt writes both of these; neither name says 'apt' on its own
+    (r"^history\.log", "/var/log/apt/{name}"),
+    (r"^term\.log", "/var/log/apt/{name}"),
+    (r"\.journal($|[~.])", "/var/log/journal/local/{name}"),
+    # -- binary login records ----------------------------------------------
+    # wtmpdb is a SQLite file and is read from its own path, not /var/log
+    (r"^(wtmpdb|wtmp\.db)$", "/var/lib/wtmpdb/wtmp.db"),
+    (r"^wtmp", "/var/log/{name}"),
+    (r"^btmp", "/var/log/{name}"),
+    (r"^utmp", "/var/run/{name}"),
+    (r"^lastlog", "/var/log/{name}"),
+    (r"^faillog", "/var/log/{name}"),
+    # -- web logs ----------------------------------------------------------
+    # the parser's own '/var/log/*access*log*' fallbacks catch these by name,
+    # so they only need to land in /var/log; the server column stays empty
+    # because a loose file does not say which daemon wrote it
+    (r"(access|error)[._-]?log", "/var/log/{name}"),
+    (r"^ssl_(request|access|error)", "/var/log/{name}"),
+    # -- accounts and configuration ----------------------------------------
+    (r"^passwd-$", "/etc/passwd-"),
+    (r"^passwd$", "/etc/passwd"),
+    (r"^shadow$", "/etc/shadow"),
+    (r"^group$", "/etc/group"),
+    (r"^gshadow$", "/etc/gshadow"),
+    (r"^sudoers$", "/etc/sudoers"),
+    (r"^sudoers[._-]", "/etc/sudoers.d/{name}"),
+    (r"^sshd_config$", "/etc/ssh/sshd_config"),
+    (r"^ssh_config$", "/etc/ssh/ssh_config"),
+    (r"^authorized_keys2?$", "/root/.ssh/{name}"),
+    (r"^known_hosts$", "/root/.ssh/known_hosts"),
+    (r"^crontab$", "/etc/crontab"),
+    (r"^anacrontab$", "/etc/anacrontab"),
+    (r"^ld\.so\.preload$", "/etc/ld.so.preload"),
+    (r"^ld\.so\.conf$", "/etc/ld.so.conf"),
+    (r"^fstab$", "/etc/fstab"),
+    (r"^hosts$", "/etc/hosts"),
+    (r"^hostname$", "/etc/hostname"),
+    (r"^os-release$", "/etc/os-release"),
+    (r"^machine-id$", "/etc/machine-id"),
+    (r"^resolv\.conf$", "/etc/resolv.conf"),
+    (r"^localtime$", "/etc/localtime"),
+    (r"^environment$", "/etc/environment"),
+    (r"^rc\.local$", "/etc/rc.local"),
+    (r"^modules$", "/etc/modules"),
+    (r"\.(service|timer|socket)$", "/etc/systemd/system/{name}"),
+    # -- shell history -----------------------------------------------------
+    # the parser globs '**/.bash_history', so the leading dot is not optional
+    # and the destination cannot keep a dotless name
+    (r"^\.?bash_history$", "/.bash_history"),
+    (r"^\.?zsh_history$", "/.zsh_history"),
+    (r"^\.?sh_history$", "/.sh_history"),
+    (r"^\.?ksh_history$", "/.ksh_history"),
+    (r"^\.?python_history$", "/.python_history"),
+    (r"^\.?mysql_history$", "/.mysql_history"),
+    (r"^\.?psql_history$", "/.psql_history"),
+    (r"^\.?viminfo$", "/.viminfo"),
+    # -- command output ----------------------------------------------------
+    # these never existed as files on the host, so they go where UAC's runner
+    # would have written them - and under a name the extractor's glob matches
+    (r"^ps($|[._-])|^ps_?(aux|ef|axjf)", "live_response/process/ps_aux.txt"),
+    (r"^pstree", "live_response/process/pstree_-a.txt"),
+    (r"^top($|[._-])", "live_response/process/top.txt"),
+    (r"^lsof", "live_response/network/lsof_-nPli.txt"),
+    (r"^netstat", "live_response/network/netstat_-anp.txt"),
+    (r"^ss($|[._-])", "live_response/network/ss_-anp.txt"),
+    (r"^lsmod", "live_response/system/lsmod.txt"),
+    (r"^ip6?tables", "live_response/network/iptables_-L.txt"),
+    (r"^nft", "live_response/network/nft_list_ruleset.txt"),
+    (r"^ifconfig", "live_response/network/ifconfig_-a.txt"),
+    (r"^ip_?addr|^ip_a$", "live_response/network/ip_addr_show.txt"),
+    (r"^(ip_?)?route", "live_response/network/ip_route_show.txt"),
+    (r"^arp", "live_response/network/arp_-an.txt"),
+    (r"^dmesg", "live_response/hardware/dmesg.txt"),
+)
+ARTIFACT_ROUTES = tuple((re.compile(p, re.I), d) for p, d in ARTIFACT_ROUTES)
+
+# A loose path whose first segment is one of these is already shaped like a
+# host tree, so it is mounted as it stands rather than routed by name. This is
+# what makes '--file ./extracted/etc/passwd' and '--file ./rootfs-copy/' work
+# without a rule per file.
+HOST_ANCHORS = ("etc", "var", "usr", "root", "home", "run", "opt", "srv",
+                "boot", "lib", "lib64", "proc", "sys", "tmp", "mnt", "media")
+
+# Where an unidentified file goes when it decodes as text. /var/log is swept
+# wholesale by VAR_LOG, which splits syslog-shaped lines into columns and keeps
+# anything else verbatim - so an unknown log still gets parsed, dated and
+# hunted rather than being dropped for want of a rule.
+TEXT_FALLBACK = "/var/log/{name}"
+
+
+def route_artifact(name, rel=None, is_text=True):
+    """Loose file -> (destination, how it was decided).
+
+    `rel` is the path the file was given under, which is consulted before the
+    name: a file that arrives as 'etc/passwd' says what it is more reliably
+    than any pattern can guess.
+    """
+    parts = [x for x in (rel or "").replace("\\", "/").split("/") if x and x != "."]
+    if len(parts) > 1 and parts[0].lower() in HOST_ANCHORS:
+        return "/" + "/".join(parts), "path"
+    for rx, dest in ARTIFACT_ROUTES:
+        if rx.search(name):
+            return dest.replace("{name}", name), "name"
+    if is_text:
+        return TEXT_FALLBACK.replace("{name}", name), "text fallback"
+    return None, "unidentified"
+
+
 class Collection:
     """Uniform read access to a triage collection, extracted or archived.
 
@@ -547,6 +693,168 @@ class Collection:
                 fh.close()
             except Exception:
                 pass
+
+
+class FilesCollection(Collection):
+    """A collection assembled from loose files, for --file.
+
+    The parsers never ask 'which tool produced this collection'. They ask for
+    /etc/passwd, for /var/log/auth.log*, for live_response/process/ps*.txt -
+    and Collection answers, whatever the container underneath happens to be.
+    So the way to parse a single auth.log is not a second set of parsers: it
+    is a fourth backend, one whose members are loose files mounted at the
+    paths those questions already name.
+
+    Everything above this class then works unchanged - the analyzers, the 90
+    tables, Sigma and YARA, the findings, the console. A file that routes to
+    /var/log/auth.log is parsed by exactly the code that parses an auth.log
+    out of a UAC tar, because it IS that code.
+
+    The trade is stated rather than hidden: routing is a guess about what a
+    file is, made from its name, and a wrong guess is a file parsed as the
+    wrong artifact. Every decision is reported at load time and recorded in
+    METADATA, and 'path:/host/path' on the command line overrides it.
+    """
+
+    def __init__(self, specs, quiet=False):
+        self.path = "loose files"
+        self.kind = "files"
+        self._tar = None
+        self._zip = None
+        self._sizes = {}
+        self._names = {}
+        self._disk = {}            # synthetic member name -> real path on disk
+        self.prefix = ""
+        self.layout = "uac"
+        self.rootfs_dirs = ["[root]"]
+        self.velo = None
+        self.routed = []           # (source, member, how) - for METADATA
+        self.skipped = []          # (source, why)
+        # Loose files have no uac.log to say when the capture ran, and a
+        # syslog stamp carries no year - without an anchor every 'Nov 11
+        # 03:02:14' lands in 1900 and the whole timeline is wrong. The newest
+        # mtime of the files themselves is the best statement available of
+        # when this evidence was current.
+        self.time_hint = None
+        self._mount(specs, quiet)
+        if not self._names:
+            raise SystemExit("[!] --file: nothing could be identified as an "
+                             "artifact - pass 'path:/host/path' to say what a "
+                             "file is")
+
+    # -- mounting -----------------------------------------------------------
+    def _sources(self, specs):
+        """(real path, path it was given under, explicit destination or None)."""
+        out = []
+        for raw, dest in specs:
+            if os.path.isdir(raw):
+                if dest:
+                    raise SystemExit("[!] --file: '%s' is a directory, so it "
+                                     "cannot be mapped to the single path %s"
+                                     % (raw, dest))
+                for dirpath, _dirs, files in os.walk(raw):
+                    for fn in sorted(files):
+                        full = os.path.join(dirpath, fn)
+                        rel = os.path.relpath(full, raw).replace(os.sep, "/")
+                        out.append((full, rel, None))
+            else:
+                out.append((raw, os.path.basename(raw), dest))
+        return out
+
+    def _mount(self, specs, quiet=False):
+        for real, rel, dest in self._sources(specs):
+            try:
+                size = os.path.getsize(real)
+                mtime = datetime.fromtimestamp(os.path.getmtime(real),
+                                               timezone.utc)
+            except OSError as e:
+                self.skipped.append((real, str(e)))
+                continue
+            if dest:
+                how = "given"
+            else:
+                dest, how = route_artifact(os.path.basename(real), rel,
+                                           self._looks_text(real))
+            if not dest:
+                self.skipped.append((real, "not identified as a known artifact"))
+                continue
+            member = self._member(dest)
+            self._names[member.lower()] = member
+            self._sizes[member.lower()] = size
+            self._disk[member] = real
+            self.routed.append((real, member, how))
+            if self.time_hint is None or mtime > self.time_hint:
+                self.time_hint = mtime
+        if not quiet:
+            for real, member, how in self.routed:
+                status("[*] --file %s -> %s (%s)"
+                       % (os.path.basename(real), self.host_path(member), how))
+            for real, why in self.skipped:
+                status("[!] --file %s skipped: %s" % (os.path.basename(real), why))
+
+    def _member(self, dest):
+        """Destination -> a member name nothing else has taken.
+
+        A collision is two files that genuinely share a name - two hosts'
+        auth.log, say - which is an ambiguous input, not a routing mistake. The
+        duplicate keeps its own basename under a numbered directory rather
+        than being renamed: '/var/log/auth.log' and '/var/log/dup2/auth.log'
+        are both swept by _log_files(), and the second is still recognisably
+        an auth.log rather than an 'auth.log.2' invented here.
+        """
+        base = ("[root]/" + dest.lstrip("/")) if dest.startswith("/") else dest
+        if base.lower() not in self._names:
+            return base
+        head, _, tail = base.rpartition("/")
+        for i in range(2, 500):
+            cand = "%s/dup%d/%s" % (head, i, tail)
+            if cand.lower() not in self._names:
+                return cand
+        raise SystemExit("[!] --file: too many files named %s" % tail)
+
+    @staticmethod
+    def _looks_text(path):
+        """Whether an unidentified file is worth handing to the /var/log sweep."""
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(4096)
+        except OSError:
+            return False
+        if not head:
+            return False
+        if b"\x00" in head:
+            return False
+        try:
+            head.decode("utf-8")
+        except UnicodeDecodeError:
+            # a rotation of a text log can split a multibyte character at the
+            # read boundary; that is not a binary file
+            try:
+                head[:-4].decode("utf-8")
+            except UnicodeDecodeError:
+                return False
+        return True
+
+    # -- reading ------------------------------------------------------------
+    def _open(self, real):
+        return open(self._disk[real], "rb")
+
+
+def parse_file_spec(raw):
+    """'path' or 'path:/host/path' -> (path, destination or None).
+
+    The colon is also a drive separator on Windows, so an existing path is
+    never split, and a split is only accepted when what follows looks like a
+    destination - a host absolute path, or a collection-relative command path.
+    """
+    if os.path.exists(raw):
+        return raw, None
+    head, sep, tail = raw.rpartition(":")
+    if not sep or len(head) < 2:                  # 'C:/logs/auth.log'
+        return raw, None
+    if tail.startswith("/") or tail.startswith("live_response/"):
+        return head, tail
+    return raw, None
 
 
 class VelociraptorResults:
@@ -2065,10 +2373,53 @@ def _parse_block(lines, i, base=None):
 # ---------------------------------------------------------------------------
 
 SUPPORTED_MODS = {"contains", "startswith", "endswith", "re", "all", "cased",
-                  "base64", "base64offset", "windash", "expand"}
+                  "base64", "base64offset", "windash", "expand", "cidr"}
 # modifiers whose semantics this engine cannot honour - reject, never ignore
-REJECT_MODS = {"cidr", "fieldref", "exists", "gt", "gte", "lt", "lte",
+REJECT_MODS = {"fieldref", "exists", "gt", "gte", "lt", "lte",
                "utf16", "utf16le", "utf16be", "wide"}
+
+_CIDR_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+
+
+def _ip_of(text):
+    """The IP address a field value carries, or None.
+
+    A Sigma cidr rule names an address field, but the tables here fill those
+    from whatever the artifact wrote: ss and netstat give '10.0.0.5:443', a
+    v6 peer arrives as '[fe80::1]:22', auth.log and the web logs give a bare
+    address. The whole value is parsed first - that is the common case and the
+    only unambiguous one - then the bracketed and port-suffixed forms, and
+    only then the first dotted quad in the text.
+
+    Anything else is left unmatched rather than guessed at. A cidr test that
+    quietly matches the wrong number out of a log line is worse than a rule
+    that does not fire: the first invents a hit, the second is visible as a
+    gap in SIGMA_COVERAGE.
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    try:
+        return ipaddress.ip_address(s)
+    except ValueError:
+        pass
+    if s.startswith("["):                       # [fe80::1]:22
+        try:
+            return ipaddress.ip_address(s[1:].split("]")[0])
+        except (ValueError, IndexError):
+            pass
+    if s.count(":") == 1:                       # 10.0.0.5:443 - one colon, so
+        try:                                    # never a bare v6 address
+            return ipaddress.ip_address(s.split(":")[0])
+        except ValueError:
+            pass
+    m = _CIDR_IPV4_RE.search(s)
+    if m:
+        try:
+            return ipaddress.ip_address(m.group(0))
+        except ValueError:
+            pass
+    return None
 
 
 def _anchored(inner, at_start, at_end, flags):
@@ -2168,6 +2519,14 @@ class Matcher:
         if v is None:
             return None                       # 'field: null' -> field absent
         s = str(v)
+        if "cidr" in self.mods:
+            # A bare address is a /32 (or /128), which is what Sigma means by
+            # it, and strict=False accepts '10.0.0.5/8' rather than rejecting
+            # the rule over a host bit the author left set.
+            try:
+                return ("cidr", ipaddress.ip_network(s, strict=False))
+            except ValueError as e:
+                raise RuleError("bad cidr value '%s': %s" % (s, e))
         if "base64offset" in self.mods:
             forms = []
             for off in (0, 1, 2):
@@ -2220,7 +2579,13 @@ class Matcher:
             hay = str(got)
             kind, pat = t
             # anchors live in the pattern, so every form is a plain search
-            if kind == "any":
+            if kind == "cidr":
+                ip = _ip_of(hay)
+                # a v4 address is never inside a v6 network and vice versa;
+                # `in` raises on the mismatch rather than returning False
+                results.append(bool(ip) and ip.version == pat.version
+                               and ip in pat)
+            elif kind == "any":
                 results.append(any(p.search(hay) for p in pat))
             elif kind == "re_low":
                 if hay_low is None:
@@ -2913,6 +3278,38 @@ class Triage:
         if ts is not None:
             self.events.append(Event(ts, category, description, severity, source))
 
+    def _events_from_findings(self):
+        """Put every dated finding on the timeline.
+
+        The timeline used to be built only from the nine analyzers that call
+        event() directly, so a collection could carry four CRITICAL findings -
+        every one of them dated - and a TIMELINE holding no CRITICAL row at
+        all. Isolating CRITICAL in the console then emptied the timeline
+        instead of showing the four moments the whole analysis was about, and
+        the promise the header chips make - that a technique cell, a timeline
+        column and a findings row all count the same set - was false.
+
+        A finding that knows when it happened is a timeline entry by
+        definition. The raw events around it are the context; the conclusion
+        is the point, and it belongs on the same clock.
+
+        One row at first_seen, not two: a finding spanning October to December
+        is one conclusion with a window, and drawing it again at last_seen
+        would double every multi-occurrence finding in the chart. The span
+        itself is already on the finding, which is where a reader asks for it.
+        """
+        for f in self.findings:
+            if not f.first_seen:
+                continue
+            try:
+                ts = datetime.strptime(f.first_seen, "%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                continue
+            # aware, like every other event: the sort below compares them and
+            # one naive stamp in the list raises rather than mis-ordering
+            self.events.append(Event(ts.replace(tzinfo=timezone.utc), f.category,
+                                     f.title, f.severity, f.source or "(finding)"))
+
     def ioc(self, value, where):
         if value:
             self.iocs[value].add(where)
@@ -3275,12 +3672,56 @@ class Triage:
                         self.collection_time.strftime("%Y-%m-%d %H:%M:%S UTC")
                         + " (from `date` on the host)")
 
+        if not self.collection_time:
+            # --file: no uac.log, no `date` capture, and a syslog stamp
+            # carries no year - so without an anchor every 'Nov 11 03:02:14'
+            # collapses onto 1900 and the timeline is worthless. The newest
+            # mtime of the files handed over is the best statement available
+            # of when this evidence was current, and saying which anchor was
+            # used matters more than the anchor itself.
+            hint = getattr(self.col, "time_hint", None)
+            if hint:
+                self.collection_time = hint
+                self.meta["Collection finished"] = (
+                    hint.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    + " (newest mtime of the files given with --file - no "
+                      "collection metadata to date this run)")
+
         if "Host UTC offset" not in self.meta:
             # said out loud, the same way the Velociraptor path does: uac.log is
             # where a UAC collection states its offset, and without one every
             # host-local stamp below is being read as UTC
             self.meta["Host UTC offset"] = ("unknown - uac.log carried none, "
                                             "host-local log stamps read as UTC")
+
+        routed = getattr(self.col, "routed", None)
+        if routed:
+            # Routing is a guess from a filename, and a wrong guess is a file
+            # parsed as the wrong artifact. It belongs in the report next to
+            # the findings it produced, not only on the terminal of whoever
+            # ran it.
+            self.meta["Loose files"] = "%d routed by --file" % len(routed)
+            self.add("INFO", "Collection", "Artifacts routed from loose files",
+                     "No collection was parsed: these files were mounted at "
+                     "the paths the extractors look for, chosen from each "
+                     "file's name unless the command line said otherwise. A "
+                     "file identified as the wrong artifact is parsed as the "
+                     "wrong artifact - check this list before relying on "
+                     "anything below it.",
+                     ["%-38s -> %-34s (%s)"
+                      % (os.path.basename(src), self.col.host_path(member), how)
+                      for src, member, how in routed],
+                     source="--file", count=len(routed))
+        skipped = getattr(self.col, "skipped", None)
+        if skipped:
+            self.add("LOW", "Collection", "Loose files that could not be identified",
+                     "These were given with --file and not parsed: nothing in "
+                     "the name matched a known artifact and the contents are "
+                     "not text, so there is no destination that would not be "
+                     "a guess. Pass 'path:/host/path' to say what one is.",
+                     ["%-38s %s" % (os.path.basename(src), why)
+                      for src, why in skipped],
+                     source="--file", count=len(skipped))
 
         detail = "\n".join("%-24s %s" % (k + ":", v) for k, v in self.meta.items() if v)
         # a profile whose uac.log this parser cannot date still knows when it
@@ -4599,9 +5040,15 @@ class Triage:
         For host-local text - syslog, auth.log, secure - where the stamp has to
         be moved onto UTC. A source that already normalised its own timestamps
         wants _utc_ts instead.
+
+        log_ts() rather than norm_log_ts(): a year-less syslog stamp needs the
+        collection year AND the roll-back when that lands it in the future.
+        Calling norm_log_ts directly took the hint and skipped the roll-back,
+        so a January collection read every December line in auth.log.1 as
+        eleven months from now - and the failed-login window, which is the one
+        thing this function feeds, was built out of those dates.
         """
-        ct = self.collection_time
-        s = norm_log_ts(text, self.tz_offset, ct.year if ct else None)
+        s = self.log_ts(text)
         if not s:
             return None
         try:
@@ -6174,6 +6621,7 @@ class Triage:
                          "This check was skipped; the rest of the report is unaffected.")
         prog.done()
         self.findings.sort(key=lambda f: (SEV_RANK[f.severity], f.category, f.title))
+        self._events_from_findings()
         self.events.sort(key=lambda e: e.ts)
         return self.findings
 
@@ -7006,16 +7454,15 @@ class TableBuilder:
     def t_timeline(self):
         t = self.table("TIMELINE", "Normalised event timeline",
                        ["timestamp_utc", "severity", "category", "description", "source"],
-                       "Analysis", "All dated events, every clock normalised to UTC.")
+                       "Analysis",
+                       "All dated events, every clock normalised to UTC. Every "
+                       "dated finding is here too, at its first_utc and under "
+                       "its own severity, so the timeline and the findings "
+                       "list answer a severity filter with the same set - a "
+                       "finding-derived row carries the artifact it came from "
+                       "in source, or '(finding)' where it had none.")
         for e in self.tri.events:
             t.add(e.ts, e.severity, e.category, e.description, e.source)
-
-    def t_iocs(self):
-        t = self.table("IOCS", "Extracted indicators",
-                       ["indicator", "seen_in_count", "seen_in"], "Analysis",
-                       "Indicators the analyzers pulled out, with where they appeared.")
-        for val, where in sorted(self.tri.iocs.items()):
-            t.add(val, len(where), "; ".join(sorted(where)))
 
     def t_file_inventory(self):
         """Every file in the collection - the 'did anything get missed' table."""
@@ -14080,7 +14527,7 @@ class TableBuilder:
         # their own right. Ordering them the other way silently dropped every
         # rule hit out of FINDINGS and the console report.
         "t_hacktools", "t_yara", "t_sigma", "t_pivot", "t_rule_errors",
-        "t_findings", "t_timeline", "t_iocs",
+        "t_findings", "t_timeline",
         # why an artifact above is absent, before the list of what is left
         "t_collection_errors",
         "t_unparsed",          # must stay last: it reports on everything above
@@ -14108,7 +14555,7 @@ class TableBuilder:
     #
     # Anything not named below runs in every scope. That covers two kinds:
     # collection accounting (METADATA, COLLECTION_LOG, COLLECTION_ERRORS,
-    # UNPARSED_FILES) and derived views (FINDINGS, TIMELINE, IOCS), plus the
+    # UNPARSED_FILES) and derived views (FINDINGS, TIMELINE), plus the
     # handful of tables that genuinely merge both sides - FIREWALL holds the
     # running ruleset and the saved rules file, PACKAGES the dpkg output and
     # the dpkg database, MOUNTS the mount command and fstab. Those keep both
@@ -14271,6 +14718,23 @@ def _table_json_body(t, fh):
 NDJSON_TIME_COLUMNS = ("timestamp_utc", "timestamp", "start_utc",
                        "last_utc", "first_utc")
 
+# A row's own moment, for the console's time window - and deliberately only
+# the two columns that mean "this row IS a thing that happened".
+#
+# The window narrows what happened, never what exists. Half the tables here
+# carry a timestamp that is an attribute of a standing thing rather than an
+# event: USERS.last_login_utc (2 of 33 accounts have one), SUID_SGID.mtime_utc,
+# PROCESS_MASTER.start_utc. Filtering those on a one-hour window deletes the
+# account list, every suid binary, and every process that was already running
+# when the hour began - which is not a narrower answer, it is a wrong one.
+#
+# A table with neither column is left alone entirely, and the console says so
+# rather than showing an empty grid. Ordered by preference: a table carrying
+# both a stamp of its own and a first/last span is filtered on the stamp,
+# because that is when the row happened rather than when the thing it belongs
+# to was first seen.
+CONSOLE_TIME_COLUMNS = ("timestamp_utc", "timestamp")
+
 # Context added to every event. Prefixed because the row's own fields win and
 # must: SIGMA_MATCHES and HACKTOOL_HITS both have a column literally called
 # 'table', and an unprefixed context field would overwrite the evidence with
@@ -14398,6 +14862,14 @@ def _script_json(obj):
     return json.dumps(obj).replace("<", "\\u003c")
 
 
+# Artifact tables the console lists above the per-category nav, in this order.
+# "is any of the known toolkit on this host at all" is the first question asked
+# of a triage collection, and the answer was three categories down the sidebar
+# under D for Detection - far enough that it read as a footnote to the parsing
+# rather than as the point of it.
+PINNED_TABLES = ("HACKTOOL_HITS", "HACKTOOL_VARIANTS")
+
+
 def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
                       opts=None):
     """The console: triage views and every artifact table in one page.
@@ -14421,11 +14893,18 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
     # Which table each console view reads. A view whose table was not built -
     # a single-table export - simply does not appear in the nav.
     views = {v: n for v, n in (("findings", "FINDINGS"),
-                               ("timeline", "TIMELINE"), ("iocs", "IOCS"))
+                               ("timeline", "TIMELINE"))
              if n in tbls}
     payload = {"meta": [], "tactics": ATTACK_TACTICS, "order": ATTACK_ORDER,
                "version": VERSION, "index": index, "tables": tbls,
-               "views": views}
+               "views": views,
+               "pinned": [n for n in PINNED_TABLES if n in tbls],
+               # what the console reads a row's clock out of, in preference
+               # order. Shared with the NDJSON exporter rather than restated:
+               # two lists of time columns would disagree the first time one
+               # gained a column.
+               "tcols": list(CONSOLE_TIME_COLUMNS),
+               "spancols": ["first_utc", "last_utc"]}
     if tri is not None:
         payload.update(_triage_payload(tri, opts))
     elif meta:
@@ -14442,7 +14921,18 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
         fh.write("<header><div class='brand'><b>linsight</b>"
                  "<span>PARSE LINUX DEEP. HUNT THE MALICIOUS.</span></div>"
                  "<div class='host'><b>%s</b> &nbsp;<code>%s</code></div>"
+                 "<div class='tf'>"
+                 "<input id='t0' type='search' placeholder='from'"
+                 " title='click for a calendar - or type YYYY-MM-DD, "
+                 "YYYY-MM-DD HH:MM, -24h, -7d'>"
+                 "<span class='ar'>&rarr;</span>"
+                 "<input id='t1' type='search' placeholder='to'"
+                 " title='click for a calendar - or type YYYY-MM-DD, "
+                 "YYYY-MM-DD HH:MM, -24h, -7d'>"
+                 "<button class='clr' id='tclr' title='clear the time window'>"
+                 "&times;</button></div>"
                  "<div class='chips' id='chips'></div></header>"
+                 "<div class='cal' id='cal'></div>"
                  % (esc(str(host)), esc(str(src))))
         fh.write("<div class='layout'><nav id='nav'></nav>"
                  "<main id='main'></main></div>")
@@ -14873,14 +15363,6 @@ def write_html(tri, path, opts):
                             esc(e.category), esc(trunc(e.description, 300))))
         parts.append("</table>")
 
-    if tri.iocs:
-        parts.append("<h2>Indicators observed (%d)</h2><table><tr><th>indicator</th>"
-                     "<th>seen in</th></tr>" % len(tri.iocs))
-        for k, v in sorted(tri.iocs.items()):
-            parts.append("<tr><td><code>%s</code></td><td class='d'>%s</td></tr>"
-                         % (esc(k), esc(", ".join(sorted(v)))))
-        parts.append("</table>")
-
     parts.append("<p class='kv'>generated by linsight.py v%s</p></body></html>" % VERSION)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("".join(parts))
@@ -14994,6 +15476,55 @@ font-variant-numeric:tabular-nums;user-select:none}
 .chip.on.LOW{color:var(--LOW);border-color:var(--LOW)}
 .chip.on.INFO{color:var(--INFO);border-color:var(--INFO)}
 .chip.off{opacity:.42;text-decoration:line-through}
+/* the time window, beside the chips: the other filter that bites everywhere */
+.tf{display:flex;align-items:center;gap:4px;flex:0 0 auto}
+.tf input{width:104px;background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+border-radius:4px;padding:2px 6px;font:11px/1.6 inherit;outline:none}
+.tf input:focus{border-color:var(--accent)}
+.tf input.on{border-color:var(--gold);color:var(--gold)}
+.tf input.bad{border-color:var(--CRITICAL);color:var(--CRITICAL)}
+.tf .ar{color:var(--dim);font-size:11px}
+.tf button.clr{padding:1px 7px;line-height:1.4}
+.tf button.clr.on{color:var(--gold);border-color:var(--gold)}
+/* ---- the calendar ----
+   A month grid rather than a native date input: this one shades the days that
+   actually carry evidence, which is the thing a reader wants to know before
+   picking one. A collection is mostly empty days and three loud ones. */
+.cal{display:none;position:fixed;z-index:40;background:var(--panel);
+border:1px solid var(--line);border-radius:8px;padding:10px;width:246px;
+box-shadow:0 10px 30px rgba(0,0,0,.45)}
+.cal.open{display:block}
+.cal .hd{display:flex;align-items:center;justify-content:space-between;
+margin-bottom:8px}
+.cal .hd b{font-size:12px;font-weight:600;letter-spacing:.3px}
+.cal .nav{background:transparent;border:1px solid var(--line);border-radius:4px;
+color:var(--dim);cursor:pointer;width:22px;height:22px;line-height:1;font-size:13px}
+.cal .nav:hover{color:var(--accent);border-color:var(--accent)}
+.cal .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.cal .wd{color:var(--dim);font-size:9.5px;text-align:center;letter-spacing:.5px;
+padding-bottom:2px}
+.cal .d{position:relative;height:26px;border-radius:4px;border:1px solid transparent;
+display:flex;align-items:center;justify-content:center;font-size:11.5px;
+font-variant-numeric:tabular-nums;cursor:pointer;color:var(--fg)}
+.cal .d.pad{color:var(--dim);opacity:.35;cursor:default}
+.cal .d:not(.pad):hover{border-color:var(--gold)}
+/* the day's own evidence, behind the number rather than replacing it */
+.cal .d .lvl{position:absolute;left:0;right:0;top:0;bottom:0;border-radius:4px;
+background:var(--accent);z-index:0}
+.cal .d span{position:relative;z-index:1}
+.cal .d.in .lvl{background:var(--gold)}
+.cal .d.edge{border-color:var(--gold);font-weight:700}
+.cal .d.none{color:var(--dim);opacity:.55}
+.cal .ft{display:flex;align-items:center;gap:6px;margin-top:9px;
+border-top:1px solid var(--line);padding-top:8px}
+.cal .ft input{width:62px;background:var(--bg);color:var(--fg);border:1px solid var(--line);
+border-radius:4px;padding:2px 5px;font:11px/1.5 inherit;outline:none;text-align:center}
+.cal .ft input:focus{border-color:var(--accent)}
+.cal .ft .lb{color:var(--dim);font-size:10.5px}
+.cal .pre{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.cal .pre button{flex:1 1 auto;background:var(--bg);border:1px solid var(--line);
+color:var(--dim);border-radius:11px;padding:2px 6px;font-size:10.5px;cursor:pointer}
+.cal .pre button:hover{color:var(--gold);border-color:var(--gold)}
 
 .layout{display:flex;height:calc(100vh - 56px)}
 nav{width:248px;flex:0 0 248px;background:var(--panel);border-right:1px solid var(--line);
@@ -15038,6 +15569,17 @@ border:1px solid var(--line);border-radius:6px;padding:8px}
 .histo .col.on{outline:1px solid var(--gold)}
 .axis{display:flex;justify-content:space-between;color:var(--dim);font-size:10.5px;
 padding:4px 2px 0}
+/* seven rows of twenty-four cells, plus a label column and an hour axis that
+   spans the cells rather than the label */
+.heat{display:grid;grid-template-columns:30px repeat(24,1fr);gap:2px;
+background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px}
+.heat .d{color:var(--dim);font-size:10px;line-height:15px;text-align:right;
+padding-right:5px}
+.heat .c{height:15px;border-radius:2px;background:#1a212b}
+.heat .c.on{cursor:default}
+.heat .c.on:hover{outline:1px solid var(--gold);outline-offset:1px}
+.heat .hx{grid-column:2/26;display:flex;justify-content:space-between;
+color:var(--dim);font-size:10.5px;padding-top:5px}
 table.meta{border-collapse:collapse;font-size:12px}
 table.meta td{padding:3px 14px 3px 0;vertical-align:top;border:0}
 table.meta td:first-child{color:var(--dim);white-space:nowrap}
@@ -15087,7 +15629,7 @@ border-left:3px solid var(--line);background:var(--panel2)}
 white-space:nowrap}
 .cell .n{float:right;color:var(--dim);font-size:10.5px}
 
-/* ---- tables (timeline, iocs) ---- */
+/* ---- tables (timeline, and the console's own grids) ---- */
 table.grid{width:100%;border-collapse:collapse;font-size:12px}
 table.grid th{position:sticky;top:0;background:var(--panel2);text-align:left;
 padding:6px 9px;border-bottom:1px solid var(--line);font-weight:600;z-index:1}
@@ -15106,9 +15648,9 @@ nav a.tbl{padding:5px 14px;font-size:12px}
 nav a.tbl span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ---- tables ----
-   Scoped to .tbl: the console has tables of its own (the timeline, the
-   indicator list, the collection metadata) and fixed layout with measured
-   column widths is right for an artifact grid and wrong for those. */
+   Scoped to .tbl: the console has tables of its own (the timeline and
+   the collection metadata) and fixed layout with measured column widths is
+   right for an artifact grid and wrong for those. */
 .desc{color:var(--dim);margin:0 0 12px;font-size:12px}
 .controls{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
 .badge{background:#0d1117;border:1px solid var(--line);border-radius:11px;padding:2px 9px;
@@ -15153,22 +15695,26 @@ button.clr:hover{color:var(--accent);border-color:var(--accent)}
 """
 
 APP_JS = """var D=window.__LINSIGHT__,SEV=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
-var TB=D.tables||{},IDX=D.index||[],V=D.views||{};
-var st={view:null,sev:{},cat:'',tech:'',sel:null,bucket:null,table:null,tq:''};
+var TB=D.tables||{},IDX=D.index||[],V=D.views||{},PIN=D.pinned||[];
+/* The offensive-tool grid the overview reads and the nav pins. Named once:
+   the console asks for it in four places and a typo would fail silently. */
+var HT='HACKTOOL_HITS';
+var st={view:null,sev:{},cat:'',tech:'',sel:null,table:null,tq:'',
+        t0:null,t1:null};   /* t0/t1: the time window, epoch seconds, inclusive */
 SEV.forEach(function(s){st.sev[s]=true;});
 var VIEWS=[['overview','Overview'],['findings','Findings'],['attack','ATT&CK'],
-           ['timeline','Timeline'],['iocs','Indicators']];
+           ['timeline','Timeline']];
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function el(id){return document.getElementById(id);}
 function sevRank(s){var i=SEV.indexOf(s);return i<0?99:i;}
 
-/* The three console views ARE the three analysis tables - there is one
-   FINDINGS, one TIMELINE, one IOCS, and the view is how you read it. Nothing
-   is carried twice: the severity cards, the ATT&CK matrix and the activity
-   chart are all computed from these rows rather than from a second copy of
-   the same data embedded beside them. */
+/* The console views ARE the analysis tables - there is one FINDINGS and one
+   TIMELINE, and the view is how you read it. Nothing is carried twice: the
+   severity cards, the ATT&CK matrix, the activity charts and the offensive-
+   tool ranking are all computed from these rows and from HACKTOOL_HITS,
+   rather than from a second copy of the same data embedded beside them. */
 function vt(v){return V[v]&&TB[V[v]]?TB[V[v]]:null;}
 function isView(t){
  for(var k in V){if(V[k]===t.name)return k;}
@@ -15181,6 +15727,139 @@ function ci(t,name){return t?t.columns.indexOf(name):-1;}
 function ts(s){
  var d=Date.parse(String(s||'').replace(' ','T')+'Z');
  return isNaN(d)?null:d/1000;
+}
+
+/* ---------- the time window ---------- */
+/* One window, applied to every grid that carries a clock rather than only to
+   the three console views. 'what happened between 03:00 and 04:00' is the
+   question a triage console exists to answer, and answering it in FINDINGS
+   while AUTH_LOG and WEB_LOG still show the whole capture is not an answer.
+
+   A table with no time column is left alone rather than emptied: /etc/passwd
+   did not happen at a time, and a window that blanks the account list has
+   filtered out the context you narrowed in order to read. */
+var TCOL=D.tcols||['timestamp_utc'],SPAN=D.spancols||['first_utc','last_utc'];
+function tcols(t){
+ if(t._tc)return t._tc;
+ var i,p=-1;
+ for(i=0;i<TCOL.length&&p<0;i++)p=ci(t,TCOL[i]);
+ var f=ci(t,SPAN[0]),l=ci(t,SPAN[1]);
+ t._tc={p:p,f:f,l:l,any:(p>=0||f>=0||l>=0)};
+ return t._tc;
+}
+/* A row's own extent: a stamp is a point, first/last is a span, and a row
+   carrying both is placed at its stamp. Returns null for a row that is
+   simply undated - a finding raised off a config file has no time, and that
+   is a fact about the finding rather than a parse failure. */
+function rowSpan(tc,r){
+ var a=null,b=null;
+ if(tc.p>=0)a=b=ts(r[tc.p]);
+ if(a===null&&tc.f>=0)a=ts(r[tc.f]);
+ if(b===null&&tc.l>=0)b=ts(r[tc.l]);
+ if(a===null&&b===null)return null;
+ if(a===null)a=b;
+ if(b===null)b=a;
+ return b<a?[b,a]:[a,b];
+}
+/* Overlap, not containment: a finding that ran from 02:00 to 05:00 happened
+   during a window of 03:00-04:00, and requiring the whole span to fit inside
+   would drop exactly the long-running things worth narrowing onto. */
+function inWindow(tc,r){
+ var sp=rowSpan(tc,r);
+ if(sp===null)return false;
+ if(st.t0!==null&&sp[1]<st.t0)return false;
+ if(st.t1!==null&&sp[0]>st.t1)return false;
+ return true;
+}
+function winOn(){return st.t0!==null||st.t1!==null;}
+/* The latest moment anything in the collection carries, so '-24h' has an end
+   to count back from. The capture is the natural anchor, not the reader's
+   clock: a collection taken last year is still read as its own last day. */
+var DMAX=null;
+function dataMax(){
+ if(DMAX!==null)return DMAX;
+ DMAX=0;
+ var t=vt('timeline')||vt('findings');
+ if(t){
+  var tc=tcols(t);
+  t.rows.forEach(function(r){
+   var sp=rowSpan(tc,r);
+   if(sp&&sp[1]>DMAX)DMAX=sp[1];});}
+ return DMAX;
+}
+/* 'YYYY-MM-DD', with an optional time, or '-24h' / '-7d' / '-2w' counted back
+   from the end of the data. `end` rounds a bare date up to its last second,
+   so 'to: 2021-12-08' means all of the 8th rather than midnight at its start.
+   Returns undefined for text that is not a time at all, which is how the box
+   knows to mark itself bad instead of silently filtering nothing. */
+function parseWhen(txt,end){
+ var v=String(txt||'').trim();
+ if(!v)return null;
+ var rel=/^-(\\d+)\\s*([hdw])$/i.exec(v);
+ if(rel){
+  var mul={h:3600,d:86400,w:604800}[rel[2].toLowerCase()];
+  var base=dataMax();
+  return base?base-(+rel[1])*mul:undefined;
+ }
+ var m=/^(\\d{4})-(\\d\\d)-(\\d\\d)(?:[ T](\\d\\d):(\\d\\d)(?::(\\d\\d))?)?$/.exec(v);
+ if(!m)return undefined;
+ var hasT=m[4]!==undefined,hasS=m[6]!==undefined;
+ var d=Date.UTC(+m[1],+m[2]-1,+m[3],hasT?+m[4]:0,hasT?+m[5]:0,hasS?+m[6]:0);
+ if(isNaN(d))return undefined;
+ var sec=d/1000;
+ if(!end)return sec;
+ return sec+(hasS?0:(hasT?59:86399));
+}
+function fmtWin(){
+ return (st.t0!==null?fmtT(st.t0):'\u2026')+' \u2192 '+
+        (st.t1!==null?fmtT(st.t1):'\u2026');
+}
+function setWin(a,b){
+ st.t0=a;st.t1=b;
+ var i0=el('t0'),i1=el('t1');
+ if(i0)i0.value=a===null?'':fmtT(a);
+ if(i1)i1.value=b===null?'':fmtT(b);
+ markWin();
+ render();
+}
+function markWin(){
+ var i0=el('t0'),i1=el('t1'),c=el('tclr');
+ if(i0)i0.classList.toggle('on',st.t0!==null);
+ if(i1)i1.classList.toggle('on',st.t1!==null);
+ if(c)c.classList.toggle('on',winOn());
+}
+/* Typed into either box: both are re-read, because '-24h' in the from box is
+   defined against whatever the to box says. A box holding text that is not a
+   time marks itself and is treated as empty rather than emptying the grid. */
+function readWin(){
+ var i0=el('t0'),i1=el('t1');
+ var a=parseWhen(i0?i0.value:'',false),b=parseWhen(i1?i1.value:'',true);
+ if(i0)i0.classList.toggle('bad',a===undefined);
+ if(i1)i1.classList.toggle('bad',b===undefined);
+ st.t0=(a===undefined)?null:a;
+ st.t1=(b===undefined)?null:b;
+ markWin();
+ render();
+}
+/* How many rows the window took out of this grid because they carry no time
+   at all - worth saying, because 55 of 104 findings are undated and a reader
+   who does not know that reads their absence as 'nothing happened'. */
+function undatedCount(t){
+ var tc=tcols(t);
+ if(!tc.any)return 0;
+ var n=0;
+ t.rows.forEach(function(r){if(rowSpan(tc,r)===null)n++;});
+ return n;
+}
+function winBadge(t){
+ if(!winOn())return '';
+ var tc=tcols(t);
+ if(!tc.any)return '<span class="badge">time window not applied \u2014 '+
+   esc(t.name)+' carries no clock</span>';
+ var u=undatedCount(t);
+ return '<span class="badge warn">window '+esc(fmtWin())+
+   (u?' \u2014 '+u.toLocaleString()+' undated row(s) hidden':'')+
+   ' <span class="pill" data-winclear="1">clear &times;</span></span>';
 }
 
 var TECH=/\\bT\\d{4}(?:\\.\\d{3})?\\b/g;
@@ -15215,10 +15894,12 @@ function fc(){
 function frows(){
  var f=fc();
  if(!f)return [];
+ var tc=winOn()?tcols(f.t):null;
  return f.t.rows.filter(function(r){
   if(!st.sev[r[f.severity]])return false;
   if(st.cat&&r[f.category]!==st.cat)return false;
   if(st.tech&&techsOf(r[f.mitre]).indexOf(st.tech)<0)return false;
+  if(tc&&tc.any&&!inWindow(tc,r))return false;
   return true;});
 }
 
@@ -15229,7 +15910,7 @@ function setView(v,name){
   /* A console view is a table too, so switching to one carries the same
      reset: its sort and its column filters are its own. */
   var n=V[v];
-  if(n!==st.table){st.table=n;sortCol=-1;colFilters=[];st.tq='';st.bucket=null;}
+  if(n!==st.table){st.table=n;sortCol=-1;colFilters=[];st.tq='';}
  }
  st.view=v;
  location.hash=(v==='table')?'t/'+st.table:v;
@@ -15259,7 +15940,7 @@ function chips(){
       criticals", which is otherwise four clicks. */
    if(ev&&ev.altKey){SEV.forEach(function(x){st.sev[x]=(x===s);});}
    else{st.sev[s]=!st.sev[s];}
-   st.bucket=null;chips();render();};});
+   chips();render();};});
 }
 
 /* ---------- charts ---------- */
@@ -15268,6 +15949,9 @@ function chips(){
    collection covering a year and one covering an hour have to produce the
    same shaped chart, and the stack is what makes a burst of CRITICAL visible
    inside an hour that also carries a thousand INFO lines. */
+/* The bucket bounds of the last histogram drawn with clickable:true, so the
+   click handler can turn a column index back into a time range. */
+var HB=[];
 function histo(rows,ti,si,n,h_px,clickable){
  var pts=[];
  rows.forEach(function(r){
@@ -15288,7 +15972,12 @@ function histo(rows,ti,si,n,h_px,clickable){
  for(i=0;i<n;i++){
   var tip=[];
   SEV.forEach(function(sv){if(b[i].s[sv])tip.push(b[i].s[sv]+' '+sv);});
-  h+='<div class="col'+(st.bucket===i&&clickable?' on':'')+'" data-b="'+i+
+  /* A column is lit when it overlaps the window, not when it was the one
+     clicked: the window can also be typed, or set from another chart, and a
+     highlight that only followed clicks would disagree with the filter. */
+  var lit=clickable&&winOn()&&
+    !(st.t1!==null&&b[i].t0>st.t1)&&!(st.t0!==null&&b[i].t1<st.t0);
+  h+='<div class="col'+(lit?' on':'')+'" data-b="'+i+
      '" title="'+esc(fmtT(b[i].t0)+'  -  '+(tip.join(', ')||'0'))+'">';
   /* column-reverse stacks the first child at the bottom, so walking INFO up
      to CRITICAL puts the loud severities on top where they are read first. */
@@ -15299,6 +15988,7 @@ function histo(rows,ti,si,n,h_px,clickable){
   h+='</div>';}
  h+='</div><div class="axis"><span>'+esc(fmtT(t0))+'</span><span>'+
     esc(fmtT(t0+span/2))+'</span><span>'+esc(fmtT(t1))+'</span></div>';
+ if(clickable)HB=b;
  return {html:h,b:b};
 }
 /* Epoch seconds back to the shape the rows carry, built from the UTC parts
@@ -15309,17 +15999,133 @@ function fmtT(sec){
  return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
         p(d.getUTCHours())+':'+p(d.getUTCMinutes());
 }
+/* 24 UTC hours, severity-stacked. This answers what the running timeline
+   cannot: whether the activity sits inside a working day or at 03:00. A month
+   of evidence collapses onto one clock face, so a nightly cron and a single
+   3am login land in the same column and the shape is the question. */
+function hourly(rows,ti,si,h_px){
+ var b=[],i,any=false;
+ for(i=0;i<24;i++)b.push({n:0,s:{}});
+ rows.forEach(function(r){
+  var e=ts(r[ti]);
+  if(e===null)return;
+  any=true;
+  var k=new Date(e*1000).getUTCHours(),sv=si>=0?r[si]:'INFO';
+  b[k].n++;b[k].s[sv]=(b[k].s[sv]||0)+1;});
+ if(!any)return '<div class="empty">no dated rows</div>';
+ var max=0;
+ b.forEach(function(x){if(x.n>max)max=x.n;});
+ max=max||1;
+ var h='<div class="histo" style="height:'+h_px+'px">';
+ for(i=0;i<24;i++){
+  var tip=[];
+  SEV.forEach(function(sv){if(b[i].s[sv])tip.push(b[i].s[sv]+' '+sv);});
+  h+='<div class="col" title="'+esc((i<10?'0':'')+i+':00 UTC  -  '+
+     (tip.join(', ')||'0'))+'">';
+  for(var j=SEV.length-1;j>=0;j--){
+   var c=b[i].s[SEV[j]];
+   if(c)h+='<div class="seg" style="height:'+(c*100/max)+'%;background:var(--'+
+     SEV[j]+')"></div>';}
+  h+='</div>';}
+ return h+'</div><div class="axis"><span>00:00</span><span>06:00</span>'+
+   '<span>12:00</span><span>18:00</span><span>23:00</span></div>';
+}
+/* A pair may carry a third element, a severity, and a bar that has one is
+   tinted with it. Length alone ranks by how often a name was seen, which puts
+   a noisy LOW above the single CRITICAL hit that is the reason to look. */
 function barList(pairs,act,lab){
  if(!pairs.length)return '<div class="empty">nothing</div>';
- var max=pairs[0][1]||1,h='<div class="bars">';
+ /* the largest value, not the first one: a list ranked by severity rather
+    than by length puts a short bar at the head, and scaling to it draws every
+    longer bar past the full width of its own track */
+ var max=1,h='<div class="bars">';
+ pairs.forEach(function(p){if(p[1]>max)max=p[1];});
  pairs.forEach(function(p){
+  var tint=p[2]?';background:var(--'+p[2]+');opacity:.32':'';
   h+='<div class="bar" data-k="'+esc(p[0])+'" data-act="'+(act||'')+'">'+
      '<div class="lbl"><div class="fill" style="width:'+
-     Math.max(2,Math.round(p[1]*100/max))+'%"></div>'+
+     Math.max(2,Math.round(p[1]*100/max))+'%'+tint+'"></div>'+
      '<div class="tx">'+esc((lab?lab(p[0]):p[0])||'(none)')+'</div></div>'+
      '<div class="n">'+p[1]+'</div></div>';});
  return h+'</div>';
 }
+function uniq(a){
+ var seen={},out=[];
+ a.forEach(function(x){if(!seen[x]){seen[x]=1;out.push(x);}});
+ return out;
+}
+/* Seven days by twenty-four hours. This is the shape a single hour profile
+   cannot show: a job that runs every night at 03:00 draws a column, a weekend
+   intrusion draws two rows, and a one-off draws a single cell. Intensity is
+   volume and the colour is the worst severity in the cell, because the quiet
+   cell holding the only CRITICAL row is the one worth finding.
+
+   sqrt on the intensity, not a linear ramp: one artifact that logs every
+   minute sets max for the whole grid, and everything else would sit at the
+   same invisible floor under it. */
+var DAYS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+function heat(rows,ti,si){
+ var g=[],d,i,any=false,max=0;
+ for(d=0;d<7;d++){g.push([]);for(i=0;i<24;i++)g[d].push({n:0,s:'INFO'});}
+ rows.forEach(function(r){
+  var e=ts(r[ti]);
+  if(e===null)return;
+  any=true;
+  var dt=new Date(e*1000),c=g[(dt.getUTCDay()+6)%7][dt.getUTCHours()];
+  c.n++;
+  if(c.n>max)max=c.n;
+  var sv=si>=0?r[si]:'INFO';
+  if(sevRank(sv)<sevRank(c.s))c.s=sv;});
+ if(!any)return '<div class="empty">no dated rows</div>';
+ var h='<div class="heat">';
+ for(d=0;d<7;d++){
+  h+='<div class="d">'+DAYS[d]+'</div>';
+  for(i=0;i<24;i++){
+   var c=g[d][i];
+   var sty=c.n?' style="background:var(--'+c.s+');opacity:'+
+     (0.2+0.8*Math.sqrt(c.n/max)).toFixed(2)+'"':'';
+   h+='<div class="c'+(c.n?' on':'')+'"'+sty+' title="'+
+      esc(DAYS[d]+' '+(i<10?'0':'')+i+':00 UTC  -  '+c.n+' row(s)'+
+          (c.n?', worst '+c.s:''))+'"></div>';}}
+ return h+'<div class="hx"><span>00</span><span>06</span><span>12</span>'+
+   '<span>18</span><span>23</span></div></div>';
+}
+/* One row per distinct value of `col`, as [value, hits, worst severity].
+   HACKTOOL_HITS, SIGMA_MATCHES and YARA_MATCHES are the same shape - a name,
+   a severity, and a whole-collection count repeated on every sample row - so
+   one reader serves all three rather than three that drift apart.
+
+   The count is taken, not summed: it already covers every reference, and the
+   table keeps only a sample of the rows, so summing would report a tool seen
+   40 times as seen 480. A table without the column is ranked by how many rows
+   it actually carries instead. */
+function rank(name,col){
+ var t=TB[name];
+ if(!t)return [];
+ var vi=ci(t,col),ni=ci(t,'count'),si=ci(t,'severity');
+ if(vi<0)return [];
+ var m={},sev={},out=[],k;
+ t.rows.forEach(function(r){
+  var v=r[vi];
+  if(!v)return;
+  if(ni>=0){
+   var n=parseInt(r[ni],10);
+   if(!(n>0))n=1;
+   if(m[v]===undefined||n>m[v])m[v]=n;
+  }else{m[v]=(m[v]||0)+1;}
+  if(si>=0&&(sev[v]===undefined||sevRank(r[si])<sevRank(sev[v])))sev[v]=r[si];});
+ for(k in m)out.push([k,m[k],sev[k]||'INFO']);
+ out.sort(function(a,b){
+  var d=sevRank(a[2])-sevRank(b[2]);
+  return d?d:b[1]-a[1];});
+ return out;
+}
+function toolPairs(){return rank(HT,'tool');}
+/* The named-hit grids the overview ranks, beyond the tooling panel that leads
+   it. A table that was not built simply has no panel. */
+var RANKED=[['SIGMA_MATCHES','rule','Sigma rules fired'],
+            ['YARA_MATCHES','rule','YARA rules matched'],
+            ['IOC_HITS','indicator','Pivot indicators']];
 function tally(list,fn){
  var m={},out=[],k;
  list.forEach(function(x){
@@ -15332,24 +16138,207 @@ function tally(list,fn){
  return out;
 }
 
+
+/* ---------- the calendar ---------- */
+/* A month grid rather than a native date input, for one reason: this one can
+   shade the days that actually carry evidence. A collection is mostly empty
+   days and three loud ones, and "which days is there anything on" is the
+   question a reader has before they can pick a window at all - a native
+   picker shows a blank month and leaves them guessing.
+
+   The boxes stay typeable. The calendar is the way in; '-24h' is still the
+   fastest way to say the last day, and taking that away to force clicking
+   would be a worse control, not a better one. */
+var CALFOR=null,CALMON=null,CALH=0,CALM=0;
+var WD=['Mo','Tu','We','Th','Fr','Sa','Su'];
+var MON=['January','February','March','April','May','June','July','August',
+         'September','October','November','December'];
+function p2(x){return (x<10?'0':'')+x;}
+function ymd(y,m,d){return y+'-'+p2(m+1)+'-'+p2(d);}
+/* Rows per UTC day, for the shading. Read off the same table the activity
+   chart is drawn from, so the calendar and the chart cannot disagree about
+   where the evidence is. */
+var DAYN=null;
+function dayCounts(){
+ if(DAYN)return DAYN;
+ DAYN={max:0,n:{}};
+ var t=vt('timeline')||vt('findings');
+ if(!t)return DAYN;
+ var tc=tcols(t);
+ t.rows.forEach(function(r){
+  var sp=rowSpan(tc,r);
+  if(!sp)return;
+  var d=new Date(sp[0]*1000);
+  var k=ymd(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate());
+  DAYN.n[k]=(DAYN.n[k]||0)+1;
+  if(DAYN.n[k]>DAYN.max)DAYN.max=DAYN.n[k];});
+ return DAYN;
+}
+/* The month to open on: the end of the value already in the box, else the
+   month the evidence ends in. Never the reader's current month - a
+   collection from three years ago would open on an empty grid. */
+function calMonthFor(which){
+ var v=parseWhen(el(which)?el(which).value:'',which==='t1');
+ if(v===null||v===undefined)v=dataMax()||Math.floor(Date.now()/1000);
+ var d=new Date(v*1000);
+ return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),1)/1000;
+}
+function calHtml(){
+ var d0=new Date(CALMON*1000),y=d0.getUTCFullYear(),m=d0.getUTCMonth();
+ var first=(new Date(Date.UTC(y,m,1)).getUTCDay()+6)%7;   /* Monday-first */
+ var days=new Date(Date.UTC(y,m+1,0)).getUTCDate();
+ var dc=dayCounts(),i;
+ var h='<div class="hd"><button class="nav" data-mv="-1">&lsaquo;</button>'+
+   '<b>'+MON[m]+' '+y+'</b>'+
+   '<button class="nav" data-mv="1">&rsaquo;</button></div><div class="grid">';
+ WD.forEach(function(w){h+='<div class="wd">'+w+'</div>';});
+ for(i=0;i<first;i++)h+='<div class="d pad"></div>';
+ for(i=1;i<=days;i++){
+  var k=ymd(y,m,i),n=dc.n[k]||0;
+  /* the day's start and end, to say whether it is inside the window */
+  var s0=Date.UTC(y,m,i)/1000,s1=s0+86399;
+  var inWin=winOn()&&!(st.t1!==null&&s0>st.t1)&&!(st.t0!==null&&s1<st.t0);
+  var edge=winOn()&&((st.t0!==null&&st.t0>=s0&&st.t0<=s1)||
+                     (st.t1!==null&&st.t1>=s0&&st.t1<=s1));
+  var cls='d'+(n?'':' none')+(inWin?' in':'')+(edge?' edge':'');
+  h+='<div class="'+cls+'" data-d="'+k+'" title="'+esc(k+' \u2014 '+
+     (n?n.toLocaleString()+' row(s)':'nothing'))+'">'+
+     (n?'<div class="lvl" style="opacity:'+
+        (0.16+0.5*Math.sqrt(n/(dc.max||1))).toFixed(2)+'"></div>':'')+
+     '<span>'+i+'</span></div>';}
+ h+='</div><div class="ft"><span class="lb">time</span>'+
+    '<select id="calh">';
+ for(i=0;i<24;i++)h+='<option value="'+i+'"'+(i===CALH?' selected':'')+'>'+
+   p2(i)+'</option>';
+ h+='</select><span class="lb">:</span><select id="calm">';
+ for(i=0;i<60;i++)h+='<option value="'+i+'"'+(i===CALM?' selected':'')+'>'+
+   p2(i)+'</option>';
+ h+='</select><span class="lb">UTC</span></div>';
+ h+='<div class="pre"><button data-pre="24h">last 24h</button>'+
+    '<button data-pre="7d">7d</button><button data-pre="30d">30d</button>'+
+    '<button data-pre="all">all</button></div>';
+ return h;
+}
+function calRender(){
+ var c=el('cal');
+ if(!c)return;
+ c.innerHTML=calHtml();
+ [].forEach.call(c.querySelectorAll('[data-mv]'),function(b){
+  b.onclick=function(){
+   var d=new Date(CALMON*1000);
+   CALMON=Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+(+b.getAttribute('data-mv')),1)/1000;
+   calRender();};});
+ [].forEach.call(c.querySelectorAll('.d[data-d]'),function(x){
+  x.onclick=function(){calPick(x.getAttribute('data-d'));};});
+ var hh=el('calh'),mm=el('calm');
+ /* changing the time re-applies it to the day already chosen, so the boxes
+    never disagree with the selects sitting above them */
+ if(hh)hh.onchange=function(){CALH=+hh.value;calRetime();};
+ if(mm)mm.onchange=function(){CALM=+mm.value;calRetime();};
+ [].forEach.call(c.querySelectorAll('[data-pre]'),function(b){
+  b.onclick=function(){calPreset(b.getAttribute('data-pre'));};});
+}
+function calOpen(which){
+ var i=el(which),c=el('cal');
+ if(!i||!c)return;
+ CALFOR=which;
+ CALMON=calMonthFor(which);
+ /* a 'to' bound defaults to the end of its day, a 'from' bound to the start:
+    picking one day at each end should mean that whole day */
+ var cur=/(\\d\\d):(\\d\\d)/.exec(i.value||'');
+ CALH=cur?+cur[1]:(which==='t1'?23:0);
+ CALM=cur?+cur[2]:(which==='t1'?59:0);
+ calRender();
+ var r=i.getBoundingClientRect();
+ c.style.left=Math.max(6,Math.min(r.left,
+   (window.innerWidth||900)-252))+'px';
+ c.style.top=(r.bottom+6)+'px';
+ c.classList.add('open');
+}
+function calClose(){
+ var c=el('cal');
+ if(c)c.classList.remove('open');
+ CALFOR=null;
+}
+function calWrite(text){
+ var i=el(CALFOR);
+ if(!i)return;
+ i.value=text;
+ readWin();
+}
+function calPick(k){
+ if(!CALFOR)return;
+ calWrite(k+' '+p2(CALH)+':'+p2(CALM));
+ calRender();          /* repaint so the new window shows in the grid */
+}
+function calRetime(){
+ var i=el(CALFOR);
+ if(!i)return;
+ var m=/^(\\d{4}-\\d\\d-\\d\\d)/.exec(i.value||'');
+ if(m)calWrite(m[1]+' '+p2(CALH)+':'+p2(CALM));
+}
+/* The presets set both ends at once, so they close the popover: there is
+   nothing left to pick. */
+function calPreset(kind){
+ if(kind==='all'){setWin(null,null);calClose();return;}
+ var end=dataMax();
+ if(!end){calClose();return;}
+ var back={'24h':86400,'7d':604800,'30d':2592000}[kind];
+ setWin(end-back,end);
+ calClose();
+}
+
+
 /* ---------- overview ---------- */
 function viewOverview(){
- var f=fc(),fs=frows(),tl=vt('timeline'),io=vt('iocs');
- var h='<h2>Overview</h2><div class="cards">';
- SEV.forEach(function(s){
+ var f=fc(),fs=frows(),tl=vt('timeline'),tp=toolPairs();
+ var techs=f?tally(fs,function(r){return techsOf(r[f.mitre]);}):[];
+ var h='<h2>Overview</h2>'+(winOn()?'<div class="pills"><span class="pill" '+
+   'data-winclear="1">time window: '+esc(fmtWin())+' &times;</span></div>':'')+
+   '<div class="cards">';
+ if(f)SEV.forEach(function(s){
   var n=fs.filter(function(r){return r[f.severity]===s;}).length;
   h+='<div class="card" data-sev="'+s+'" style="border-top-color:var(--'+s+')">'+
      '<b style="color:var(--'+s+')">'+n+'</b><span>'+s+'</span></div>';});
+ if(tp.length)h+='<div class="card" data-tbl="'+HT+
+    '" style="border-top-color:var(--CRITICAL)"><b>'+tp.length.toLocaleString()+
+    '</b><span>OFFENSIVE TOOLS</span></div>';
+ if(techs.length)h+='<div class="card" data-go="attack" '+
+    'style="border-top-color:var(--accent)"><b>'+techs.length.toLocaleString()+
+    '</b><span>TECHNIQUES</span></div>';
  if(tl)h+='<div class="card" data-go="timeline" style="border-top-color:var(--gold)">'+
     '<b>'+tl.row_count.toLocaleString()+'</b><span>TIMELINE EVENTS</span></div>';
- if(io)h+='<div class="card" data-go="iocs" style="border-top-color:var(--accent)">'+
-    '<b>'+io.row_count.toLocaleString()+'</b><span>INDICATORS</span></div>';
  h+='</div>';
 
- h+='<div class="grid2"><div><h3>Activity</h3>';
- h+=tl?histo(tl.rows,ci(tl,'timestamp_utc'),ci(tl,'severity'),60,88,false).html
-      :'<div class="empty">no timeline</div>';
- h+='</div><div><h3>Collection</h3><table class="meta">';
+ /* The tooling ranking leads, because it is the one panel that names a thing
+    rather than counting one: 'nmap, linpeas, chisel' is a sentence about the
+    host, where a severity total is a sentence about the report. */
+ if(tp.length)h+='<h3>Offensive tooling <span class="count">&mdash; click a '+
+    'tool for its hits</span></h3>'+barList(tp.slice(0,12),'tool');
+
+ /* Two clocks side by side. The left is what the collection recorded, the
+    right is what the analysis raised out of it - a spike of log volume with
+    no findings under it reads nothing like the reverse, and neither shape is
+    visible in the other chart. */
+ h+='<div class="grid2"><div><h3>Activity <span class="count">&mdash; click a '+
+    'column to narrow the time window, shift-click to extend</span></h3>'+
+    (tl?histo(tl.rows,ci(tl,'timestamp_utc'),ci(tl,'severity'),60,88,true).html
+       :'<div class="empty">no timeline</div>')+'</div>';
+ h+='<div><h3>Findings over time</h3>'+
+    (f&&f.first_utc>=0&&fs.length
+      ?histo(fs,f.first_utc,f.severity,60,88,false).html
+      :'<div class="empty">no dated findings</div>')+'</div></div>';
+
+ /* The same rows on a week's clock face. The hour profile beside it answers
+    'what is the daily rhythm'; this answers 'which day and hour exactly',
+    which is the question asked of an out-of-hours login. */
+ if(tl)h+='<h3>When it happened <span class="count">&mdash; day of week by '+
+    'hour, UTC</span></h3>'+heat(tl.rows,ci(tl,'timestamp_utc'),ci(tl,'severity'));
+
+ h+='<div class="grid2"><div><h3>Activity by hour (UTC)</h3>'+
+    (tl?hourly(tl.rows,ci(tl,'timestamp_utc'),ci(tl,'severity'),88)
+       :'<div class="empty">no timeline</div>')+'</div>';
+ h+='<div><h3>Collection</h3><table class="meta">';
  D.meta.forEach(function(kv){
   h+='<tr><td>'+esc(kv[0])+'</td><td>'+esc(kv[1])+'</td></tr>';});
  h+='</table></div></div>';
@@ -15357,10 +16346,32 @@ function viewOverview(){
  h+='<div class="grid2"><div><h3>Categories</h3>'+
     barList(tally(fs,function(r){return r[f.category];}).slice(0,14),'cat')+'</div>';
  h+='<div><h3>Techniques</h3>'+
-    barList(tally(fs,function(r){return techsOf(r[f.mitre]);}).slice(0,14),
-            'tech',techLabel)+'</div></div>';
+    barList(techs.slice(0,14),'tech',techLabel)+'</div></div>';
+
+ h+='<div class="grid2"><div><h3>Tactics</h3>'+
+    barList(tally(fs,function(r){
+     return uniq(techsOf(r[f.mitre]).map(tacticOf));}).slice(0,14),'tac')+'</div>';
  h+='<div><h3>Loudest artifacts</h3>'+
-    barList(tally(fs,function(r){return r[f.artifact];}).slice(0,10),'')+'</div>';
+    barList(tally(fs,function(r){return r[f.artifact];}).slice(0,14),'')+
+    '</div></div>';
+
+ /* What the rule engines and the pivot actually fired on, each ranked out of
+    its own grid and each bar a click into that grid, filtered to the row it
+    names. A panel appears only when its table was built. */
+ var last=[];
+ RANKED.forEach(function(p){
+  var pr=rank(p[0],p[1]);
+  if(pr.length)last.push('<div><h3>'+esc(p[2])+'</h3>'+
+   barList(pr.slice(0,12),'tbl:'+p[0])+'</div>');});
+ /* Where the evidence actually is. The nav carries a row count per table, but
+    sorted by category rather than by size - and 'which of these 88 grids is
+    worth opening' is answered by the size. */
+ var big=IDX.filter(function(t){return !isView(t)&&t.rows;})
+    .map(function(t){return [t.name,t.rows];})
+    .sort(function(a,b){return b[1]-a[1];}).slice(0,12);
+ if(big.length)last.push('<div><h3>Largest tables</h3>'+
+   barList(big,'open')+'</div>');
+ if(last.length)h+='<div class="grid2">'+last.join('')+'</div>';
  return h;
 }
 function techLabel(t){
@@ -15421,19 +16432,14 @@ function viewHead(){
  }else if(st.view==='timeline'){
   var t=TB[st.table];
   /* Drawn from what the chips, the row filter and the column filters left,
-     but never from the bucket: picking a spike must not hide the shape the
+     but never from the window: picking a spike must not hide the shape the
      spike sits in. */
-  var g=histo(tMatching(t,true),ci(t,'timestamp_utc'),ci(t,'severity'),80,132,true);
-  TLB=g.b;
-  h+=g.html;
-  if(st.bucket!=null&&TLB[st.bucket])
-   h+='<div class="pills"><span class="pill" data-clear="bucket">'+
-      esc(fmtT(TLB[st.bucket].t0)+' - '+fmtT(TLB[st.bucket].t1))+
-      ' &times;</span></div>';
+  h+=histo(tMatching(t,true),ci(t,'timestamp_utc'),ci(t,'severity'),80,132,true).html;
  }
+ if(winOn())h+='<div class="pills"><span class="pill" data-winclear="1">'+
+   'time window: '+esc(fmtWin())+' &times;</span></div>';
  return h;
 }
-var TLB=[];   /* the timeline chart's bucket bounds, from the last render */
 
 /* The finding under the cursor, read out of the row itself - the grid holds
    every column the detail pane needs, evidence included. */
@@ -15465,15 +16471,30 @@ function detailHtml(){
 }
 
 /* ---------- nav ---------- */
-/* Views first, then every remaining table under its category. The three
-   analysis tables are not listed twice - they are the views above. */
+/* Views first, then the pinned offensive-tool grids, then every remaining
+   table under its category. The analysis tables are not listed twice - they
+   are the views above. */
+function navRow(t){
+ return '<a class="tbl" data-t="'+esc(t.name)+'" title="'+esc(t.title)+'"><span>'+
+   esc(t.name)+'</span><span class="n">'+t.rows.toLocaleString()+'</span></a>';
+}
 function buildNav(){
  var h='';
- if(fc()||vt('timeline')||vt('iocs')){
+ if(fc()||vt('timeline')){
   VIEWS.forEach(function(v){
    var t=vt(v[0]),n=t?'<span class="n">'+t.row_count.toLocaleString()+'</span>':'';
    h+='<a data-v="'+v[0]+'">'+v[1]+n+'</a>';});}
  var rest=IDX.filter(function(t){return !isView(t);});
+ /* PIN order, not index order: HACKTOOL_HITS is the list of references and
+    HACKTOOL_VARIANTS is that list rolled up, so the roll-up reads as a
+    summary of the row above it rather than as a separate table. */
+ var pin=[];
+ PIN.forEach(function(nm){
+  rest.forEach(function(t){if(t.name===nm)pin.push(t);});});
+ rest=rest.filter(function(t){return PIN.indexOf(t.name)<0;});
+ if(pin.length){
+  h+='<div class="sec"></div><div class="cat">Offensive tooling</div>';
+  pin.forEach(function(t){h+=navRow(t);});}
  if(rest.length){
   var byCat={},order=[];
   rest.forEach(function(t){
@@ -15482,10 +16503,7 @@ function buildNav(){
   h+='<div class="sec"></div>';
   order.forEach(function(c){
    h+='<div class="cat">'+esc(c||'Other')+'</div>';
-   byCat[c].forEach(function(t){
-    h+='<a class="tbl" data-t="'+esc(t.name)+'" title="'+esc(t.title)+'"><span>'+
-       esc(t.name)+'</span><span class="n">'+t.rows.toLocaleString()+
-       '</span></a>';});});}
+   byCat[c].forEach(function(t){h+=navRow(t);});});}
  el('nav').innerHTML=h;
  [].forEach.call(document.querySelectorAll('nav a'),function(a){
   a.onclick=function(){
@@ -15503,7 +16521,19 @@ function render(){
  wire();
  markNav();
 }
+/* Open an artifact grid with its row filter already typed in. A tool bar in
+   the overview is a question about one tool, and landing on the unfiltered
+   table leaves the reader to retype the name they just clicked. */
+function goTable(name,q){
+ if(!TB[name])return;
+ st.table=name;sortCol=-1;colFilters=[];st.tq=q||'';
+ st.view='table';
+ location.hash='t/'+name;
+ render();
+}
 function wire(){
+ wireHisto();
+ wireWin();
  [].forEach.call(document.querySelectorAll('[data-tech]'),function(x){
   x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
  [].forEach.call(document.querySelectorAll('.card[data-sev]'),function(cd){
@@ -15513,27 +16543,65 @@ function wire(){
    chips();setView('findings');};});
  [].forEach.call(document.querySelectorAll('.card[data-go]'),function(cd){
   cd.onclick=function(){setView(cd.getAttribute('data-go'));};});
+ [].forEach.call(document.querySelectorAll('.card[data-tbl]'),function(cd){
+  cd.onclick=function(){goTable(cd.getAttribute('data-tbl'),'');};});
  [].forEach.call(document.querySelectorAll('.bar[data-act]'),function(b){
   b.onclick=function(){
    var a=b.getAttribute('data-act'),k=b.getAttribute('data-k');
    if(a==='cat'){st.cat=k;setView('findings');}
-   else if(a==='tech'){st.tech=k;setView('findings');}};});
+   else if(a==='tech'){st.tech=k;setView('findings');}
+   /* A tactic is not a findings filter - the matrix is the view that draws
+      one, so the click lands there rather than on a filter that cannot be
+      expressed. */
+   else if(a==='tac'){setView('attack');}
+   else if(a==='tool'){goTable(HT,k);}
+   /* 'tbl:NAME' carries its own destination, so one handler serves every
+      ranked panel and a new panel needs no new branch here. */
+   else if(a.indexOf('tbl:')===0){goTable(a.slice(4),k);}
+   else if(a==='open'){goTable(k,'');}};});
 }
 function start(){
  chips();
  buildNav();
+ /* Wired once and never rebuilt: these live in the header, outside main, so
+    they keep their text and their caret across every render - the same reason
+    the per-column filter inputs are left alone by tRefresh. */
+ ['t0','t1'].forEach(function(id){
+  var i=el(id);
+  if(!i)return;
+  i.oninput=function(){readWin();if(CALFOR===id)calRender();};
+  i.onfocus=function(){calOpen(id);};
+  i.onclick=function(ev){(ev||window.event).stopPropagation();calOpen(id);};});
+ var tc=el('tclr');
+ if(tc)tc.onclick=function(){setWin(null,null);calClose();};
+ /* The popover eats its own clicks, so the handler below only ever sees the
+    ones that really are outside it.
+
+    This cannot be done by walking up from ev.target instead: every control in
+    here re-renders the grid, which replaces the popover's innerHTML and
+    detaches the very node that was clicked. The walk then finds no parent, the
+    click reads as 'outside', and stepping to the previous month closed the
+    calendar. The event path is fixed when the event is dispatched, so this
+    listener still runs on a node that has since been thrown away. */
+ var cw=el('cal');
+ if(cw)cw.onclick=function(ev){(ev||window.event).stopPropagation();};
+ document.addEventListener('click',function(){
+  var c=el('cal');
+  if(c&&c.classList.contains('open'))calClose();});
  var v=(location.hash||'').replace('#','');
  if(v.indexOf('t/')===0&&TB[v.slice(2)])setView('table',v.slice(2));
- else if(['overview','findings','attack','timeline','iocs'].indexOf(v)>=0&&
+ else if(['overview','findings','attack','timeline'].indexOf(v)>=0&&
          (fc()||vt('timeline')))setView(v);
- else if(fc()||vt('timeline')||vt('iocs'))setView('overview');
+ else if(fc()||vt('timeline'))setView('overview');
  else if(IDX.length)setView('table',IDX[0].name);
  document.onkeydown=function(e){
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
   var k=e.key;
   if(k==='/'){var q=el('q');if(q){q.focus();e.preventDefault();}}
-  if(k>='1'&&k<='5'&&fc())setView(['overview','findings','attack','timeline',
-   'iocs'][+k-1]);
+  if(k==='t'){var tb=el('t0');if(tb){tb.focus();calOpen('t0');e.preventDefault();}}
+  if(k==='Escape'&&CALFOR)calClose();
+  if(k>='1'&&k<='4'&&fc())setView(['overview','findings','attack',
+   'timeline'][+k-1]);
   /* j/k walk the rows of whichever grid is open, the way the console report
      is read - and in the findings view that moves the detail pane with it. */
   if(k==='j'||k==='k'){
@@ -15594,7 +16662,10 @@ function tSortRows(rows){
    own column. They combine with AND, which is what makes them worth having
    separately - 'sshd' anywhere plus user=root is a different question from
    either on its own. */
-function tMatching(t,noBucket){
+/* `raw` skips nothing any more except the caller's own reason for asking:
+   the timeline chart passes it so that it draws the shape the window was
+   picked out of rather than only the window. */
+function tMatching(t,raw){
  var q=(st.tq||'').toLowerCase();
  var rows=t.rows;
  if(q){rows=rows.filter(function(r){return r.join(' ').toLowerCase().indexOf(q)>=0;});}
@@ -15612,6 +16683,12 @@ function tMatching(t,noBucket){
     whose chips disagree with its own table is worse than no chips at all.
     Only the three console tables answer to them - an artifact grid that
     happens to carry a severity column is not the findings list. */
+ /* Before the view-only filters, and outside the isView() guard: the window
+    is the one filter that applies to an artifact grid as much as to the
+    findings list. */
+ if(winOn()&&!raw){
+  var tc=tcols(t);
+  if(tc.any)rows=rows.filter(function(r){return inWindow(tc,r);});}
  var v=isView(t);
  if(v){
   var si=t.columns.indexOf('severity');
@@ -15621,11 +16698,7 @@ function tMatching(t,noBucket){
    if(st.cat)rows=rows.filter(function(r){return r[f.category]===st.cat;});
    if(st.tech)rows=rows.filter(function(r){
     return techsOf(r[f.mitre]).indexOf(st.tech)>=0;});}
-  if(v==='timeline'&&!noBucket&&st.bucket!=null&&TLB[st.bucket]){
-   var ti=t.columns.indexOf('timestamp_utc'),bk=TLB[st.bucket];
-   if(ti>=0)rows=rows.filter(function(r){
-    var e=ts(r[ti]);
-    return e!==null&&e>=bk.t0&&(e<bk.t1||st.bucket===TLB.length-1);});}}
+  }
  if(sortCol>=0){rows=tSortRows(rows);}
  TLAST=rows;
  return rows;
@@ -15660,12 +16733,34 @@ function tBodyHtml(t,rows,cap){
 /* Only the tbody and the counters are rebuilt, never the filter inputs:
    replacing an input while it has focus loses the caret, which makes it
    impossible to type more than one character into a filter. */
+/* Why a grid is empty, when the answer is 'the header chips', not 'the data'.
+   A table can legitimately hold no rows at one severity - isolate CRITICAL on
+   a collection whose criticals are all undated and the timeline has nothing
+   to show - and 'No rows match.' reads as a broken page rather than as an
+   answer. Say which severities are on, what the table does hold, and offer
+   the way out. */
+function emptyNote(t){
+ var plain='No rows match.';
+ if(!t)return plain;
+ var si=t.columns.indexOf('severity');
+ if(si<0||!isView(t))return plain;
+ var on=SEV.filter(function(s){return st.sev[s];});
+ if(!on.length)return 'Every severity is switched off in the header.'+
+   ' <span class="pill" id="allsev">show all &times;</span>';
+ if(on.length===SEV.length)return plain;
+ var have={};
+ t.rows.forEach(function(r){have[r[si]]=(have[r[si]]||0)+1;});
+ if(on.some(function(s){return have[s];}))return plain;
+ return 'No '+on.join(' / ')+' rows in '+esc(t.name)+'. It holds '+
+   t.row_count.toLocaleString()+' row(s) at other severities. '+
+   '<span class="pill" id="allsev">show all severities &times;</span>';
+}
 function tRefresh(){
  var t=TB[st.table];if(!t){return;}
  var rows=tMatching(t);
  var cap=rows.length>t.cap?t.cap:rows.length;
  var tb=document.getElementById('tb');
- if(tb){tb.innerHTML=tBodyHtml(t,rows,cap);}
+ if(tb){tb.innerHTML=tBodyHtml(t,rows,cap);wireRows();}
  var mn=document.getElementById('matchn');
  if(mn){mn.textContent=rows.length.toLocaleString()+' matching';}
  var note=document.getElementById('note');
@@ -15673,7 +16768,8 @@ function tRefresh(){
   ' of '+rows.length.toLocaleString()+' matching rows. Narrow the filter, or use'+
   ' the CSV / JSON export for everything.':'';}
  var none=document.getElementById('none');
- if(none){none.style.display=rows.length?'none':'block';}
+ if(none){none.style.display=rows.length?'none':'block';
+  if(!rows.length){none.innerHTML=emptyNote(t);wireEmpty();}}
  /* The chart follows the filter, but the box being typed into must not be
     rebuilt - so the head is replaced and re-wired while the input above it
     is left exactly where it is, caret included. */
@@ -15693,7 +16789,8 @@ function tRender(){
  h+='<div class="controls"><input type="search" id="q" placeholder="filter rows '+
     'in this table..." value="'+esc(st.tq||'')+'"><span class="badge">'+t.row_count.toLocaleString()+
     ' rows total</span><span class="badge" id="matchn">'+rows.length.toLocaleString()+
-    ' matching</span><button class="clr" id="clr">clear filters</button>';
+    ' matching</span><button class="clr" id="clr">clear filters</button>'+
+    winBadge(t);
  if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
    t.rows.length.toLocaleString()+' \\u2014 full data in the CSV / JSON export</span>';}
  h+='</div>';
@@ -15703,8 +16800,9 @@ function tRender(){
  lay=tLayout(t,rows.length?rows:t.rows,Math.max(cap,1));
  /* table-layout:fixed only honours the <colgroup> if the table itself has a
     width. Left to 'auto' the browser falls back to shrink-to-fit and sizes
-    column 1 from its content - which is how IOCS ended up with a 3567px
-    'indicator' beside a 58px 'seen_in'. Sum the columns and say so. */
+    column 1 from its content - which is how a table of one long field and
+    one short one ended up 3567px wide beside a 58px column. Sum the columns
+    and say so. */
  var total=0,elastic=-1,widest=0;
  lay.forEach(function(L,i){total+=L.w;
   /* only a wrapping column is a candidate: extra width buys it another line
@@ -15739,39 +16837,80 @@ function tRender(){
      '"></th>';});
  h+='</tr></thead><tbody id="tb">'+tBodyHtml(t,rows,cap)+'</tbody></table>'+lists;
  h+='<div class="empty" id="none"'+(rows.length?' style="display:none"':'')+
-    '>No rows match.</div>';
+    '>'+(rows.length?'No rows match.':emptyNote(t))+'</div>';
  h+='<p class="desc" id="note">'+(rows.length>cap?'Showing first '+cap.toLocaleString()+
   ' of '+rows.length.toLocaleString()+' matching rows. Narrow the filter, or use'+
   ' the CSV / JSON export for everything.':'')+'</p>';
  document.getElementById('main').innerHTML=h;
  tWire();
+ wireEmpty();
+ wireWin();
+}
+/* A histogram column is a time range. Clicking one narrows the window to it;
+   shift-clicking extends the window to cover both ends, which is how a span
+   wider than one bucket is picked without a drag. Clicking the lit column
+   again lets go. */
+function wireHisto(){
+ [].forEach.call(document.querySelectorAll('.histo.click .col'),function(c){
+  c.onclick=function(ev){
+   ev=ev||window.event;
+   var b=HB[+c.getAttribute('data-b')];
+   if(!b)return;
+   /* the bucket's own end is the next bucket's start, so a hair is taken off
+      it - otherwise a row landing exactly on the boundary is in both */
+   var lo=b.t0,hi=b.t1-0.001;
+   if(ev&&ev.shiftKey&&winOn()){
+    if(st.t0!==null&&st.t0<lo)lo=st.t0;
+    if(st.t1!==null&&st.t1>hi)hi=st.t1;
+   }else if(st.t0===lo&&st.t1===hi){lo=null;hi=null;}
+   setWin(lo,hi);};});
+}
+/* Every 'clear the window' control, wherever it was drawn. */
+function wireWin(){
+ [].forEach.call(document.querySelectorAll('[data-winclear]'),function(x){
+  x.onclick=function(){setWin(null,null);};});
+}
+/* The way out of a filter that emptied the grid, offered by emptyNote(). */
+function wireEmpty(){
+ var a=document.getElementById('allsev');
+ if(a)a.onclick=function(){
+  SEV.forEach(function(s){st.sev[s]=true;});
+  chips();tRender();};
 }
 /* Handlers for everything viewHead() drew: the histogram columns, the filter
    pills and the detail pane's close control. */
 function wireHead(){
- [].forEach.call(document.querySelectorAll('.histo.click .col'),function(c){
-  c.onclick=function(){
-   var i=+c.getAttribute('data-b');
-   st.bucket=(st.bucket===i)?null:i;tRender();};});
+ wireHisto();
+ wireWin();
  [].forEach.call(document.querySelectorAll('#vhead [data-clear]'),function(x){
   var k=x.getAttribute('data-clear');
   x.onclick=function(){st[k]=(k==='bucket'||k==='sel')?null:'';tRender();};});
  [].forEach.call(document.querySelectorAll('#vhead [data-tech]'),function(x){
   x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
 }
+/* A findings row opens itself in the detail pane; every other grid is read in
+   place, so a click there would only take the row out from under you.
+
+   This is its own function because tRefresh() replaces the whole tbody - on
+   every keystroke in the row filter, every column filter and every sort - and
+   the handlers go with the elements they were attached to. Wiring the rows
+   only in tWire() left every grid dead the moment it was filtered: the rows
+   redrew, the click did nothing, and the evidence pane kept showing whatever
+   was open before. Anything that rebuilds the body must call this after. */
+function wireRows(){
+ if(isView(TB[st.table])!=='findings')return;
+ [].forEach.call(document.querySelectorAll('tbody tr'),function(tr){
+  tr.onclick=function(){
+   st.sel=TLAST[+tr.getAttribute('data-r')];
+   var vh=document.getElementById('vhead');
+   if(vh){vh.innerHTML=viewHead();wireHead();}
+   [].forEach.call(document.querySelectorAll('tbody tr.sel'),function(o){
+    o.classList.remove('sel');});
+   tr.classList.add('sel');};});
+}
 function tWire(){
  wireHead();
- /* A findings row opens itself in the detail pane; every other grid is read
-    in place, so a click there would only take the row out from under you. */
- if(isView(TB[st.table])==='findings'){
-  [].forEach.call(document.querySelectorAll('tbody tr'),function(tr){
-   tr.onclick=function(){
-    st.sel=TLAST[+tr.getAttribute('data-r')];
-    var vh=document.getElementById('vhead');
-    if(vh){vh.innerHTML=viewHead();wireHead();}
-    [].forEach.call(document.querySelectorAll('tbody tr.sel'),function(o){
-     o.classList.remove('sel');});
-    tr.classList.add('sel');};});}
+ wireRows();
  [].forEach.call(document.querySelectorAll('#hdr th'),function(th){
   th.onclick=function(){var i=+th.getAttribute('data-i');
    if(sortCol===i){sortAsc=!sortAsc;}else{sortCol=i;sortAsc=true;}
@@ -15810,9 +16949,9 @@ start();
 def _triage_payload(tri, opts):
     """The collection header the console shows beside its charts.
 
-    Everything else it needs - the findings, the timeline, the indicators -
-    is read out of the FINDINGS, TIMELINE and IOCS tables, which the builder
-    produces for the CSV and JSON exports anyway. Embedding a second copy for
+    Everything else it needs - the findings, the timeline, the offensive-tool
+    hits - is read out of the FINDINGS, TIMELINE and HACKTOOL_* tables, which
+    the builder produces for the CSV and JSON exports anyway. Embedding a second copy for
     the page to read would double the largest part of the file and give the
     two copies a way to disagree with each other.
     """
@@ -15831,6 +16970,9 @@ def main(argv=None):
                "  python linsight.py collection.tar.gz --html report.html --json out.json\n"
                "  python linsight.py ./coll --min-severity HIGH --timeline timeline.csv\n"
                "  python linsight.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3\n"
+               "  python linsight.py --file /var/log/auth.log\n"
+               "  python linsight.py --file ./loose-logs/ --file ps.txt\n"
+               "  python linsight.py --file capture.txt:/var/log/auth.log\n"
                "  python linsight.py ./coll --export ./triage_out\n"
                "  python linsight.py ./coll --csv-dir ./tables --quiet\n"
                "  python linsight.py ./coll --export ./live --scope live\n"
@@ -15838,6 +16980,16 @@ def main(argv=None):
                "  python linsight.py ./coll --update-sigma   # fetch SigmaHQ, then hunt\n"
                "  python linsight.py ./coll --sigma-cached   # hunt offline with the cache\n"
                "  python linsight.py --update-sigma          # refresh the cache only\n")
+    ap.add_argument("--file", dest="files", action="append", metavar="PATH[:DEST]",
+                    help="parse loose files instead of a collection. Repeatable, "
+                         "and PATH may be a directory. Each file is mounted at "
+                         "the path its parser looks for, chosen from the name "
+                         "('auth.log' -> /var/log/auth.log, 'ps.txt' -> the "
+                         "process listing); a directory whose top level looks "
+                         "like a host tree (etc/, var/, ...) is mounted as it "
+                         "stands. Append ':/host/path' to say what a file is "
+                         "when the name does not: "
+                         "--file capture.txt:/var/log/auth.log")
     ap.add_argument("collection", nargs="?",
                     help="collection directory, .tar, .tar.gz or .zip - UAC "
                          "output or a Velociraptor offline collector zip; the "
@@ -16032,18 +17184,33 @@ def main(argv=None):
             status("[*] sigma: cached %s" % opts.sigma_note)
         opts.sigma = (opts.sigma or []) + [cache]
 
-    if not opts.collection:
+    if opts.files and opts.collection:
+        ap.error("--file parses loose files instead of a collection; pass one "
+                 "or the other, not both")
+
+    if not opts.collection and not opts.files:
         if opts.update_sigma:
             return 0                    # a rule refresh on its own
-        ap.error("a collection is required (or --update-sigma on its own to "
-                 "refresh the rule cache)")
+        ap.error("a collection or --file is required (or --update-sigma on its "
+                 "own to refresh the rule cache)")
 
-    if not os.path.exists(opts.collection):
-        ap.error("collection not found: %s" % opts.collection)
-
-    col = Collection(opts.collection)
-    status("[*] loaded %s collection: %d files, root prefix '%s', rootfs dirs %s"
-          % (col.kind, len(col._names), col.prefix or "(none)", ", ".join(col.rootfs_dirs)))
+    if opts.files:
+        specs = []
+        for raw in opts.files:
+            path, dest = parse_file_spec(raw)
+            if not os.path.exists(path):
+                ap.error("--file not found: %s" % path)
+            specs.append((path, dest))
+        col = FilesCollection(specs, quiet=opts.quiet)
+        status("[*] loaded %d loose file(s) as a synthetic collection"
+               % len(col._names))
+    else:
+        if not os.path.exists(opts.collection):
+            ap.error("collection not found: %s" % opts.collection)
+        col = Collection(opts.collection)
+        status("[*] loaded %s collection: %d files, root prefix '%s', rootfs dirs %s"
+              % (col.kind, len(col._names), col.prefix or "(none)",
+                 ", ".join(col.rootfs_dirs)))
 
     _check_output_paths(col, opts)      # before any work, for every output flag
 

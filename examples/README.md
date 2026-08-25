@@ -21,6 +21,13 @@ python linsight.py C:\path\to\uac-ApacheWebServer-linux-20211208202503.tar \
 `browser.html` and `findings.html` are single files with no external assets:
 download and open, no server, no network.
 
+> **This snapshot predates the current build.** It was produced before the
+> console gained the time window and calendar, the reworked overview panels
+> and the pinned offensive-tooling grids, and before the `IOCS` table was
+> removed — so `tables/IOCS.csv` is here and `browser.html` shows the older
+> console. Regenerating it needs the original collection archive, which is
+> not in this repository.
+
 ## What it found
 
 ```
