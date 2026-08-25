@@ -575,5 +575,10 @@ def probe_xfs(volume):
     """An XfsFilesystem on this volume, or None."""
     try:
         return XfsFilesystem(volume)
-    except (XfsError, struct.error, ValueError):
+    except Exception:
+        # A superblock is attacker-influenced data and this is the
+        # boundary where a filesystem is either readable or not.
+        # Every failure means the same thing to the caller - it
+        # could not be opened - and none of them should escape as
+        # a traceback from the middle of a disk scan.
         return None

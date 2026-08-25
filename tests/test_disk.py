@@ -52,7 +52,7 @@ def load(built):
     import linsight.image, linsight.volume, linsight.disk        # noqa
     import linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs   # noqa
     import linsight.ad1, linsight.distro, linsight.common        # noqa
-    import linsight.hosttz                                       # noqa
+    import linsight.hosttz, linsight.fsbase                      # noqa
 
     class Flat(object):
         pass
@@ -60,6 +60,7 @@ def load(built):
     flat = Flat()
     for mod in (linsight.image, linsight.volume, linsight.disk, linsight.ad1,
                 linsight.distro, linsight.common, linsight.hosttz,
+                linsight.fsbase,
                 linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs):
         for name in dir(mod):
             if not name.startswith("__"):
@@ -939,6 +940,140 @@ def check_timezone(L, res):
         finally:
             col.close()
 
+def check_robustness(L, res):
+    """Truncated and corrupted structures must degrade, never raise.
+
+    This is the test for the *class* of bug that a real image found, rather
+    than for the one instance of it. An ext2 /boot with 128-byte inodes read
+    crtime from offset 0x90 - past the end of the inode - and took the whole
+    run down with a struct.error. The fix was three bounds checks; the reason
+    it happened at all is that every reader here parses structures whose size
+    and contents come from the evidence, and the evidence is a decade of
+    different mkfs defaults plus whatever an attacker left behind.
+
+    So the readers are fed short buffers, zeroed buffers and random ones, and
+    the assertion is only that nothing escapes as an exception. A reader may
+    return nothing, and should; it may not raise.
+    """
+    print("\nrobustness - truncated and corrupt input must not raise")
+    import random
+    rng = random.Random(20260825)
+
+    # inode-shaped buffers at every size a real filesystem has used, plus the
+    # ones no filesystem uses
+    problems = []
+    path = fixture("ext4.img")
+    if not path:
+        res.skip("robustness", "ext4.img not built")
+        return
+    col = L.DiskCollection(path, quiet=True)
+    try:
+        fs = col.mounts[0][2]
+        real = fs.inode(2)
+        for size in (0, 1, 16, 64, 127, 128, 129, 160, 255, 256, 512):
+            for label, raw in (("truncated", real[:size]),
+                               ("zeroed", b"\x00" * size),
+                               ("random", bytes(rng.randrange(256)
+                                                for _ in range(size)))):
+                try:
+                    # the path a walk takes for every entry it meets
+                    n = L.FsNode()
+                    n._ref = raw
+                    if len(raw) >= 128:
+                        fs._time(raw, 0x08, 0x8C, 0)
+                        fs._time(raw, 0x90, 0x94, 0, need=0x1C)
+                        fs._map(n)
+                        fs._dir_entries(n)
+                except Exception as exc:
+                    problems.append("%s inode of %d bytes: %s: %s"
+                                    % (label, size, exc.__class__.__name__, exc))
+    finally:
+        col.close()
+    if problems:
+        res.fail("ext inode structures", problems[0] +
+                 ("" if len(problems) == 1
+                  else " (and %d more)" % (len(problems) - 1)))
+    else:
+        res.ok("ext inode structures  short, zeroed and random buffers")
+
+    # a volume of garbage must be refused by every reader rather than crash
+    problems = []
+    for name, size in (("zeros", 1 << 20), ("random", 1 << 20), ("tiny", 512)):
+        if name == "zeros":
+            data = b"\x00" * size
+        elif name == "tiny":
+            data = b"\x00" * size
+        else:
+            data = bytes(rng.randrange(256) for _ in range(size))
+        vol = _MemoryVolume(L, data)
+        for probe_name in ("probe_ext", "probe_xfs", "probe_btrfs"):
+            probe = getattr(L, probe_name, None)
+            if probe is None:
+                continue
+            try:
+                got = probe(vol)
+            except Exception as exc:
+                problems.append("%s on %s: %s: %s"
+                                % (probe_name, name, exc.__class__.__name__, exc))
+                continue
+            if got is not None:
+                problems.append("%s claimed to open %s bytes of %s"
+                                % (probe_name, size, name))
+    if problems:
+        res.fail("filesystem probes", problems[0])
+    else:
+        res.ok("filesystem probes     zeros, random and truncated volumes")
+
+    # and the containers: a file that is not the format it claims
+    problems = []
+    import tempfile
+    for magic, ext in ((b"QFI\xfb" + b"\x00" * 200, ".qcow2"),
+                       (b"KDMV" + b"\x00" * 200, ".vmdk"),
+                       (b"vhdxfile" + b"\x00" * 200, ".vhdx"),
+                       (b"EVF\x09\x0d\x0a\xff\x00" + b"\x00" * 200, ".E01")):
+        fh = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+        try:
+            fh.write(magic)
+            fh.close()
+            try:
+                img = L.open_image(fh.name)
+                img.read(0, 4096)
+                img.close()
+            except L.ImageError:
+                pass                    # refused by name, which is correct
+            except Exception as exc:
+                problems.append("%s header: %s: %s"
+                                % (ext, exc.__class__.__name__, exc))
+        finally:
+            try:
+                os.unlink(fh.name)
+            except OSError:
+                pass
+    if problems:
+        res.fail("container headers", problems[0])
+    else:
+        res.ok("container headers     truncated qcow2/vmdk/vhdx/E01")
+
+
+class _MemoryVolume(object):
+    """A volume backed by a bytes object, for feeding readers rubbish."""
+
+    def __init__(self, L, data):
+        self.data = data
+        self.size = len(data)
+        self.chunk = 1 << 16
+        self.path = "memory"
+        self.fstype = ""
+        self.label = ""
+        self.scheme = "whole"
+        self.detail = ""
+
+    def read(self, offset, length):
+        if offset < 0 or length <= 0:
+            return b""
+        return self.data[offset:offset + length]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--built", action="store_true",
@@ -975,6 +1110,7 @@ def main(argv=None):
     check_filename_hunts(L, res)
     check_inventory_times(L, res)
     check_timezone(L, res)
+    check_robustness(L, res)
 
     print("\n%d passed, %d failed, %d skipped"
           % (res.passed, len(res.failed), len(res.skipped)))

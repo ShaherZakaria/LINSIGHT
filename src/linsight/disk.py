@@ -146,7 +146,20 @@ class DiskCollection(Collection):
         opened = []
         for vol in candidates:
             probe = FS_PROBES.get(vol.fstype)
-            fs = probe(vol) if probe else None
+            # Opening a filesystem is parsing attacker-influenced structures,
+            # and one that will not open must not stop the others being read.
+            # The probes return None for the failures they expect; this is for
+            # the ones they do not.
+            try:
+                fs = probe(vol) if probe else None
+            except Exception as exc:
+                if getattr(self, "_debug", False):
+                    raise
+                self.notes.append("%s says it is %s and opening it raised %s: "
+                                  "%s - it was not read"
+                                  % (vol.name, vol.fstype,
+                                     exc.__class__.__name__, exc))
+                continue
             if fs is None:
                 self.notes.append("%s says it is %s but its superblock would "
                                   "not parse" % (vol.name, vol.fstype))
@@ -157,7 +170,15 @@ class DiskCollection(Collection):
         if not opened:
             return
         root_vol, root_fs = self._pick_root(opened)
-        layout = self._fstab_layout(root_fs)
+        try:
+            layout = self._fstab_layout(root_fs)
+        except Exception as exc:
+            # only decides where the *other* filesystems mount; the root is
+            # already chosen, and losing this costs placement rather than data
+            self.notes.append("reading /etc/fstab raised %s: %s - other "
+                              "filesystems were not placed by it"
+                              % (exc.__class__.__name__, exc))
+            layout = {}
         placed = [("/", root_vol, root_fs)]
         for vol, fs in opened:
             if fs is root_fs:
