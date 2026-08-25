@@ -25,6 +25,7 @@ from .decode import (
     split_log_line)
 from .collect import velo_get, velo_time
 from .distro import describe_distro, identify_distro
+from .hosttz import describe_hosttz, format_offset, resolve_hosttz
 
 
 
@@ -48,6 +49,8 @@ class Triage:
         self.gids = set()
         self.collection_time = None   # true UTC instant the collection finished
         self.tz_offset = timedelta(0)  # host local clock - UTC
+        self.tz_source = ""            # what stated it, if anything did
+        self.host_tz = {}
         self.iocs = defaultdict(set)  # ioc string -> set of artifact mentions
         self.ww_paths = set()         # world-writable paths confirmed from the bodyfile
         self.bodyfile_seen = False
@@ -77,6 +80,91 @@ class Triage:
     def event(self, ts, category, description, severity="INFO", source=""):
         if ts is not None:
             self.events.append(Event(ts, category, description, severity, source))
+
+    def resolve_host_timezone(self):
+        """Establish the host's time zone, for every layout.
+
+        Runs before the analyzers because almost every Linux log timestamp is
+        local with no zone on it, and the offset is what turns 'Mar 24
+        22:14:44' from a fact about a clock into a fact about a moment. An
+        hour wrong here is an hour wrong in every correlation the report
+        supports.
+
+        A collector that stated its own offset keeps it: uac.log and the
+        Velociraptor context record what the host's clock was doing at the
+        moment of collection, which is a better statement about that moment
+        than anything reconstructed from the filesystem. The zone *name* is
+        filled in regardless, because the offset alone cannot say whether a
+        log line from six months earlier was written on summer time.
+        """
+        info = resolve_hosttz(self.col, self.collection_time)
+        self.host_tz = info
+        if info["zone"]:
+            self.meta["Time zone"] = describe_hosttz(info)
+            if info["zone_source"]:
+                self.meta["Time zone source"] = info["zone_source"]
+        if info["offset"] is not None and not self.tz_source:
+            self.tz_offset = info["offset"]
+            self.tz_source = info["offset_source"]
+            self.meta["Host UTC offset"] = "%s (from %s)" % (
+                format_offset(info["offset"]), info["offset_source"])
+        elif info["offset"] is None and not self.tz_source:
+            # nothing anywhere stated it. One line saying so, rather than the
+            # collector-specific message and this one contradicting each other
+            self.meta["Host UTC offset"] = (
+                "unknown - nothing in this collection records it, so "
+                "host-local log stamps are read as UTC")
+        elif info["offset"] is not None and info["offset"] != self.tz_offset:
+            # the collector said one thing and the filesystem says another;
+            # the collector's own statement stands, and the disagreement is
+            # not swallowed
+            self.meta["Time zone note"] = (
+                "%s says %s while the collector recorded %s at collection "
+                "time - log stamps are read at the collector's offset"
+                % (info["offset_source"], format_offset(info["offset"]),
+                   format_offset(self.tz_offset)))
+        if info["note"]:
+            self.meta["Time zone note"] = info["note"]
+        if not info["zone"] and not self.meta.get("Time zone"):
+            self.meta["Time zone"] = (
+                "not recorded in this collection - host-local log stamps are "
+                "read at %s" % format_offset(self.tz_offset))
+        self._timezone_finding(info)
+
+    def _timezone_finding(self, info):
+        """Say what the zone is, and say when nothing said."""
+        if info["zone"] or info["offset"] is not None:
+            evidence = []
+            if info["zone_source"]:
+                evidence.append("%-28s %s" % (info["zone_source"], info["zone"]))
+            if info["offset_source"]:
+                evidence.append("%-28s %s" % (info["offset_source"],
+                                              format_offset(info["offset"])))
+            if info["date_line"]:
+                evidence.append("%-28s %s" % ("the host's own date",
+                                              info["date_line"]))
+            if info["note"]:
+                evidence.append(info["note"])
+            self.add("INFO", "System",
+                     "Host time zone: %s" % (describe_hosttz(info) or "offset only"),
+                     "Linux writes most log timestamps in local time with no "
+                     "zone on them, so this is what every one of them below is "
+                     "read against. An hour wrong here is an hour wrong in "
+                     "every correlation this report supports.",
+                     evidence=evidence or None,
+                     source=info["zone_source"] or info["offset_source"])
+        else:
+            self.add("MEDIUM", "System", "Host time zone is unknown",
+                     "Nothing in this collection records the host's time zone "
+                     "or its offset, so every local timestamp below is read as "
+                     "UTC. If the host was not on UTC, every one of them is "
+                     "wrong by that offset - which is the kind of error that "
+                     "makes a timeline agree with itself and disagree with "
+                     "every other source.",
+                     evidence=["looked for: timedatectl output, /etc/timezone, "
+                               "/etc/sysconfig/clock, /etc/localtime, "
+                               "the host's `date`"],
+                     source="time zone")
 
     def identify_distribution(self):
         """Establish the distribution, whichever layout the evidence arrived as.
@@ -542,6 +630,7 @@ class Triage:
             try:
                 sign = -1 if off[0] == "-" else 1
                 self.tz_offset = sign * timedelta(hours=int(off[1:3]), minutes=int(off[3:5]))
+                self.tz_source = "uac.log"
             except (ValueError, IndexError):
                 pass
             try:
@@ -569,7 +658,10 @@ class Triage:
             self.meta["Collection started"] = (
                 first_ts.strftime("%Y-%m-%d %H:%M:%S UTC") if first_ts else "")
             self.meta["Collection finished"] = last_ts.strftime("%Y-%m-%d %H:%M:%S UTC")
-            self.meta["Host UTC offset"] = "%+03d:%02d" % (
+            # said with its source, the same way every other offset in this
+            # report is - the collector's own statement of what the host's
+            # clock was doing is the strongest one there is, and worth naming
+            self.meta["Host UTC offset"] = "%+03d:%02d (from uac.log)" % (
                 self.tz_offset.total_seconds() // 3600,
                 abs(self.tz_offset.total_seconds() % 3600) // 60)
 
@@ -3536,6 +3628,7 @@ class Triage:
     def run(self):
         steps = [
             self.analyze_collection,
+            self.resolve_host_timezone,     # before anything reads a log stamp
             self.identify_distribution,     # every layout, not just one
             self.analyze_accounts,          # populates users/uids/gids first
             self.analyze_kernel_taint,

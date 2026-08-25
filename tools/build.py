@@ -48,6 +48,7 @@ MODULES = [
     ("decode",    "log decoders: compressed text, utmp/lastlog, the journal"),
     ("collect",   "collection access (directory / tar / zip backends)"),
     ("distro",    "which Linux distribution this is, and how we know"),
+    ("hosttz",    "what time zone the host was in, and how we know"),
     ("image",     "disk images: raw, split raw, E01, qcow2, vmdk, vhdx, device"),
     ("volume",    "volume layer: MBR, GPT, LVM2, LUKS"),
     ("fsbase",    "what every filesystem reader has to answer"),

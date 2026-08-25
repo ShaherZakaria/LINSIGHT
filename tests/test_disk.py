@@ -52,13 +52,14 @@ def load(built):
     import linsight.image, linsight.volume, linsight.disk        # noqa
     import linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs   # noqa
     import linsight.ad1, linsight.distro, linsight.common        # noqa
+    import linsight.hosttz                                       # noqa
 
     class Flat(object):
         pass
 
     flat = Flat()
     for mod in (linsight.image, linsight.volume, linsight.disk, linsight.ad1,
-                linsight.distro, linsight.common,
+                linsight.distro, linsight.common, linsight.hosttz,
                 linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs):
         for name in dir(mod):
             if not name.startswith("__"):
@@ -90,13 +91,19 @@ EXPECTED = [
     ("/dev/shm/.update", "f", 46, "-rwxr-xr-x", ""),
     ("/tmp/.x", "f", 20, "-rwsr-xr-x", ""),
     ("/etc/auth-link", "l", None, "lrwxrwxrwx", "/var/log/auth.log"),
+    ("/etc/timezone", "f", 14, "-rw-r--r--", ""),
+    ("/etc/localtime", "l", None, "lrwxrwxrwx",
+     "/usr/share/zoneinfo/Europe/Berlin"),
     ("/etc/long-link", "l", 276, "lrwxrwxrwx", None),   # target checked by length
 ]
 
 #: How many names the fixture tree holds. A reader that returns a plausible
 #: subset - shortform directories only, say - is the failure mode that looks
-#: most like success, so the count is asserted rather than eyeballed.
-EXPECTED_NODES = 445
+#: most like success, so the count is asserted rather than eyeballed. Change
+#: it only alongside tools/mkfixtures.sh, and only once the arithmetic works
+#: out: the last move was 445 -> 451 for /etc/timezone, /etc/localtime, one
+#: compiled zone and the three directories above it.
+EXPECTED_NODES = 451
 
 FILESYSTEM_FIXTURES = [
     ("ext4.img", "ext4"),
@@ -812,6 +819,126 @@ def check_inventory_times(L, res):
         finally:
             col.close()
 
+#: (zone, January offset, July offset). Read from this machine's own
+#: /usr/share/zoneinfo, so no fixture is needed - and the point of the table
+#: is the pair: a reader that returns a single fixed offset per zone passes
+#: the January column and fails July, which is exactly the bug that puts a
+#: summer log line an hour out.
+TZ_CASES = (
+    ("Europe/Berlin", "+01:00", "+02:00"),
+    ("America/New_York", "-05:00", "-04:00"),
+    ("Asia/Tokyo", "+09:00", "+09:00"),
+    ("Australia/Sydney", "+11:00", "+10:00"),
+    ("UTC", "+00:00", "+00:00"),
+)
+
+def zoneinfo_roots():
+    """Where a compiled zone might be readable from, best first.
+
+    Python's own zoneinfo knows where the platform keeps tzdata, which beats
+    guessing at paths that do not exist on Windows at all.
+    """
+    roots = []
+    try:
+        import zoneinfo
+        roots.extend(zoneinfo.TZPATH)
+    except Exception:
+        pass
+    roots.extend(("/usr/share/zoneinfo", "/usr/lib/zoneinfo",
+                  "C:/Program Files/Git/usr/share/zoneinfo"))
+    return [r for r in roots if r and os.path.isdir(r)]
+
+
+def check_timezone(L, res):
+    """The compiled zone reader, and the zone name wherever it is written."""
+    print("\nhost time zone - the offset in force, not the offset now")
+    from datetime import datetime, timezone as _tz
+    zones = {}                       # name -> the compiled TZif bytes
+    for root in zoneinfo_roots():
+        for zone, _j, _u in TZ_CASES:
+            if zone in zones:
+                continue
+            path = os.path.join(root, *zone.split("/"))
+            if os.path.exists(path):
+                with open(path, "rb") as fh:
+                    zones[zone] = fh.read()
+    if not zones:
+        # No tzdata on this machine - but the disk fixture carries a compiled
+        # zone of its own, put there for exactly this. Reading it back out
+        # tests the reader against a real file without needing the analysis
+        # box to have one.
+        path = fixture("ext4.img")
+        if path:
+            col = L.DiskCollection(path, quiet=True)
+            try:
+                raw = col.read_bytes("[root]/usr/share/zoneinfo/Europe/Berlin")
+                if raw and raw[:4] == b"TZif":
+                    zones["Europe/Berlin"] = raw
+            finally:
+                col.close()
+    if not zones:
+        res.skip("tzif reader", "no compiled zone available to read")
+    else:
+        wrong = []
+        for zone, want_jan, want_jul in TZ_CASES:
+            raw = zones.get(zone)
+            if raw is None:
+                continue
+            jan = L.format_offset(L.tzif_offset(
+                raw, datetime(2024, 1, 15, tzinfo=_tz.utc)))
+            jul = L.format_offset(L.tzif_offset(
+                raw, datetime(2024, 7, 15, tzinfo=_tz.utc)))
+            if (jan, jul) != (want_jan, want_jul):
+                wrong.append("%s -> %s/%s, expected %s/%s"
+                             % (zone, jan, jul, want_jan, want_jul))
+        if wrong:
+            res.fail("tzif reader", wrong[0])
+        else:
+            res.ok("tzif reader           %d zone(s), summer and winter both"
+                   % len(zones))
+
+    # a symlink target is the zone name, which is how a disk or an AD1 answers
+    wrong = []
+    for target, want in (("/usr/share/zoneinfo/Europe/Berlin", "Europe/Berlin"),
+                         ("../usr/share/zoneinfo/Asia/Tokyo", "Asia/Tokyo"),
+                         ("/usr/share/zoneinfo/posix/UTC", "UTC"),
+                         ("/etc/localtime", "")):
+        got = L._zone_from_target(target)
+        if got != want:
+            wrong.append("%s -> %r, expected %r" % (target, got, want))
+    for name, want in (("Europe/Berlin", True), ("UTC", True),
+                       ("America/Argentina/Buenos_Aires", True),
+                       ("Etc/GMT+5", True), ("", False),
+                       ("garbage here", False), ("#comment", False)):
+        if L.valid_zone(name) != want:
+            wrong.append("valid_zone(%r) != %s" % (name, want))
+    if wrong:
+        res.fail("zone names", wrong[0])
+    else:
+        res.ok("zone names            symlink targets and validation")
+
+    # and end to end, where the fixture carries one
+    for name in ("ext4.img", "xfs.img", "btrfs.img"):
+        path = fixture(name)
+        if not path:
+            res.skip("timezone %s" % name, "not built")
+            continue
+        col = L.DiskCollection(path, quiet=True)
+        try:
+            info = L.resolve_hosttz(col, None)
+            if not info["zone"]:
+                res.fail("timezone %s" % name,
+                         "the fixture sets /etc/timezone and /etc/localtime "
+                         "and neither was read")
+            elif info["zone"] != "Europe/Berlin":
+                res.fail("timezone %s" % name,
+                         "read as %r" % info["zone"])
+            else:
+                res.ok("timezone %-14s %s from %s"
+                       % (name, L.describe_hosttz(info), info["zone_source"]))
+        finally:
+            col.close()
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--built", action="store_true",
@@ -847,6 +974,7 @@ def main(argv=None):
     check_distribution(L, res)
     check_filename_hunts(L, res)
     check_inventory_times(L, res)
+    check_timezone(L, res)
 
     print("\n%d passed, %d failed, %d skipped"
           % (res.passed, len(res.failed), len(res.skipped)))
