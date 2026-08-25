@@ -256,8 +256,29 @@ class Collection:
                 self._add_member(rel, zi.filename, zi.file_size)
             self._check_sealed(encrypted)
         else:
+            self._check_foreign()
             self.kind = "tar"
-            self._tar = tarfile.open(self.path, "r:*")
+            try:
+                self._tar = tarfile.open(self.path, "r:*")
+            except OSError as exc:
+                raise SystemExit("[!] cannot open %s: %s" % (self.path, exc))
+            except (tarfile.TarError, EOFError):
+                # tarfile's own message is a list of the compressors it is
+                # not, which says nothing about what the file is. What the
+                # analyst needs here is the set of things that would work.
+                raise SystemExit(
+                    "[!] %s is not something linsight reads.\n"
+                    "    It is not a directory, a tar, a zip, or a disk image "
+                    "this reader recognises.\n"
+                    "    Expected one of:\n"
+                    "      a UAC or Velociraptor collection - a directory, "
+                    ".tar, .tar.gz or .zip\n"
+                    "      a disk - .dd/.raw, .E01, .qcow2, .vmdk, .vhdx, "
+                    ".vhd, or a device\n"
+                    "      loose files - pass them with --file instead\n"
+                    "    If it IS a disk image whose header is damaged or "
+                    "missing, force it with --disk."
+                    % os.path.basename(self.path))
             for ti in self._tar.getmembers():
                 if not ti.isfile():
                     continue
@@ -267,6 +288,69 @@ class Collection:
                 self._add_member(rel, ti.name, ti.size)
         if not self._names:
             raise SystemExit("[!] no readable files found in %s" % self.path)
+
+    # Containers that are evidence, and are not a collection this tool reads.
+    # Each is named rather than guessed at: an analyst who points linsight at
+    # an AD1 needs to be told it is an AD1 and what turns it into something
+    # readable. "not a gzip file" is a true statement and the wrong answer.
+    #
+    # (magic, what it is, what to do about it)
+    FOREIGN = (
+        (b"ADSEGMENTEDFILE\x00", "an AccessData/FTK logical image (AD1)",
+         "Export its contents - FTK Imager, File > Export Files... - and point\n"
+         "    linsight at the exported tree:  python linsight.py --file <dir>"),
+        (b"ADCRYPTEDFILE\x00", "an encrypted AccessData image",
+         "Decrypt it in FTK Imager first."),
+        (b"7z\xbc\xaf\x27\x1c", "a 7-Zip archive",
+         "Extract it, then point linsight at the result."),
+        (b"Rar!\x1a\x07", "a RAR archive",
+         "Extract it, then point linsight at the result."),
+        (b"SQLite format 3\x00", "a SQLite database",
+         "That is one artifact, not a collection - pass it with --file."),
+        (b"\x89PNG\r\n\x1a\n", "a PNG image", "That is not evidence this "
+         "tool parses."),
+        (b"%PDF-", "a PDF", "That is not evidence this tool parses."),
+    )
+
+    def _check_foreign(self):
+        """Stop on a container that is recognisable and is not a collection.
+
+        This runs before the tar backend is tried, because tarfile's own
+        failure is a list of the compressors it is not, which says nothing
+        about what the file actually is. A wrong tool for the evidence should
+        end with the name of the evidence and the way forward.
+        """
+        try:
+            with open(self.path, "rb") as fh:
+                head = fh.read(64)
+        except OSError as exc:
+            raise SystemExit("[!] cannot read %s: %s" % (self.path, exc))
+        for magic, what, advice in self.FOREIGN:
+            if head.startswith(magic):
+                raise SystemExit(
+                    "[!] %s is %s.\n"
+                    "    linsight reads UAC and Velociraptor collections, disk "
+                    "images, and loose files.\n"
+                    "    %s"
+                    % (os.path.basename(self.path), what, advice))
+        # a lone compressed file, rather than a compressed tar: that is one
+        # artifact and --file is what parses one artifact
+        for magic, name in ((b"\x1f\x8b", "gzip"), (b"BZh", "bzip2"),
+                            (b"\xfd7zXZ\x00", "xz"), (b"\x28\xb5\x2f\xfd",
+                                                      "zstd")):
+            if head.startswith(magic):
+                try:
+                    tarfile.open(self.path, "r:*").close()
+                except Exception:
+                    raise SystemExit(
+                        "[!] %s is %s-compressed but is not a tar archive.\n"
+                        "    If it is one artifact - a rotated log, a copied "
+                        "database - pass it with --file,\n"
+                        "    which decompresses it and parses it as itself:\n"
+                        "      python linsight.py --file %s"
+                        % (os.path.basename(self.path), name,
+                           os.path.basename(self.path)))
+                break
 
     def _check_sealed(self, encrypted):
         """Stop on a collection whose contents cannot actually be read.
