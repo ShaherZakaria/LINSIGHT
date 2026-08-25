@@ -85,8 +85,8 @@ happened to capture.
    often a legitimate daemon that survived a package upgrade. Expect false
    positives; a finding is a pointer, not a conclusion.
 5. **Linux only.** No memory analysis, no carving, no deleted-file recovery.
-6. **The Sigma engine is a faithful subset, not all of Sigma.** `|cidr`,
-   `|fieldref` and the numeric comparators are rejected rather than applied,
+6. **The Sigma engine is a faithful subset, not all of Sigma.** `|fieldref`,
+   `|exists` and the numeric comparators are rejected rather than applied,
    and Sigma correlation rules are unsupported. Rejected rules are listed in
    `RULE_ERRORS` instead of silently matching nothing — but if your ruleset
    leans on those modifiers, they will not fire.

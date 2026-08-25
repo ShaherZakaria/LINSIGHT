@@ -14,6 +14,8 @@ Point it at a [UAC](https://github.com/tclahr/uac) or [Velociraptor](https://doc
 python linsight.py ./uac-host-linux-20260324234043.tar.gz
 ```
 
+No collection? `--file` runs the same parsers over loose files — one `auth.log`, a folder of them, a copied-out `/etc`. See [Without a collection](#without-a-collection).
+
 ## Why
 
 A UAC collection is a few thousand files of raw command output. The evidence is all there, but answering "what happened on this host" means opening `ps` output, then `netstat`, then `auth.log`, then cross-referencing PIDs by hand. This does that pass for you and tells you where to look — it does not replace the manual examination, it decides what order to do it in.
@@ -59,7 +61,7 @@ python linsight.py ./coll --timeline timeline.csv  # merged event timeline
 
 ### 2. Tables
 
-89 artifact types normalised into one grid each — processes, sockets, open files, cron, systemd units, auth log, journal, shell history, packages, persistence, the bodyfile, and so on. Every row keeps a `source` column naming the file it was parsed from.
+88 artifact types normalised into one grid each — processes, sockets, open files, cron, systemd units, auth log, journal, shell history, packages, persistence, the bodyfile, and so on. Every row keeps a `source` column naming the file it was parsed from.
 
 ```bash
 python linsight.py ./coll --export ./out       # csv/ + json/ + browser.html
@@ -78,7 +80,7 @@ Findings and the timeline always run over the whole collection; they exist to co
 
 ### 3. The console
 
-`--html` writes a document — a page you read top to bottom and hand to someone. The **browser** is the other thing an analyst wants from the same run: a console to work the case in, where the findings, the ATT&CK coverage, the timeline and all 89 tables sit behind one nav and one set of severity chips.
+`--html` writes a document — a page you read top to bottom and hand to someone. The **browser** is the other thing an analyst wants from the same run: a console to work the case in, where the findings, the ATT&CK coverage, the timeline and all 88 tables sit behind one nav and one set of severity chips.
 
 ```bash
 python linsight.py ./coll --export ./out        # csv/ + json/ + browser.html
@@ -87,20 +89,72 @@ python linsight.py ./coll --tables-html b.html  # just the console
 
 | view | what it is for |
 |---|---|
-| **Overview** | severity cards, activity over the collection's span, the loudest categories, techniques and artifacts — every bar is a click through to the findings behind it |
+| **Overview** | twelve panels: severity cards, the offensive tooling named on the host, two clocks (what the collection recorded and what the analysis raised), a day-by-hour heatmap and the same activity folded onto 24 UTC hours, the loudest categories, techniques, tactics and artifacts, what the rule engines and the pivot fired on, and the largest tables — every bar is a click through to what is behind it |
 | **Findings** | the `FINDINGS` grid: sort any column, filter per column, and click a row to open its evidence, ATT&CK techniques and time span above the table |
 | **ATT&CK** | the techniques the findings actually carry, laid out by tactic and coloured by the worst severity in each cell; click a technique to filter the findings to it |
-| **Timeline** | the `TIMELINE` grid under a severity-stacked histogram — click a column to narrow the table to that window, click it again to let go |
-| **Indicators** | the `IOCS` grid: every indicator and the artifacts that mentioned it |
-| **Tables** | the remaining artifact grids, each sortable, with a row filter and a per-column filter that combine with AND |
+| **Timeline** | the `TIMELINE` grid under a severity-stacked histogram — click a column to set the time window, shift-click another to extend it, click the lit one to let go. The chart keeps drawing the full span so you can see where the window sits. Every dated finding is on it too, at its `first_utc` and under its own severity, so isolating CRITICAL answers here with the same set the findings list does |
+| **Tables** | `HACKTOOL_HITS` and `HACKTOOL_VARIANTS` pinned at the top of the nav, then the remaining artifact grids, each sortable, with a row filter and a per-column filter that combine with AND |
 
-**The first three views *are* those tables.** There is one findings list, not a view and a table saying the same thing twice — the console half (chips, chart, evidence pane) sits on top of the same grid every other table gets, so sorting and per-column filtering work there too. Nothing is embedded twice, and the two halves have no way to disagree.
+**Findings and Timeline *are* those tables.** There is one findings list, not a view and a table saying the same thing twice — the console half (chips, chart, evidence pane) sits on top of the same grid every other table gets, so sorting and per-column filtering work there too. Nothing is embedded twice, and the two halves have no way to disagree.
 
-The severity chips in the header filter all of them at once, so a technique cell, a timeline column and a findings row all count the same set. `alt`-click a chip to isolate one severity. `1`–`5` switch views, `/` focuses the row filter, `j`/`k` walk the rows.
+The severity chips in the header filter all of them at once, so a technique cell, a timeline column and a findings row all count the same set. `alt`-click a chip to isolate one severity.
+
+Beside them is the **time window**. Clicking `from` or `to` opens a calendar: a month grid where **each day is shaded by how much evidence it holds**, so the three days that matter are visible before you pick one. Pick a day, set the hour and minute from the two selects beside it (`from` defaults to `00:00`, `to` to `23:59`, so a day at each end means those whole days), or take a preset — last 24h / 7d / 30d / all. Everything is UTC, like the rest of the report.
+
+The boxes still accept typing for anyone who prefers it: `2021-12-08`, `2021-12-08 03:00`, or `-24h` / `-7d` counted back from the end of the data. Clicking a column of the activity chart sets the window too; shift-clicking another extends it. Unlike the chips it narrows *every* grid that carries a clock, not just the views — so an incident hour narrows `AUTH_LOG` and `WEB_LOG` with the findings.
+
+It narrows what happened, never what exists. A row is only filtered when it *is* an event (`timestamp_utc`, or a finding's `first_utc`/`last_utc` span). Tables where a timestamp is an attribute of a standing thing — `USERS.last_login_utc`, `SUID_SGID.mtime_utc`, `PROCESS_MASTER.start_utc` — are left whole, because a one-hour window that deletes the account list and every suid binary is not a narrower answer. Each grid says which case it is, and how many of its rows carry no time at all.
+
+`1`–`4` switch views, `/` focuses the row filter, `t` the time window, `j`/`k` walk the rows.
 
 One file, no server, no network: the payload is embedded and the CSS and JS are inline, because the box that reads a triage collection is routinely the box that is not allowed to fetch anything. Open it with a double click — there is nothing to serve it from.
 
 `--html-rows N` caps how many rows of each table the page carries (default 2000); the CSV and JSON exports always hold everything.
+
+## Without a collection
+
+You do not need a UAC or Velociraptor collection. `--file` parses loose files
+on their own — one log, a folder of them, or a copied-out fragment of a host
+tree:
+
+```bash
+python linsight.py --file /var/log/auth.log
+python linsight.py --file ./loose-logs/ --file ps.txt
+python linsight.py --file ./extracted/etc/passwd
+python linsight.py --file capture-2311.txt:/var/log/auth.log
+```
+
+This is not a second, smaller parser. Every file is mounted at the path its
+parser already looks for, and the whole pipeline then runs unchanged — the same
+analyzers, the same 88 tables, Sigma and YARA, the findings, the console. A
+file routed to `/var/log/auth.log` is parsed by exactly the code that parses an
+auth.log out of a UAC tar, because it *is* that code.
+
+Where a file lands is decided in this order:
+
+| | how |
+|---|---|
+| `path:/host/path` | you said so — always wins |
+| `etc/passwd`, `var/log/syslog` | the path it was given under already looks like a host tree |
+| `auth.log`, `wtmp`, `sshd_config`, `ps.txt` | its name matches a known artifact |
+| anything else that is text | `/var/log/<name>`, where `VAR_LOG` splits syslog-shaped lines and keeps the rest verbatim |
+| anything else | not parsed, and listed as such |
+
+Routing is a guess from a filename, so it is reported at load time, recorded in
+`METADATA`, and raised as a finding you can read next to the ones it produced.
+A wrong guess is a file parsed as the wrong artifact — and a file that only
+reaches the `/var/log` fallback is parsed generically rather than by its real
+parser. Both are visible rather than silent:
+
+```
+[*] --file auth.log      -> /var/log/auth.log            (name)
+[*] --file capture-2311.txt -> /var/log/capture-2311.txt (text fallback)
+[!] --file blob.bin skipped: not identified as a known artifact
+```
+
+Loose files carry no collection metadata, so there is nothing to date the run
+with and a syslog stamp carries no year. The newest mtime of the files given is
+used as the anchor, and the report says so rather than quietly picking one.
 
 ## Hunting
 
@@ -137,7 +191,7 @@ For an air-gapped examination box, `--sigma-source` takes a zip you downloaded e
 
 **`--update-sigma` is the only thing in this tool that touches the network.** Everything else is offline.
 
-A rule the engine cannot represent faithfully is **rejected** and listed in `RULE_ERRORS` rather than half-applied — a rule that silently matches nothing looks exactly like a clean result.
+A rule the engine cannot represent faithfully is **rejected** and listed in `RULE_ERRORS` rather than half-applied — a rule that silently matches nothing looks exactly like a clean result. `|contains`, `|startswith`, `|endswith`, `|re`, `|all`, `|cased`, `|base64`, `|base64offset`, `|windash` and `|cidr` are applied; `|fieldref`, `|exists`, the numeric comparators and Sigma correlation rules are not.
 
 ### Built-in keyword sweep
 
