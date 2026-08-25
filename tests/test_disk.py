@@ -51,13 +51,14 @@ def load(built):
     sys.path.insert(0, os.path.join(ROOT, "src"))
     import linsight.image, linsight.volume, linsight.disk        # noqa
     import linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs   # noqa
-    import linsight.ad1                                          # noqa
+    import linsight.ad1, linsight.distro                         # noqa
 
     class Flat(object):
         pass
 
     flat = Flat()
     for mod in (linsight.image, linsight.volume, linsight.disk, linsight.ad1,
+                linsight.distro,
                 linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs):
         for name in dir(mod):
             if not name.startswith("__"):
@@ -617,6 +618,73 @@ def check_ad1(L, res):
             col.close()
 
 
+def check_distribution(L, res):
+    """The distribution must be named, and named from the right source.
+
+    The fixtures carry an /etc/os-release saying Ubuntu 22.04, so the easy
+    path is covered. What matters more is the hard path: an image with no
+    /etc at all still has to answer, from the package manager and the kernel.
+    That case is checked against whatever AD1 is present, because the logical
+    image this was built for holds only /boot, /root and /var.
+    """
+    print("\ndistribution - what the host was, and how we know")
+    for name in ("ext4.img", "xfs.img", "btrfs.img", "lvm-ext4.dd"):
+        path = fixture(name)
+        if not path:
+            res.skip("distro %s" % name, "not built")
+            continue
+        col = L.DiskCollection(path, quiet=True)
+        try:
+            info = L.identify_distro(col)
+            label = L.describe_distro(info)
+            if "ubuntu" not in label.lower():
+                res.fail("distro %s" % name,
+                         "read as %r, the fixture is Ubuntu" % label)
+            elif info["family"] != "debian":
+                res.fail("distro %s" % name,
+                         "family %r, expected debian" % info["family"])
+            elif not info["version"].startswith("22.04"):
+                res.fail("distro %s" % name,
+                         "version %r, expected 22.04" % info["version"])
+            elif info["conflict"]:
+                res.fail("distro %s" % name,
+                         "a conflict was raised where the sources agree: %s"
+                         % info["conflict"])
+            else:
+                res.ok("distro %-14s %s from %s"
+                       % (name, label, info["source"]))
+        finally:
+            col.close()
+
+    # the hard path: no /etc, so the answer has to come from somewhere else
+    images = []
+    if os.path.isdir(FIXTURES):
+        images = [os.path.join(FIXTURES, n) for n in sorted(os.listdir(FIXTURES))
+                  if n.lower().endswith(".ad1")]
+    if not images:
+        res.skip("distro from an /etc-less image", "no .ad1 in tests/fixtures")
+        return
+    for path in images:
+        name = os.path.basename(path)
+        col = L.Ad1Collection(path, quiet=True)
+        try:
+            info = L.identify_distro(col)
+            label = L.describe_distro(info)
+            has_etc = bool(col.rootfs("/etc/os-release"))
+            if not (label or info["family"]):
+                res.fail("distro %s" % name, "nothing named the distribution")
+            elif not info["family"]:
+                res.fail("distro %s" % name, "no family was established")
+            else:
+                res.ok("distro %-14s %s (%s family)%s"
+                       % (name, label or "unnamed", info["family"],
+                          "" if has_etc else " - with no /etc in the image"))
+            if info["kernel"] and not info["evidence"]:
+                res.fail("distro %s" % name,
+                         "a kernel was found but produced no evidence")
+        finally:
+            col.close()
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--built", action="store_true",
@@ -649,6 +717,7 @@ def main(argv=None):
     check_lvm(L, res)
     check_refusals(L, res)
     check_ad1(L, res)
+    check_distribution(L, res)
 
     print("\n%d passed, %d failed, %d skipped"
           % (res.passed, len(res.failed), len(res.skipped)))
