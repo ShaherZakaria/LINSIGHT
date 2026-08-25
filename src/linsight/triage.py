@@ -74,7 +74,8 @@ class Triage:
         self.tz_offset = timedelta(0)  # host local clock - UTC
         self.tz_source = ""            # what stated it, if anything did
         self.host_tz = {}
-        self.iocs = defaultdict(set)  # ioc string -> set of artifact mentions
+        self.iocs = defaultdict(set)         # ioc -> why it is one
+        self.ioc_sources = defaultdict(set)  # ioc -> artifacts it came from
         self.pivot_artifacts = {}     # indicator -> the artifacts naming it
         self.pivot_reported = set()   # the ones that earn a finding
         self.ww_paths = set()         # world-writable paths confirmed from the bodyfile
@@ -360,9 +361,28 @@ class Triage:
             self.events.append(Event(ts.replace(tzinfo=timezone.utc), f.category,
                                      f.title, f.severity, f.source or "(finding)"))
 
-    def ioc(self, value, where):
+    def ioc(self, value, why, source=""):
+        """Record an indicator, why it is one, and the artifact it came from.
+
+        These are two different facts and used to be one argument. `why` is a
+        provenance label - 'failed authentication source', 'outbound admin
+        protocol' - and is the only thing that knows why a string is in the
+        list at all, which is also what IOC_TECHNIQUES keys on. `source` is
+        the artifact it was read out of, which is where an analyst goes to
+        see it in context.
+
+        Half the callers passed a label and half passed a path, so the why
+        column of IOCS read '/var/log/auth.log' for every address any log
+        analyzer extracted. That is not why anything is an indicator, it
+        duplicated a column that already existed, and because it matched no
+        entry in IOC_TECHNIQUES it silently emptied the technique column for
+        exactly the indicators most worth mapping - every brute-force source
+        on the host among them.
+        """
         if value:
-            self.iocs[value].add(where)
+            self.iocs[value].add(why)
+            if source:
+                self.ioc_sources[value].add(source)
 
     def log_ts(self, text):
         """Log timestamp -> UTC string, using the host's offset and clock year.
@@ -3424,6 +3444,11 @@ class Triage:
             rel = real[plen:]
             if not rel.lstrip("/").lower().startswith(
                     tuple(rd.lower() + "/dev/" for rd in self.col.rootfs_dirs)):
+                continue
+            # see t_dev_files: a device node is not a regular file, and
+            # the finding below is about regular files
+            kind = self.col.member_kind(rel)
+            if kind and kind != "f":
                 continue
             host = self.col.host_path(rel)
             if host.startswith("/dev/pts/"):

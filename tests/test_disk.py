@@ -974,6 +974,65 @@ def check_auth_sessions(L, res):
         res.ok("auth.log absent           no table, no sessions")
 
 
+#: (as the log wrote it, as it should be recorded). Every auth pattern
+#: captures the address with a '\S+', which takes the punctuation after it
+#: too - and one stray character makes a second indicator for a host already
+#: in the list, of a shape that matches nothing and is typed wrongly.
+ADDR_CASES = (
+    # sshd: 'Received disconnect from 192.168.56.101: 11: disconnected'
+    ("192.168.56.101:", "192.168.56.101"),
+    ("192.168.56.101", "192.168.56.101"),
+    ("192.168.56.101,", "192.168.56.101"),
+    ("  192.168.56.101  ", "192.168.56.101"),
+    # a source port belongs in its own column
+    ("192.168.56.101:57686", "192.168.56.101"),
+    ("[2001:db8::1]:443", "2001:db8::1"),
+    # v6 survives intact - a trailing ':' is not punctuation here
+    ("::1", "::1"),
+    ("2001:db8::1", "2001:db8::1"),
+    # hostnames are addresses too
+    ("host.example.com", "host.example.com"),
+    ("host.example.com.", "host.example.com"),
+    ("workstation7", "workstation7"),
+    # what a daemon writes when it has nothing to write
+    ("-", ""),
+    ("?", ""),
+    ("UNKNOWN", ""),
+    ("", ""),
+    (None, ""),
+)
+
+
+def check_addresses(L, res):
+    """Addresses as the log meant them, not as the capture happened to end."""
+    print("\naddresses - what a '\\S+' capture drags along with it")
+    wrong = []
+    for raw, want in ADDR_CASES:
+        got = L.clean_addr(raw)
+        if got != want:
+            wrong.append("%r -> %r, expected %r" % (raw, got, want))
+    if wrong:
+        res.fail("address normalisation", wrong[0] +
+                 ("" if len(wrong) == 1 else " (and %d more)" % (len(wrong) - 1)))
+    else:
+        res.ok("address normalisation    %d cases, ports and punctuation"
+               % len(ADDR_CASES))
+
+    # The whole point is that one host does not become two indicators. A
+    # trailing colon also moves an address into the 'filename' type, because
+    # what is left is a dotted token that is not an address.
+    forms = ["192.168.56.101", "192.168.56.101:", "192.168.56.101:57686",
+             "192.168.56.101,"]
+    got = set(L.clean_addr(f) for f in forms)
+    if got != {"192.168.56.101"}:
+        res.fail("one host, one indicator", "four spellings gave %r" % (sorted(got),))
+    elif L.ioc_type("192.168.56.101") != "ipv4":
+        res.fail("one host, one indicator",
+                 "ioc_type says %r" % L.ioc_type("192.168.56.101"))
+    else:
+        res.ok("one host, one indicator  four spellings, one ipv4 indicator")
+
+
 def check_inventory_times(L, res):
     """FILE_INVENTORY has to carry times, and say where they came from."""
     print("\nfile inventory - times, and what they mean")
@@ -1311,6 +1370,7 @@ def main(argv=None):
     check_ad1(L, res)
     check_distribution(L, res)
     check_filename_hunts(L, res)
+    check_addresses(L, res)
     check_auth_sessions(L, res)
     check_inventory_times(L, res)
     check_timezone(L, res)
