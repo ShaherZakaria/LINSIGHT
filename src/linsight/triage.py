@@ -52,6 +52,8 @@ class Triage:
         self.tz_source = ""            # what stated it, if anything did
         self.host_tz = {}
         self.iocs = defaultdict(set)  # ioc string -> set of artifact mentions
+        self.pivot_artifacts = {}     # indicator -> the artifacts naming it
+        self.pivot_reported = set()   # the ones that earn a finding
         self.ww_paths = set()         # world-writable paths confirmed from the bodyfile
         self.bodyfile_seen = False
         self.auto_pivot = set()       # indicators worth chasing across every artifact
@@ -3549,6 +3551,34 @@ class Triage:
                 out.append(t)
         return out
 
+    #: How many extracted indicators to carry into the counting pass. They
+    #: cost one alternative each in a regex that is compiled once, so the cap
+    #: is about the pathological case - a collection that yielded tens of
+    #: thousands of paths - rather than about the ordinary one.
+    IOC_COUNT_LIMIT = 4000
+
+    def _ioc_terms(self, already):
+        """Indicators worth counting, that are not already being pivoted on.
+
+        Only the ones that are literal text an artifact could contain. The
+        analyzers also record shorthand - 'port:8080', 'pid:1417' - which name
+        a thing rather than quote one, and grepping the collection for the
+        string 'pid:1417' would find nothing and report zero, which reads as
+        an indicator that does not appear.
+        """
+        out = []
+        for value in sorted(self.iocs):
+            low = value.lower()
+            if low in already or ":" in value[:5] and value.split(":", 1)[0] in (
+                    "port", "pid"):
+                continue
+            if len(value) < 4:
+                continue           # too short to search for without noise
+            out.append(value)
+            if len(out) >= self.IOC_COUNT_LIMIT:
+                break
+        return out
+
     def analyze_pivot(self):
         """Search every collected artifact for the given indicators.
 
@@ -3565,6 +3595,15 @@ class Triage:
         disagree constantly about the case of hashes and hostnames.
         """
         terms = self._pivot_terms()[: self.opts.pivot_limit]
+        # Every other indicator any analyzer extracted, counted in the same
+        # pass but never reported as a finding. The IOCS table wants a count,
+        # a first and a last for all of them, and a second sweep of the
+        # collection to get it would double the most expensive step in the
+        # run - whereas one more alternative in an alternation that is already
+        # being compiled costs nothing measurable.
+        quiet = self._ioc_terms(set(t.lower() for t in terms))
+        self.pivot_reported = set(terms)
+        terms = terms + quiet
         if not terms:
             return
         try:
@@ -3587,6 +3626,17 @@ class Triage:
             if self.col._sizes.get(low, 0) > self.PIVOT_MAX_FILE:
                 continue
             host = self.col.host_path(rel)
+            # The name is evidence too. Samba writes one log per client as
+            # /var/log/samba/log.10.198.11.107, and an indicator that appears
+            # only in a path was being counted as appearing nowhere - which
+            # reads as an address this host never talked to, on a host that
+            # kept a whole logfile for it.
+            mp = rx.search(host)
+            if mp:
+                idx = mp.lastindex - 1 if mp.lastindex else 0
+                counts[idx][host] += 1
+                if len(hits[idx]) < 60:
+                    hits[idx].append((host, 0, "(named by the artifact path)"))
             raw = decompress_bytes(rel, self.col.read_bytes(rel))
             if raw is None:
                 continue
@@ -3612,6 +3662,9 @@ class Triage:
                 continue
             total = sum(counts[idx].values())
             self.pivot_stats[term] = (total, spans[idx][0], spans[idx][1])
+            self.pivot_artifacts[term] = sorted(counts[idx])
+            if term not in self.pivot_reported:
+                continue                 # counted for the IOCS table, not a finding
             for host, n, line in ev:
                 self.pivot_hits.append((term, host, n, line))
             self.add("HIGH", "Pivot", "Cross-artifact hits for '%s'" % term,

@@ -10644,6 +10644,8 @@ class Triage:
         self.tz_source = ""            # what stated it, if anything did
         self.host_tz = {}
         self.iocs = defaultdict(set)  # ioc string -> set of artifact mentions
+        self.pivot_artifacts = {}     # indicator -> the artifacts naming it
+        self.pivot_reported = set()   # the ones that earn a finding
         self.ww_paths = set()         # world-writable paths confirmed from the bodyfile
         self.bodyfile_seen = False
         self.auto_pivot = set()       # indicators worth chasing across every artifact
@@ -14141,6 +14143,34 @@ class Triage:
                 out.append(t)
         return out
 
+    #: How many extracted indicators to carry into the counting pass. They
+    #: cost one alternative each in a regex that is compiled once, so the cap
+    #: is about the pathological case - a collection that yielded tens of
+    #: thousands of paths - rather than about the ordinary one.
+    IOC_COUNT_LIMIT = 4000
+
+    def _ioc_terms(self, already):
+        """Indicators worth counting, that are not already being pivoted on.
+
+        Only the ones that are literal text an artifact could contain. The
+        analyzers also record shorthand - 'port:8080', 'pid:1417' - which name
+        a thing rather than quote one, and grepping the collection for the
+        string 'pid:1417' would find nothing and report zero, which reads as
+        an indicator that does not appear.
+        """
+        out = []
+        for value in sorted(self.iocs):
+            low = value.lower()
+            if low in already or ":" in value[:5] and value.split(":", 1)[0] in (
+                    "port", "pid"):
+                continue
+            if len(value) < 4:
+                continue           # too short to search for without noise
+            out.append(value)
+            if len(out) >= self.IOC_COUNT_LIMIT:
+                break
+        return out
+
     def analyze_pivot(self):
         """Search every collected artifact for the given indicators.
 
@@ -14157,6 +14187,15 @@ class Triage:
         disagree constantly about the case of hashes and hostnames.
         """
         terms = self._pivot_terms()[: self.opts.pivot_limit]
+        # Every other indicator any analyzer extracted, counted in the same
+        # pass but never reported as a finding. The IOCS table wants a count,
+        # a first and a last for all of them, and a second sweep of the
+        # collection to get it would double the most expensive step in the
+        # run - whereas one more alternative in an alternation that is already
+        # being compiled costs nothing measurable.
+        quiet = self._ioc_terms(set(t.lower() for t in terms))
+        self.pivot_reported = set(terms)
+        terms = terms + quiet
         if not terms:
             return
         try:
@@ -14179,6 +14218,17 @@ class Triage:
             if self.col._sizes.get(low, 0) > self.PIVOT_MAX_FILE:
                 continue
             host = self.col.host_path(rel)
+            # The name is evidence too. Samba writes one log per client as
+            # /var/log/samba/log.10.198.11.107, and an indicator that appears
+            # only in a path was being counted as appearing nowhere - which
+            # reads as an address this host never talked to, on a host that
+            # kept a whole logfile for it.
+            mp = rx.search(host)
+            if mp:
+                idx = mp.lastindex - 1 if mp.lastindex else 0
+                counts[idx][host] += 1
+                if len(hits[idx]) < 60:
+                    hits[idx].append((host, 0, "(named by the artifact path)"))
             raw = decompress_bytes(rel, self.col.read_bytes(rel))
             if raw is None:
                 continue
@@ -14204,6 +14254,9 @@ class Triage:
                 continue
             total = sum(counts[idx].values())
             self.pivot_stats[term] = (total, spans[idx][0], spans[idx][1])
+            self.pivot_artifacts[term] = sorted(counts[idx])
+            if term not in self.pivot_reported:
+                continue                 # counted for the IOCS table, not a finding
             for host, n, line in ev:
                 self.pivot_hits.append((term, host, n, line))
             self.add("HIGH", "Pivot", "Cross-artifact hits for '%s'" % term,
@@ -21183,6 +21236,57 @@ class TableBuilder:
             t.add(term, ioc_type(term), ioc_mitre(iocs.get(term)),
                   cnt, first, last, host, n, line)
 
+    def t_iocs(self):
+        """Every indicator this run extracted, with why it is one.
+
+        IOC_HITS answers "where was this term seen", one row per hit, and only
+        for the terms --pivot was given. This answers the question an analyst
+        actually starts from: what are the indicators for this host, all of
+        them, in one list to hand to a SIEM or a threat feed.
+
+        The why column is the point. An IP address with no provenance is a
+        number - the same 10.0.0.5 is a domain controller or an exfiltration
+        destination depending on which analyzer picked it up, and that is
+        recorded at the moment of extraction ('failed authentication source',
+        'outbound admin protocol', 'bodyfile (executable in tmpfs)') rather
+        than guessed at afterwards. Two indicators of the same shape and
+        different provenance are two different facts.
+
+        count, first_utc and last_utc come from the same single pass over the
+        collection that --pivot uses, so they cover every mention of the
+        indicator anywhere - not only the artifact that first named it.
+        """
+        iocs = getattr(self.tri, "iocs", None)
+        if not iocs:
+            return
+        t = self.table("IOCS", "Indicators extracted from this host",
+                       ["indicator", "ioc_type", "why", "count",
+                        "artifact_count", "first_utc", "last_utc",
+                        "artifacts", "mitre"],
+                       "Detection",
+                       "Every indicator any analyzer extracted, with the "
+                       "provenance that made it one. 'why' is where it was "
+                       "picked up and is what separates two indicators of the "
+                       "same shape: an address seen as a failed-login source "
+                       "is a different fact from the same address seen on an "
+                       "outbound admin connection. count, first_utc and "
+                       "last_utc are measured across every artifact in the "
+                       "collection rather than only the one that named it, so "
+                       "an indicator that turns up nowhere else has a count "
+                       "of 0 and that is itself worth knowing. Feed the "
+                       "indicator column to a SIEM; read the why column "
+                       "before you do.")
+        stats = getattr(self.tri, "pivot_stats", {})
+        arts = getattr(self.tri, "pivot_artifacts", {})
+        for value in sorted(iocs, key=lambda v: (ioc_type(v), v.lower())):
+            labels = sorted(iocs[value])
+            count, first, last = stats.get(value, ("", "", ""))
+            where = arts.get(value, [])
+            t.add(value, ioc_type(value), "; ".join(labels),
+                  count if count != "" else 0, len(where), first, last,
+                  "; ".join(where[:12]) + (" ..." if len(where) > 12 else ""),
+                  ioc_mitre(labels))
+
     def t_rule_errors(self):
         """Rules that would not load, and why - the coverage you did not get."""
         t = self.table("RULE_ERRORS", "Detection rules that failed to load",
@@ -21994,7 +22098,8 @@ class TableBuilder:
         # their own right. Ordering them the other way silently dropped every
         # rule hit out of FINDINGS and the console report.
         "t_sensitive_files",
-        "t_hacktools", "t_yara", "t_sigma", "t_pivot", "t_rule_errors",
+        "t_hacktools", "t_yara", "t_sigma", "t_pivot", "t_iocs",
+        "t_rule_errors",
         "t_findings", "t_timeline",
         # why an artifact above is absent, before the list of what is left
         "t_collection_errors",
@@ -22371,6 +22476,16 @@ padding:0 8px;margin:0 4px 4px 0;font-size:11px;cursor:pointer;color:var(--accen
 .pill:hover{background:var(--panel2)}
 .empty{color:var(--dim);padding:26px 4px;text-align:center}
 .bartop{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+.card2{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+ padding:10px 12px;margin:10px 0}
+.card2 a.gs{cursor:pointer;color:var(--accent);text-decoration:none}
+.card2 a.gs:hover{text-decoration:underline}
+table.mini{width:100%;margin-top:8px;border-collapse:collapse;font-size:12px;
+ table-layout:fixed}
+table.mini th{text-align:left;color:var(--dim);font-weight:normal;
+ border-bottom:1px solid var(--line);padding:3px 6px}
+table.mini td{padding:3px 6px;border-bottom:1px solid var(--line);
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 input[type=search],select{background:var(--panel);color:var(--fg);
 border:1px solid var(--line);border-radius:5px;padding:5px 9px;font:inherit;outline:none}
 input[type=search]{flex:1}
@@ -22462,11 +22577,11 @@ var TB=D.tables||{},IDX=D.index||[],V=D.views||{},PIN=D.pinned||[];
 /* The offensive-tool grid the overview reads and the nav pins. Named once:
    the console asks for it in four places and a typo would fail silently. */
 var HT='HACKTOOL_HITS';
-var st={view:null,sev:{},cat:'',tech:'',sel:null,table:null,tq:'',
+var st={view:null,sev:{},cat:'',tech:'',sel:null,table:null,tq:'',gq:'',
         t0:null,t1:null};   /* t0/t1: the time window, epoch seconds, inclusive */
 SEV.forEach(function(s){st.sev[s]=true;});
 var VIEWS=[['overview','Overview'],['findings','Findings'],['attack','ATT&CK'],
-           ['timeline','Timeline']];
+           ['timeline','Timeline'],['search','Search all']];
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
@@ -23275,12 +23390,81 @@ function buildNav(){
 }
 
 /* ---------- render ---------- */
+/* Search every table at once.
+   The per-table box answers "where in this grid", which is the question you
+   have once you already know which grid. The question an examination starts
+   from is the other one - this address, this hash, this filename, anywhere in
+   the evidence - and answering it by opening forty tables in turn is how an
+   indicator gets missed in the one nobody thought to open.
+   Every row of every table is scanned, so this is the whole export and not a
+   sample of it. That costs a pass over the payload, which is why it runs on a
+   debounce rather than on every keystroke. */
+function searchAll(q){
+ q=String(q||'').toLowerCase();
+ var out=[];
+ if(q.length<2)return out;
+ for(var i=0;i<IDX.length;i++){
+  var name=IDX[i].name,t=TB[name];
+  if(!t||!t.rows)continue;
+  var rows=t.rows,n=0,sample=[];
+  for(var r=0;r<rows.length;r++){
+   var row=rows[r],hit=false;
+   for(var c=0;c<row.length;c++){
+    var v=row[c];
+    if(v&&String(v).toLowerCase().indexOf(q)>=0){hit=true;break;}
+   }
+   if(hit){n++;if(sample.length<3)sample.push(row);}
+  }
+  if(n)out.push({name:name,title:t.title,count:n,sample:sample,cols:t.columns,
+                 capped:t.row_count>rows.length,total:t.row_count,
+                 rows:rows.length});
+ }
+ out.sort(function(a,b){return b.count-a.count;});
+ return out;
+}
+function viewSearch(){
+ var q=st.gq||'';
+ var h='<h1>Search all tables</h1>';
+ h+='<div class="controls"><input type="search" id="gq" placeholder="an address, '+
+    'a hash, a filename, a username - anywhere in the evidence..." value="'+
+    esc(q)+'"></div>';
+ if(q.length<2){
+  h+='<p class="desc">Type at least two characters. Every row of every table '+
+     'is searched, so this covers the whole export rather than the table you '+
+     'happen to be looking at.</p>';
+  return h;
+ }
+ var res=searchAll(q);
+ if(!res.length){
+  h+='<div class="empty">Nothing in any table matches '+esc(q)+'.</div>';
+  return h;
+ }
+ var total=0;res.forEach(function(x){total+=x.count;});
+ h+='<p class="desc">'+total.toLocaleString()+' matching row(s) in '+
+    res.length+' table(s). Click a table to open it with this filter applied.</p>';
+ res.forEach(function(x){
+  h+='<div class="card2"><a class="gs" data-t="'+esc(x.name)+'"><b>'+esc(x.name)+
+     '</b> <span class="badge">'+x.count.toLocaleString()+'</span></a> '+
+     '<span class="desc">'+esc(x.title||'')+
+     (x.capped?' - the page holds '+x.rows.toLocaleString()+' of '+
+      x.total.toLocaleString()+' rows, so this searched those':'')+'</span>';
+  h+='<table class="mini"><tr>';
+  x.cols.forEach(function(c){h+='<th>'+esc(c)+'</th>';});
+  h+='</tr>';
+  x.sample.forEach(function(r){
+   h+='<tr>';
+   for(var i=0;i<x.cols.length;i++){h+='<td>'+esc(r[i]==null?'':r[i])+'</td>';}
+   h+='</tr>';});
+  h+='</table></div>';});
+ return h;
+}
 function render(){
  /* Every view except the overview and the matrix is a table, and a table
     renders itself: it owns its sort, its column filters and its caret, none
     of which survive being rebuilt from a string. */
  if(st.view==='table'||vt(st.view)){tRender();markNav();return;}
- el('main').innerHTML=st.view==='attack'?viewAttack():viewOverview();
+ el('main').innerHTML=st.view==='search'?viewSearch()
+  :st.view==='attack'?viewAttack():viewOverview();
  wire();
  markNav();
 }
@@ -23294,9 +23478,27 @@ function goTable(name,q){
  location.hash='t/'+name;
  render();
 }
+var gqTimer=null;
 function wire(){
  wireHisto();
  wireWin();
+ var gq=el('gq');
+ if(gq){
+  gq.oninput=function(){
+   /* debounced: this reads every row of every table, and doing that on each
+      keystroke of a 40 MB export makes the box feel broken */
+   if(gqTimer)clearTimeout(gqTimer);
+   var v=gq.value;
+   gqTimer=setTimeout(function(){
+    st.gq=v;
+    el('main').innerHTML=viewSearch();
+    wire();
+    var b=el('gq');
+    if(b){b.focus();b.setSelectionRange(b.value.length,b.value.length);}
+   },250);};
+  [].forEach.call(document.querySelectorAll('a.gs'),function(a){
+   a.onclick=function(){goTable(a.getAttribute('data-t'),st.gq||'');};});
+ }
  [].forEach.call(document.querySelectorAll('[data-tech]'),function(x){
   x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
  [].forEach.call(document.querySelectorAll('.card[data-sev]'),function(cd){
@@ -23936,7 +24138,9 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
     for t in tables:
         index.append({"name": t.name, "title": t.title,
                       "category": t.category or "Other", "rows": len(t)})
-        d = t.as_dict(limit=html_cap)
+        # 0 means every row: the page is meant to carry the whole export so
+        # that a search across all tables is a search across all the evidence
+        d = t.as_dict(limit=html_cap or None)
         d["cap"] = 500          # rows rendered at once in the DOM
         tbls[t.name] = d
 
@@ -24103,8 +24307,23 @@ def export_tables(tri, col, opts, tb=None):
         t0 = time.perf_counter()
         write_tables_html(tables, html_path, opts.html_rows, meta, tri, opts)
         writer_times.append(("write HTML browser", time.perf_counter() - t0))
-        print("[+] console written to %s (%d findings, %d tables)"
-              % (html_path, len(tri.findings), len(tables)), file=sys.stderr)
+        # The page carries every row by default, so its size is a fact worth
+        # printing rather than a surprise on opening it. A browser copes with
+        # a large one - the grid renders 500 rows at a time - but the payload
+        # is parsed in one go, and an analyst about to open a 300 MB file on
+        # a 4 GB evidence workstation should be told first.
+        try:
+            size = os.path.getsize(html_path)
+        except OSError:
+            size = 0
+        rows = sum(len(t) for t in tables)
+        print("[+] console written to %s (%d findings, %d tables, %s rows, %s)"
+              % (html_path, len(tri.findings), len(tables), format(rows, ","),
+                 human_size(size)), file=sys.stderr)
+        if size > 200 * 1024 * 1024:
+            status("[!] that page is %s because it holds every row. "
+                   "--html-rows N caps the rows embedded in it; the CSV and "
+                   "JSON exports are unaffected either way." % human_size(size))
     if opts.process_map:
         master = next((t for t in tables if t.name == "PROCESS_MASTER"), None)
         if master is None:
@@ -24858,9 +25077,14 @@ def main(argv=None):
     tg.add_argument("--process-map", metavar="PATH",
                     help="write ONLY the correlated one-row-per-PID process table "
                          "to a single file (.csv/.html/.json by extension)")
-    tg.add_argument("--html-rows", type=int, default=2000, metavar="N",
-                    help="rows per table embedded in the HTML browser (default 2000; "
-                         "the CSV and JSON exports always get everything)")
+    tg.add_argument("--html-rows", type=int, default=0, metavar="N",
+                    help="rows per table embedded in the HTML browser. 0, the "
+                         "default, embeds every row, so the page carries the "
+                         "whole export and 'Search all' really does search "
+                         "all of it. Set a number to cap it when the page "
+                         "would be too large to open comfortably - the size "
+                         "is printed either way, and the CSV and JSON exports "
+                         "are unaffected.")
 
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colour")
     ap.add_argument("--quiet", action="store_true", help="suppress the console report")

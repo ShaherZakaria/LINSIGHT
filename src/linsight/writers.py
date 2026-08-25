@@ -12,7 +12,7 @@ import time
 
 from .constants import VERSION
 from .term import status
-from .common import NDJSON_TIME_COLUMNS
+from .common import NDJSON_TIME_COLUMNS, human_size
 from .tables import TableBuilder, _s
 from .gui import APP_CSS, APP_JS, ATTACK_ORDER, ATTACK_TACTICS, _triage_payload
 
@@ -230,7 +230,9 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
     for t in tables:
         index.append({"name": t.name, "title": t.title,
                       "category": t.category or "Other", "rows": len(t)})
-        d = t.as_dict(limit=html_cap)
+        # 0 means every row: the page is meant to carry the whole export so
+        # that a search across all tables is a search across all the evidence
+        d = t.as_dict(limit=html_cap or None)
         d["cap"] = 500          # rows rendered at once in the DOM
         tbls[t.name] = d
 
@@ -397,8 +399,23 @@ def export_tables(tri, col, opts, tb=None):
         t0 = time.perf_counter()
         write_tables_html(tables, html_path, opts.html_rows, meta, tri, opts)
         writer_times.append(("write HTML browser", time.perf_counter() - t0))
-        print("[+] console written to %s (%d findings, %d tables)"
-              % (html_path, len(tri.findings), len(tables)), file=sys.stderr)
+        # The page carries every row by default, so its size is a fact worth
+        # printing rather than a surprise on opening it. A browser copes with
+        # a large one - the grid renders 500 rows at a time - but the payload
+        # is parsed in one go, and an analyst about to open a 300 MB file on
+        # a 4 GB evidence workstation should be told first.
+        try:
+            size = os.path.getsize(html_path)
+        except OSError:
+            size = 0
+        rows = sum(len(t) for t in tables)
+        print("[+] console written to %s (%d findings, %d tables, %s rows, %s)"
+              % (html_path, len(tri.findings), len(tables), format(rows, ","),
+                 human_size(size)), file=sys.stderr)
+        if size > 200 * 1024 * 1024:
+            status("[!] that page is %s because it holds every row. "
+                   "--html-rows N caps the rows embedded in it; the CSV and "
+                   "JSON exports are unaffected either way." % human_size(size))
     if opts.process_map:
         master = next((t for t in tables if t.name == "PROCESS_MASTER"), None)
         if master is None:
