@@ -64,9 +64,15 @@ def print_console(tri, opts):
     out.write("\n" + c("=" * 100, "head", color) + "\n")
     out.write(c("  LINUX TRIAGE REPORT", "bold", color) + "   v%s\n" % VERSION)
     out.write("  %-14s : %s\n" % ("collection", tri.col.path))
-    out.write("  %-14s : %s\n" % ("layout", {"uac": "UAC",
-                                             "velociraptor": "Velociraptor offline collector"}
-                                  .get(tri.col.layout, tri.col.layout)))
+    # A disk image and an AD1 both name themselves: their layout is 'uac'
+    # internally, because that is where the parsers look for a copied
+    # filesystem, and printing that here would say the evidence came out of
+    # UAC when it did not.
+    layout = getattr(tri.col, "display_layout", "") or {
+        "uac": "UAC",
+        "velociraptor": "Velociraptor offline collector"}.get(
+            tri.col.layout, tri.col.layout)
+    out.write("  %-14s : %s\n" % ("layout", layout))
     for k, label in (("Hostname", "hostname"),
                      ("Hostname (from archive name)", "hostname"),
                      ("uname", "kernel"),

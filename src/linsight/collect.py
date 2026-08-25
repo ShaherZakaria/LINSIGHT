@@ -296,9 +296,9 @@ class Collection:
     #
     # (magic, what it is, what to do about it)
     FOREIGN = (
-        (b"ADSEGMENTEDFILE\x00", "an AccessData/FTK logical image (AD1)",
-         "Export its contents - FTK Imager, File > Export Files... - and point\n"
-         "    linsight at the exported tree:  python linsight.py --file <dir>"),
+        # AD1 itself is read by the ad1 module and never reaches here; what
+        # does reach here is one whose set is broken up, so say that rather
+        # than "not a gzip file"
         (b"ADCRYPTEDFILE\x00", "an encrypted AccessData image",
          "Decrypt it in FTK Imager first."),
         (b"7z\xbc\xaf\x27\x1c", "a 7-Zip archive",

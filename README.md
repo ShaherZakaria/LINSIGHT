@@ -15,6 +15,8 @@ python linsight.py ./uac-host-linux-20260324234043.tar.gz
 python linsight.py ./web01.E01
 ```
 
+It also reads **AD1** — the logical images FTK Imager writes. See [AD1 logical images](#ad1-logical-images).
+
 No collection and no image? `--file` runs the same parsers over loose files — one `auth.log`, a folder of them, a copied-out `/etc`. See [Without a collection](#without-a-collection).
 
 ## Why
@@ -256,6 +258,55 @@ LVM2 metadata from the on-disk format. That fixture covers the linear layout a
 default install produces. Striped and mirrored segments are implemented against
 the format and are not covered by it.
 
+## AD1 logical images
+
+An AD1 is what FTK Imager writes when someone acquires *files* rather than a
+disk — a "Custom Content Image": give me `/etc`, `/var/log` and the home
+directories off this box. Point linsight at one:
+
+```bash
+python linsight.py ./FirstHack.ad1
+python linsight.py ./case.ad1 --sigma ./sigma-rules/ --export ./out
+```
+
+It is a tree of files with their metadata, which is what the collection layer
+already takes, so an AD1 is a fifth backend beside directory, tar, zip and
+disk. Multi-segment sets (`.ad1`, `.ad2`, … past `.ad9` into `.ad10`) are
+gathered from any one of them and read as a single stream.
+
+Three things come out of the format that a tar of the same files would not
+have:
+
+| | |
+|---|---|
+| **four timestamps** | atime, mtime, ctime **and crtime** per entry, so `BODYFILE` and the timeline carry creation times off a logical image the same way they do off a disk |
+| **stored hashes** | FTK records an MD5 and a SHA-1 for every file as it acquires it. Those land in `FILE_HASHES` — a VT-ready hash list for the whole acquisition, with nothing else run |
+| **owner and mode** | uid, gid and the mode string as the source filesystem had them, not as whatever unpacked the image left them |
+
+### How it is verified
+
+The stored hashes are also the answer key. Every file the reader extracts is
+hashed and compared with the MD5 and SHA-1 the imager wrote beside it — a
+reader with the format even slightly wrong cannot produce thousands of matching
+digests. On the image this was developed against: **1,860 files, 270 MB, zero
+mismatches.**
+
+That check needs no fixture from this project. Drop any AD1 into
+`tests/fixtures/` and `python tests/test_disk.py` verifies it against its own
+hashes, which is how to confirm the reader handles an image it has not seen.
+
+The format is not documented by the vendor; it was read off real images. Two
+things follow. The four timestamps are unlabelled, so they were not guessed:
+they are pinned by two invariants the source filesystem cannot break — `ctime
+>= mtime`, since ctime updates whenever mtime does, and `crtime <= ctime`,
+since a file cannot be changed before it exists. Only one assignment survives
+both across a whole acquisition. And an AD1 whose version or shape this reader
+has not been shown fails by name and says to export it with FTK Imager, rather
+than returning a partial tree.
+
+Encrypted AccessData images (`ADCRYPTEDFILE`) are identified and refused —
+decrypt in FTK Imager first.
+
 ## Without a collection
 
 You do not need a UAC or Velociraptor collection. `--file` parses loose files
@@ -395,7 +446,7 @@ where the volatile half of a UAC collection lives.
 
 ## Caveats
 
-- Linux only. Windows and macOS artifacts are not parsed, and an NTFS or APFS volume on a disk is named in `DISK_LAYOUT` and left unread.
+- Linux only. Windows and macOS artifacts are not parsed, and an NTFS or APFS volume on a disk is named in `DISK_LAYOUT` and left unread. An AD1 of a Windows host will mount and its files will be listed, but almost nothing in it has a parser here.
 - On a disk, only what survives a shutdown is there. Process, socket and module tables come out empty; the report says so.
 - Findings are leads, not verdicts. Every one names the artifact it came from; confirm against the evidence before acting on it.
 - A full export of a mid-size collection is hundreds of MB of CSV. Use `--scope` or `--csv-dir` with a narrower need if you do not want all of it.

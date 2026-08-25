@@ -44,6 +44,52 @@ def utc(seconds, nanos=0):
         return None
 
 
+def epoch_seconds(when):
+    """A datetime as whole seconds since 1970, or 0 for 'not recorded'.
+
+    0 rather than an empty string because that is what a mactime bodyfile
+    wants in a time column it has nothing for, and every backend that builds
+    one is writing the same format.
+    """
+    if not when:
+        return 0
+    try:
+        return int(when.timestamp())
+    except (OverflowError, OSError, ValueError, AttributeError):
+        return 0
+
+
+class GeneratedLines(io.RawIOBase):
+    """A read-only stream over lines produced on demand.
+
+    The bodyfile of a full server filesystem is a few hundred megabytes of
+    text that exists only because this tool wants to read it back. Building it
+    in memory to hand to a reader that consumes it a line at a time is how a
+    4 GB machine becomes a swapping one, so it is produced as it is read.
+    """
+
+    def __init__(self, make_lines):
+        io.RawIOBase.__init__(self)
+        self._iter = make_lines()
+        self._buf = b""
+        self._done = False
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        want = len(buf)
+        while len(self._buf) < want and not self._done:
+            try:
+                self._buf += next(self._iter)
+            except StopIteration:
+                self._done = True
+        take = min(want, len(self._buf))
+        buf[:take] = self._buf[:take]
+        self._buf = self._buf[take:]
+        return take
+
+
 class FsNode(object):
     """One name in a filesystem, with whatever that filesystem knows about it.
 
