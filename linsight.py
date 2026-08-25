@@ -14670,25 +14670,6 @@ class Table:
     def __len__(self):
         return self._count
 
-    def as_dict(self, limit=None):
-        rows = (list(self.iter_rows()) if limit is None
-                else list(itertools.islice(self.iter_rows(), limit)))
-        return {
-            "name": self.name,
-            "title": self.title,
-            "category": self.category,
-            "description": self.description,
-            "sources": self.sources,
-            "columns": self.columns,
-            # self._count, not len(self.rows): once a table has spilled, the
-            # list is only the unflushed tail, and iterating above emptied it -
-            # so this reported every large table as having no rows at all while
-            # still shipping them
-            "row_count": self._count,
-            "rows_included": len(rows),
-            "rows": [[_s(v) for v in r] for r in rows],
-        }
-
 
 def _human_duration(seconds):
     """Seconds -> '3d 04h', '2h 14m', '4m 55s', '41s'.
@@ -23243,6 +23224,59 @@ button.clr:hover{color:var(--accent);border-color:var(--accent)}
 
 APP_JS = """var D=window.__LINSIGHT__,SEV=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
 var TB=D.tables||{},IDX=D.index||[],V=D.views||{},PIN=D.pinned||[];
+/* Rows for the large tables, gzipped and base64'd, one entry per table.
+
+   The page carries every row of the export so that a search across all
+   tables is a search across all the evidence - which on a real collection is
+   three quarters of a million rows and, written as plain JSON, a 228 MB
+   file that a browser will not open in any reasonable time. Compressed it is
+   14 MB, and decoded a table at a time, when that table is first read.
+
+   Small tables are not in here at all: they are inline in D.tables, so the
+   findings, the timeline and the forty-odd little grids need no decoder. */
+var PACK=window.__ROWS__||{},GZ_OK=(typeof DecompressionStream!=='undefined');
+var PENDING={};
+function unpack(b64){
+ var bin=atob(b64),u=new Uint8Array(bin.length);
+ for(var i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);
+ var st=new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'));
+ return new Response(st).text().then(function(txt){return JSON.parse(txt);});
+}
+/* Resolves once every named table has its rows. Decodes run once per table
+   and are shared: opening a grid while the same table is already being
+   decoded for a search must not decode it twice. */
+function ensure(names){
+ var want=[];
+ (names||[]).forEach(function(n){
+  var t=TB[n];
+  if(!t||t.rows!==undefined||!PACK[n])return;
+  if(want.indexOf(n)<0)want.push(n);});
+ if(!want.length)return Promise.resolve();
+ if(!GZ_OK){
+  want.forEach(function(n){TB[n].rows=[];TB[n].no_gzip=true;});
+  return Promise.resolve();
+ }
+ return Promise.all(want.map(function(n){
+  if(!PENDING[n]){
+   PENDING[n]=unpack(PACK[n]).then(function(rows){
+    TB[n].rows=rows;delete PACK[n];
+   },function(err){
+    TB[n].rows=[];TB[n].decode_error=String(err&&err.message||err);});
+  }
+  return PENDING[n];}));
+}
+/* Which tables the view about to be drawn actually reads. The console views
+   are computed from FINDINGS and TIMELINE, the overview also ranks a handful
+   of named grids, and the search reads everything by definition. */
+function needs(){
+ var n=[],k;
+ for(k in V)n.push(V[k]);
+ if(TB[HT])n.push(HT);
+ RANKED.forEach(function(r){n.push(r[0]);});
+ if(st.table)n.push(st.table);
+ if(st.view==='search')for(k in TB)n.push(k);
+ return n;
+}
 /* The offensive-tool grid the overview reads and the nav pins. Named once:
    the console asks for it in four places and a typo would fail silently. */
 var HT='HACKTOOL_HITS';
@@ -23473,7 +23507,7 @@ function chips(){
  var f=fc();
  if(!f){el('chips').innerHTML='';return;}
  var n={};
- f.t.rows.forEach(function(r){n[r[f.severity]]=(n[r[f.severity]]||0)+1;});
+ (f.t.rows||[]).forEach(function(r){n[r[f.severity]]=(n[r[f.severity]]||0)+1;});
  var h='';
  SEV.forEach(function(s){
   h+='<button class="chip '+s+' '+(st.sev[s]?'on':'off')+'" data-s="'+s+'">'+
@@ -24127,7 +24161,9 @@ function viewSearch(){
   h+='</table></div>';});
  return h;
 }
-function render(){
+/* Drawn only once the rows the view reads are decoded. Everything below
+   this point may assume TB[name].rows is an array. */
+function draw(){
  /* Every view except the overview and the matrix is a table, and a table
     renders itself: it owns its sort, its column filters and its caret, none
     of which survive being rebuilt from a string. */
@@ -24136,6 +24172,15 @@ function render(){
   :st.view==='attack'?viewAttack():viewOverview();
  wire();
  markNav();
+}
+function render(){
+ var want=needs(),cold=want.filter(function(n){
+  return TB[n]&&TB[n].rows===undefined&&PACK[n];});
+ /* Only says so when there is actually a wait. Decoding one small grid is
+    faster than the message would be readable. */
+ if(cold.length)el('main').innerHTML='<div class="empty">Decoding '+
+  cold.length+' table'+(cold.length>1?'s':'')+'...</div>';
+ ensure(want).then(draw);
 }
 /* Open an artifact grid with its row filter already typed in. A tool bar in
    the overview is a question about one tool, and landing on the unfiltered
@@ -24160,10 +24205,12 @@ function wire(){
    var v=gq.value;
    gqTimer=setTimeout(function(){
     st.gq=v;
-    el('main').innerHTML=viewSearch();
-    wire();
-    var b=el('gq');
-    if(b){b.focus();b.setSelectionRange(b.value.length,b.value.length);}
+    ensure(needs()).then(function(){
+     el('main').innerHTML=viewSearch();
+     wire();
+     var b=el('gq');
+     if(b){b.focus();b.setSelectionRange(b.value.length,b.value.length);}
+    });
    },250);};
   [].forEach.call(document.querySelectorAll('a.gs'),function(a){
    a.onclick=function(){goTable(a.getAttribute('data-t'),st.gq||'');};});
@@ -24195,8 +24242,6 @@ function wire(){
    else if(a==='open'){goTable(k,'');}};});
 }
 function start(){
- chips();
- buildNav();
  /* Wired once and never rebuilt: these live in the header, outside main, so
     they keep their text and their caret across every render - the same reason
     the per-column filter inputs are left alone by tRefresh. */
@@ -24222,12 +24267,21 @@ function start(){
  document.addEventListener('click',function(){
   var c=el('cal');
   if(c&&c.classList.contains('open'))calClose();});
- var v=(location.hash||'').replace('#','');
- if(v.indexOf('t/')===0&&TB[v.slice(2)])setView('table',v.slice(2));
- else if(['overview','findings','attack','timeline'].indexOf(v)>=0&&
-         (fc()||vt('timeline')))setView(v);
- else if(fc()||vt('timeline'))setView('overview');
- else if(IDX.length)setView('table',IDX[0].name);
+ /* The severity chips count FINDINGS rows and the first view reads them,
+    so the page waits for that one decode before it draws anything. It is
+    the only wait the console makes on open: every other table is decoded
+    when it is opened. */
+ el('main').innerHTML='<div class="empty">Opening the export...</div>';
+ ensure(needs()).then(function(){
+  chips();
+  buildNav();
+  var v=(location.hash||'').replace('#','');
+  if(v.indexOf('t/')===0&&TB[v.slice(2)])setView('table',v.slice(2));
+  else if(['overview','findings','attack','timeline'].indexOf(v)>=0&&
+          (fc()||vt('timeline')))setView(v);
+  else if(fc()||vt('timeline'))setView('overview');
+  else if(IDX.length)setView('table',IDX[0].name);
+ });
  document.onkeydown=function(e){
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
   var k=e.key;
@@ -24425,7 +24479,12 @@ function tRender(){
     ' rows total</span><span class="badge" id="matchn">'+rows.length.toLocaleString()+
     ' matching</span><button class="clr" id="clr">clear filters</button>'+
     winBadge(t);
- if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
+ if(t.no_gzip){h+='<span class="badge warn">this browser has no '+
+   'DecompressionStream, so the packed tables cannot be read here \\u2014 '+
+   'use the CSV / JSON export, or a current browser</span>';}
+ else if(t.decode_error){h+='<span class="badge warn">these rows would not '+
+   'decode: '+esc(t.decode_error)+'</span>';}
+ else if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
    t.rows.length.toLocaleString()+' \\u2014 full data in the CSV / JSON export</span>';}
  h+='</div>';
  h+='<div id="vhead">'+viewHead()+'</div>';
@@ -24783,6 +24842,51 @@ def _script_json(obj):
     return json.dumps(obj).replace("<", "\\u003c")
 
 
+#: A table whose rows are smaller than this stays inline in the page, as
+#: plain JSON. Most tables are tiny - forty of the fifty-nine on a workstation
+#: collection are under a few kilobytes - and compressing those buys nothing
+#: while making the page need a decompressor before it can show anything at
+#: all. Above it, compression is worth roughly twenty times its own weight.
+PACK_MIN = 8192
+
+
+def _packed_rows(table, limit):
+    """(inline rows, base64 of gzipped rows) - exactly one of the two.
+
+    Compressed per table rather than in one block, because the point is that
+    the page opens without decoding all of it. A collection with three
+    quarters of a million rows makes a 228 MB page, and a browser asked to
+    parse that much JSON before it can draw anything either takes a minute
+    over it or gives up. One table at a time, decoded when it is opened, is
+    what makes 'every row is in the page' and 'the page opens' both true.
+
+    The JSON is fed to the compressor a row at a time and never assembled -
+    VAR_LOG alone runs to a million rows, and holding its text and its
+    compressed form and the base64 of that at once is three copies of the
+    largest thing in the export.
+    """
+    rows = (table.iter_rows() if limit is None
+            else itertools.islice(table.iter_rows(), limit))
+    co = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    out, plain, n, small = [], [], 0, True
+    for r in rows:
+        text = "%s%s" % ("," if n else "[", _script_json([_s(v) for v in r]))
+        n += 1
+        if small:
+            plain.append(text)
+            if sum(len(x) for x in plain) > PACK_MIN:
+                small = False
+                out.append(co.compress("".join(plain).encode("utf-8")))
+                plain = []
+        else:
+            out.append(co.compress(text.encode("utf-8")))
+    if small:
+        return json.loads("".join(plain) + "]") if n else [], ""
+    out.append(co.compress(("]" if n else "[]").encode("utf-8")))
+    out.append(co.flush())
+    return None, base64.b64encode(b"".join(out)).decode("ascii")
+
+
 # Artifact tables the console lists above the per-category nav, in this order.
 # "is any of the known toolkit on this host at all" is the first question asked
 # of a triage collection, and the answer was three categories down the sidebar
@@ -24803,14 +24907,23 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
     is what a single-table export (--process-map p.html) should still produce.
     """
     esc = htmllib.escape
-    index, tbls = [], {}
+    index, tbls, packed = [], {}, {}
     for t in tables:
         index.append({"name": t.name, "title": t.title,
                       "category": t.category or "Other", "rows": len(t)})
         # 0 means every row: the page is meant to carry the whole export so
         # that a search across all tables is a search across all the evidence
-        d = t.as_dict(limit=html_cap or None)
-        d["cap"] = 500          # rows rendered at once in the DOM
+        limit = html_cap or None
+        rows, blob = _packed_rows(t, limit)
+        d = {"name": t.name, "title": t.title, "category": t.category,
+             "description": t.description, "sources": t.sources,
+             "columns": t.columns, "row_count": len(t),
+             "rows_included": min(len(t), limit) if limit else len(t),
+             "cap": 500}         # rows rendered at once in the DOM
+        if blob:
+            packed[t.name] = blob
+        else:
+            d["rows"] = rows
         tbls[t.name] = d
 
     # Which table each console view reads. A view whose table was not built -
@@ -24860,6 +24973,13 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
         fh.write("<div class='layout'><nav id='nav'></nav>"
                  "<main id='main'></main></div>")
         fh.write("<script>window.__LINSIGHT__=%s;</script>" % _script_json(payload))
+        # written a table at a time rather than through json.dumps: this is
+        # the large half of the file, and base64 is already JSON-safe - it
+        # has no quote, no backslash and no '<' to escape.
+        fh.write("<script>window.__ROWS__={")
+        for i, (name, blob) in enumerate(sorted(packed.items())):
+            fh.write('%s%s:"%s"' % ("," if i else "", json.dumps(name), blob))
+        fh.write("};</script>")
         fh.write("<script>%s</script></body></html>" % APP_JS)
 
 
@@ -24977,10 +25097,11 @@ def export_tables(tri, col, opts, tb=None):
         write_tables_html(tables, html_path, opts.html_rows, meta, tri, opts)
         writer_times.append(("write HTML browser", time.perf_counter() - t0))
         # The page carries every row by default, so its size is a fact worth
-        # printing rather than a surprise on opening it. A browser copes with
-        # a large one - the grid renders 500 rows at a time - but the payload
-        # is parsed in one go, and an analyst about to open a 300 MB file on
-        # a 4 GB evidence workstation should be told first.
+        # printing rather than a surprise on opening it. The rows are gzipped
+        # per table and decoded when that table is opened, so the size on
+        # disk is roughly a twentieth of the evidence in it and opening the
+        # page no longer means parsing all of it - but a search across all
+        # tables does decode all of them, and that is held in memory.
         try:
             size = os.path.getsize(html_path)
         except OSError:
@@ -24989,10 +25110,12 @@ def export_tables(tri, col, opts, tb=None):
         print("[+] console written to %s (%d findings, %d tables, %s rows, %s)"
               % (html_path, len(tri.findings), len(tables), format(rows, ","),
                  human_size(size)), file=sys.stderr)
-        if size > 200 * 1024 * 1024:
-            status("[!] that page is %s because it holds every row. "
-                   "--html-rows N caps the rows embedded in it; the CSV and "
-                   "JSON exports are unaffected either way." % human_size(size))
+        if size > 40 * 1024 * 1024:
+            status("[!] that page is %s because it holds every row, packed. "
+                   "It opens without decoding all of it, but searching every "
+                   "table does. --html-rows N caps the rows embedded in it; "
+                   "the CSV and JSON exports are unaffected either way."
+                   % human_size(size))
     if opts.process_map:
         master = next((t for t in tables if t.name == "PROCESS_MASTER"), None)
         if master is None:

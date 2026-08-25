@@ -341,6 +341,59 @@ button.clr:hover{color:var(--accent);border-color:var(--accent)}
 
 APP_JS = """var D=window.__LINSIGHT__,SEV=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
 var TB=D.tables||{},IDX=D.index||[],V=D.views||{},PIN=D.pinned||[];
+/* Rows for the large tables, gzipped and base64'd, one entry per table.
+
+   The page carries every row of the export so that a search across all
+   tables is a search across all the evidence - which on a real collection is
+   three quarters of a million rows and, written as plain JSON, a 228 MB
+   file that a browser will not open in any reasonable time. Compressed it is
+   14 MB, and decoded a table at a time, when that table is first read.
+
+   Small tables are not in here at all: they are inline in D.tables, so the
+   findings, the timeline and the forty-odd little grids need no decoder. */
+var PACK=window.__ROWS__||{},GZ_OK=(typeof DecompressionStream!=='undefined');
+var PENDING={};
+function unpack(b64){
+ var bin=atob(b64),u=new Uint8Array(bin.length);
+ for(var i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);
+ var st=new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'));
+ return new Response(st).text().then(function(txt){return JSON.parse(txt);});
+}
+/* Resolves once every named table has its rows. Decodes run once per table
+   and are shared: opening a grid while the same table is already being
+   decoded for a search must not decode it twice. */
+function ensure(names){
+ var want=[];
+ (names||[]).forEach(function(n){
+  var t=TB[n];
+  if(!t||t.rows!==undefined||!PACK[n])return;
+  if(want.indexOf(n)<0)want.push(n);});
+ if(!want.length)return Promise.resolve();
+ if(!GZ_OK){
+  want.forEach(function(n){TB[n].rows=[];TB[n].no_gzip=true;});
+  return Promise.resolve();
+ }
+ return Promise.all(want.map(function(n){
+  if(!PENDING[n]){
+   PENDING[n]=unpack(PACK[n]).then(function(rows){
+    TB[n].rows=rows;delete PACK[n];
+   },function(err){
+    TB[n].rows=[];TB[n].decode_error=String(err&&err.message||err);});
+  }
+  return PENDING[n];}));
+}
+/* Which tables the view about to be drawn actually reads. The console views
+   are computed from FINDINGS and TIMELINE, the overview also ranks a handful
+   of named grids, and the search reads everything by definition. */
+function needs(){
+ var n=[],k;
+ for(k in V)n.push(V[k]);
+ if(TB[HT])n.push(HT);
+ RANKED.forEach(function(r){n.push(r[0]);});
+ if(st.table)n.push(st.table);
+ if(st.view==='search')for(k in TB)n.push(k);
+ return n;
+}
 /* The offensive-tool grid the overview reads and the nav pins. Named once:
    the console asks for it in four places and a typo would fail silently. */
 var HT='HACKTOOL_HITS';
@@ -571,7 +624,7 @@ function chips(){
  var f=fc();
  if(!f){el('chips').innerHTML='';return;}
  var n={};
- f.t.rows.forEach(function(r){n[r[f.severity]]=(n[r[f.severity]]||0)+1;});
+ (f.t.rows||[]).forEach(function(r){n[r[f.severity]]=(n[r[f.severity]]||0)+1;});
  var h='';
  SEV.forEach(function(s){
   h+='<button class="chip '+s+' '+(st.sev[s]?'on':'off')+'" data-s="'+s+'">'+
@@ -1225,7 +1278,9 @@ function viewSearch(){
   h+='</table></div>';});
  return h;
 }
-function render(){
+/* Drawn only once the rows the view reads are decoded. Everything below
+   this point may assume TB[name].rows is an array. */
+function draw(){
  /* Every view except the overview and the matrix is a table, and a table
     renders itself: it owns its sort, its column filters and its caret, none
     of which survive being rebuilt from a string. */
@@ -1234,6 +1289,15 @@ function render(){
   :st.view==='attack'?viewAttack():viewOverview();
  wire();
  markNav();
+}
+function render(){
+ var want=needs(),cold=want.filter(function(n){
+  return TB[n]&&TB[n].rows===undefined&&PACK[n];});
+ /* Only says so when there is actually a wait. Decoding one small grid is
+    faster than the message would be readable. */
+ if(cold.length)el('main').innerHTML='<div class="empty">Decoding '+
+  cold.length+' table'+(cold.length>1?'s':'')+'...</div>';
+ ensure(want).then(draw);
 }
 /* Open an artifact grid with its row filter already typed in. A tool bar in
    the overview is a question about one tool, and landing on the unfiltered
@@ -1258,10 +1322,12 @@ function wire(){
    var v=gq.value;
    gqTimer=setTimeout(function(){
     st.gq=v;
-    el('main').innerHTML=viewSearch();
-    wire();
-    var b=el('gq');
-    if(b){b.focus();b.setSelectionRange(b.value.length,b.value.length);}
+    ensure(needs()).then(function(){
+     el('main').innerHTML=viewSearch();
+     wire();
+     var b=el('gq');
+     if(b){b.focus();b.setSelectionRange(b.value.length,b.value.length);}
+    });
    },250);};
   [].forEach.call(document.querySelectorAll('a.gs'),function(a){
    a.onclick=function(){goTable(a.getAttribute('data-t'),st.gq||'');};});
@@ -1293,8 +1359,6 @@ function wire(){
    else if(a==='open'){goTable(k,'');}};});
 }
 function start(){
- chips();
- buildNav();
  /* Wired once and never rebuilt: these live in the header, outside main, so
     they keep their text and their caret across every render - the same reason
     the per-column filter inputs are left alone by tRefresh. */
@@ -1320,12 +1384,21 @@ function start(){
  document.addEventListener('click',function(){
   var c=el('cal');
   if(c&&c.classList.contains('open'))calClose();});
- var v=(location.hash||'').replace('#','');
- if(v.indexOf('t/')===0&&TB[v.slice(2)])setView('table',v.slice(2));
- else if(['overview','findings','attack','timeline'].indexOf(v)>=0&&
-         (fc()||vt('timeline')))setView(v);
- else if(fc()||vt('timeline'))setView('overview');
- else if(IDX.length)setView('table',IDX[0].name);
+ /* The severity chips count FINDINGS rows and the first view reads them,
+    so the page waits for that one decode before it draws anything. It is
+    the only wait the console makes on open: every other table is decoded
+    when it is opened. */
+ el('main').innerHTML='<div class="empty">Opening the export...</div>';
+ ensure(needs()).then(function(){
+  chips();
+  buildNav();
+  var v=(location.hash||'').replace('#','');
+  if(v.indexOf('t/')===0&&TB[v.slice(2)])setView('table',v.slice(2));
+  else if(['overview','findings','attack','timeline'].indexOf(v)>=0&&
+          (fc()||vt('timeline')))setView(v);
+  else if(fc()||vt('timeline'))setView('overview');
+  else if(IDX.length)setView('table',IDX[0].name);
+ });
  document.onkeydown=function(e){
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
   var k=e.key;
@@ -1523,7 +1596,12 @@ function tRender(){
     ' rows total</span><span class="badge" id="matchn">'+rows.length.toLocaleString()+
     ' matching</span><button class="clr" id="clr">clear filters</button>'+
     winBadge(t);
- if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
+ if(t.no_gzip){h+='<span class="badge warn">this browser has no '+
+   'DecompressionStream, so the packed tables cannot be read here \\u2014 '+
+   'use the CSV / JSON export, or a current browser</span>';}
+ else if(t.decode_error){h+='<span class="badge warn">these rows would not '+
+   'decode: '+esc(t.decode_error)+'</span>';}
+ else if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
    t.rows.length.toLocaleString()+' \\u2014 full data in the CSV / JSON export</span>';}
  h+='</div>';
  h+='<div id="vhead">'+viewHead()+'</div>';
