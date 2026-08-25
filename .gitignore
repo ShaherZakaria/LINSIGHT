@@ -31,3 +31,13 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Disk-image test fixtures built by tools/mkfixtures.py
+/tests/fixtures/
+*.dd
+*.raw
+*.img
+*.E01
+*.qcow2
+*.vmdk
+*.vhdx
