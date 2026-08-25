@@ -200,6 +200,53 @@ class Table:
         }
 
 
+def _human_duration(seconds):
+    """Seconds -> '3d 04:12', '02:14', '41s' - the way `last` reads."""
+    if seconds in ("", None):
+        return ""
+    try:
+        n = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if n < 0:
+        return ""
+    if n < 60:
+        return "%ds" % n
+    days, rest = divmod(n, 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return "%dd %02d:%02d" % (days, hours, rest // 60)
+    return "%02d:%02d" % (hours, rest // 60)
+
+
+def _duration_seconds(text):
+    """`last`'s own '(01:23)' or '(2+03:04)' -> seconds.
+
+    'still logged in' and 'gone - no logout' start with a letter and come back
+    empty rather than zero: a session of unknown length is not a session of no
+    length, and a zero here would sort with the forty-second ones.
+    """
+    s = str(text or "").strip().strip("()")
+    if not s or not s[0].isdigit():
+        return ""
+    days = 0
+    if "+" in s:
+        head, _, s = s.partition("+")
+        try:
+            days = int(head)
+        except ValueError:
+            return ""
+    try:
+        nums = [int(p) for p in s.split(":")]
+    except ValueError:
+        return ""
+    if len(nums) == 2:
+        return days * 86400 + nums[0] * 3600 + nums[1] * 60
+    if len(nums) == 3:
+        return days * 86400 + nums[0] * 3600 + nums[1] * 60 + nums[2]
+    return ""
+
+
 def _fs_ts(when):
     """A filesystem timestamp as the string every other table prints, or ''."""
     if not when:
@@ -3176,11 +3223,95 @@ class TableBuilder:
                     t.add(self.col.host_path(rel), i, s,
                           "yes" if "NOPASSWD" in s.upper() else "")
 
+    #: The utmp record types the session pairing below turns on.
+    UT_BOOT = "BOOT_TIME"
+    UT_RUNLVL = "RUN_LVL"
+    UT_USER = "USER_PROCESS"
+    UT_DEAD = "DEAD_PROCESS"
+
+    def _wtmp_sessions(self):
+        """Login sessions rebuilt from wtmp, with how long each one lasted.
+
+        How long someone was logged in is usually the question the login
+        records are being read for. A root session held open for three days
+        across the window is a different fact from a root login that lasted
+        forty seconds, and wtmp does not store the difference: it stores a
+        login record and, later, a logout record on the same terminal, and the
+        duration is the gap between them. `last` does that pairing on a live
+        host. Nothing does it for a disk image, where there is no `last`
+        output and the wtmp file is the only thing there is.
+
+        Pairing is by terminal in file order, the way last does it. A boot or
+        shutdown record closes everything still open before it: those sessions
+        never had a logout written, and the moment the machine went down is
+        the honest end for them rather than a blank or a guess.
+        """
+        cached = getattr(self, "_wtmp_session_cache", None)
+        if cached is not None:
+            return cached
+        out = []
+        seen_files = set()
+        for rel in self._log_files() + self.col.rootfs_glob("/var/log/wtmp*"):
+            base = os.path.basename(rel).lower()
+            if not base.startswith("wtmp") or base.endswith(".db"):
+                continue
+            if rel.lower() in seen_files:
+                continue
+            seen_files.add(rel.lower())
+            raw = decompress_bytes(rel, self.col.read_bytes(rel))
+            if not raw:
+                continue
+            host = self.col.host_path(rel)
+            open_on = {}                    # terminal -> the session open on it
+            for r in parse_utmp(raw):
+                when, kind, line = r["time"], r["type"], r["line"]
+                if kind == self.UT_BOOT or (kind == self.UT_RUNLVL
+                                            and r["user"] in ("shutdown",
+                                                              "runlevel")):
+                    ended = ("ended at reboot" if kind == self.UT_BOOT
+                             else "ended at shutdown")
+                    for sess in open_on.values():
+                        sess["end"] = when
+                        sess["state"] = ended
+                    open_on = {}
+                    continue
+                if kind == self.UT_USER and r["user"] and line:
+                    prev = open_on.get(line)
+                    if prev is not None:
+                        # a second login on the same terminal with no logout
+                        # between them: the first one ended here, and saying
+                        # so beats leaving it open until the next reboot
+                        prev["end"] = when
+                        prev["state"] = "no logout record"
+                    sess = {"user": r["user"], "line": line, "host": r["host"],
+                            "ip": r["ip"], "pid": r["pid"], "start": when,
+                            "end": None, "state": "", "source": host}
+                    open_on[line] = sess
+                    out.append(sess)
+                elif kind == self.UT_DEAD and line and line in open_on:
+                    sess = open_on.pop(line)
+                    sess["end"] = when
+                    sess["state"] = "closed"
+            for sess in open_on.values():
+                sess["state"] = "still open at the end of this wtmp"
+        self._wtmp_session_cache = out
+        return out
+
     def t_logins(self):
         t = self.table("LOGINS", "Login history",
-                       ["user", "terminal", "source_host", "start", "end", "duration",
+                       ["user", "terminal", "source_host", "start", "end",
+                        "duration", "duration_seconds", "state", "pid",
                         "source"], "Authentication",
-                       "last / lastb / who, every variant UAC captured.")
+                       "Every login session: from last/lastb/who where the "
+                       "collector ran them, and from wtmp itself otherwise - "
+                       "which is the only source on a disk image. The wtmp "
+                       "sessions are rebuilt by pairing each login with the "
+                       "logout on the same terminal, so the duration is "
+                       "measured rather than reported. state says how the "
+                       "session ended, because 'no logout record' and 'still "
+                       "open' are different facts that otherwise both look "
+                       "like a blank end time. duration_seconds is the same "
+                       "number unformatted, so the table sorts by it.")
         rx = re.compile(r"^(\S+)\s+(\S+)\s+(\S*)\s{2,}(\w{3}\s+\w{3}\s+\d+\s+[\d:]+)"
                         r"\s*-?\s*(\S+)?\s*(\(.*\))?\s*$")
         for rel in sorted(self.col.glob("live_response/system/last*.txt")) + \
@@ -3191,14 +3322,32 @@ class TableBuilder:
                     continue
                 m = rx.match(s)
                 if m:
+                    dur = (m.group(6) or "").strip("()")
                     t.add(m.group(1), m.group(2), m.group(3), m.group(4),
-                          m.group(5) or "", (m.group(6) or "").strip("()"),
-                          os.path.basename(rel))
+                          m.group(5) or "", dur, _duration_seconds(dur),
+                          "", "", os.path.basename(rel))
                 else:
                     f = s.split()
                     if f:
                         t.add(f[0], f[1] if len(f) > 1 else "", "",
-                              " ".join(f[2:]), "", "", os.path.basename(rel))
+                              " ".join(f[2:]), "", "", "", "", "",
+                              os.path.basename(rel))
+
+        # And the sessions wtmp itself describes. On a disk image this is the
+        # whole table; anywhere else it is the cross-check, measured from the
+        # records rather than taken from what `last` printed.
+        for sess in self._wtmp_sessions():
+            start, end = sess["start"], sess["end"]
+            secs = ""
+            if start and end:
+                secs = int((end - start).total_seconds())
+                if secs < 0:
+                    secs = ""          # clock moved; a negative span is not one
+            t.add(sess["user"], sess["line"], sess["host"] or sess["ip"],
+                  start.strftime("%Y-%m-%d %H:%M:%S") if start else "",
+                  end.strftime("%Y-%m-%d %H:%M:%S") if end else "",
+                  _human_duration(secs), secs, sess["state"], sess["pid"],
+                  sess["source"])
 
     # message shape -> (event label, regex whose named groups fill user/ip/port)
     # (event label, regex, class) - class 'priv' feeds PRIVILEGE_ACTIVITY.
@@ -7069,11 +7218,25 @@ class TableBuilder:
                        "is a different fact from the same address seen on an "
                        "outbound admin connection. count, first_utc and "
                        "last_utc are measured across every artifact in the "
-                       "collection rather than only the one that named it, so "
-                       "an indicator that turns up nowhere else has a count "
-                       "of 0 and that is itself worth knowing. Feed the "
+                       "collection rather than only the one that named it. "
+                       "They are filled for the terms the run pivoted on; "
+                       "--count-iocs measures every indicator instead, at the "
+                       "cost of a much slower sweep. An empty count means not "
+                       "measured, and a 0 means measured and found nowhere "
+                       "else - which is itself worth knowing. Feed the "
                        "indicator column to a SIEM; read the why column "
                        "before you do.")
+        # Measured here rather than during the analysis: half the indicators
+        # in this table are extracted by the table extractors above, so a
+        # sweep run any earlier would count the analyzers' own and quietly
+        # leave the rest unmeasured.
+        if getattr(self.tri.opts, "count_iocs", False):
+            status("[*] counting %s indicator(s) across the collection "
+                   "(--count-iocs)" % format(len(iocs), ","))
+            try:
+                self.tri.count_indicators()
+            except Exception as exc:
+                status("[!] indicator counting failed: %s" % exc)
         stats = getattr(self.tri, "pivot_stats", {})
         arts = getattr(self.tri, "pivot_artifacts", {})
         for value in sorted(iocs, key=lambda v: (ioc_type(v), v.lower())):
@@ -7081,7 +7244,7 @@ class TableBuilder:
             count, first, last = stats.get(value, ("", "", ""))
             where = arts.get(value, [])
             t.add(value, ioc_type(value), "; ".join(labels),
-                  count if count != "" else 0, len(where), first, last,
+                  count, len(where), first, last,
                   "; ".join(where[:12]) + (" ..." if len(where) > 12 else ""),
                   ioc_mitre(labels))
 

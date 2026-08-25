@@ -186,6 +186,51 @@ HACKTOOL_AMBIGUOUS = {
 }
 
 
+def trie_pattern(terms):
+    r"""Many literals as one prefix-tree regex, rather than one alternation.
+
+    'a|ab|ac' makes the engine try every branch at every position. Python's re
+    does not factor common prefixes, so a hundred indicators is a hundred
+    attempts per character - and the indicators an examination produces share
+    prefixes heavily, because they are mostly addresses off the same handful
+    of subnets and paths under the same handful of directories.
+
+    Folding them into 10\.198\.(?:11\.(?:107|200)|136\.103) means the engine
+    fails the whole group on the first character that does not match, which is
+    what makes scanning gigabytes with a large indicator list practical rather
+    than theoretical.
+    """
+    root = {}
+    for term in terms:
+        node = root
+        for ch in term:
+            node = node.setdefault(ch, {})
+        node[""] = {}                     # end of a term
+    return _trie_regex(root)
+
+
+def _trie_regex(node):
+    if not node:
+        return ""
+    if list(node) == [""]:
+        return ""
+    alts, optional = [], False
+    for ch in sorted(node):
+        if ch == "":
+            optional = True
+            continue
+        rest = _trie_regex(node[ch])
+        alts.append(re.escape(ch) + rest)
+    if not alts:
+        return ""
+    if len(alts) == 1:
+        body = alts[0]
+        # a single continuation needs no group unless it is optional
+        return ("(?:%s)?" % body) if optional else body
+    body = "(?:%s)" % "|".join(alts)
+    return body + "?" if optional else body
+
+
 def _tool_regex(groups, loose=False):
     """One alternation for the whole tier, so a cell costs a single pass.
 
