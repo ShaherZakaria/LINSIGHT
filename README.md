@@ -106,6 +106,17 @@ python linsight.py ./coll --tables-html b.html # just the console (below)
 python linsight.py ./coll --process-map p.csv  # only the merged process table
 ```
 
+`browser.html` carries **every row of every table**, so **Search all** searches
+the whole export rather than the grid you happen to have open — one box for
+"this address, this hash, this filename, anywhere in the evidence", with the
+matching tables ranked by hit count and a click to open any of them with the
+filter already applied.
+
+That page is as large as the evidence: a 742,000-row collection makes a 228 MB
+file, and the size is printed every time. `--html-rows N` caps the rows
+embedded in it when that is too much to open; the CSV and JSON exports are
+unaffected either way.
+
 `--scope` narrows the table build to half the collection:
 
 - `live` — the volatile snapshot: process table, sockets, open files, loaded modules, live sessions
@@ -557,6 +568,35 @@ with and a syslog stamp carries no year. The newest mtime of the files given is
 used as the anchor, and the report says so rather than quietly picking one.
 
 ## Hunting
+
+### Every indicator, in one table
+
+`IOCS` is the list of indicators this run extracted — addresses, hashes,
+paths, ports, key comments, process names — with the thing that makes it
+useful:
+
+| column | |
+|---|---|
+| `indicator` | the value, ready to hand to a SIEM or a feed |
+| `ioc_type` | `ipv4`, `sha256`, `path`, `url`, `port`, `pid`, `domain`, … |
+| **`why`** | where it was picked up — `failed authentication source`, `outbound admin protocol`, `/etc/ld.so.preload`, `bodyfile (executable in tmpfs)` |
+| `count` / `artifact_count` | how many mentions, in how many artifacts |
+| `first_utc` / `last_utc` | measured across the whole collection |
+| `mitre` | the technique implied by the provenance |
+
+The `why` column is the point. An address with no provenance is a number — the
+same `10.0.0.5` is a domain controller or an exfiltration destination depending
+on which analyzer picked it up, and that is recorded at the moment of
+extraction rather than guessed at afterwards. Two indicators of the same shape
+and different provenance are two different facts.
+
+The counts come from the same single pass over the collection that `--pivot`
+uses, so they cover every mention anywhere — not only the artifact that first
+named it. An indicator that turns up nowhere else has a count of `0`, and that
+is itself worth knowing: it means nothing corroborates it.
+
+`IOC_HITS` is the other half — one row per *hit*, with the line quoted, for the
+terms `--pivot` was given.
 
 ### Pivot on an indicator
 

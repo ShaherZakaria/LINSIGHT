@@ -6958,6 +6958,57 @@ class TableBuilder:
             t.add(term, ioc_type(term), ioc_mitre(iocs.get(term)),
                   cnt, first, last, host, n, line)
 
+    def t_iocs(self):
+        """Every indicator this run extracted, with why it is one.
+
+        IOC_HITS answers "where was this term seen", one row per hit, and only
+        for the terms --pivot was given. This answers the question an analyst
+        actually starts from: what are the indicators for this host, all of
+        them, in one list to hand to a SIEM or a threat feed.
+
+        The why column is the point. An IP address with no provenance is a
+        number - the same 10.0.0.5 is a domain controller or an exfiltration
+        destination depending on which analyzer picked it up, and that is
+        recorded at the moment of extraction ('failed authentication source',
+        'outbound admin protocol', 'bodyfile (executable in tmpfs)') rather
+        than guessed at afterwards. Two indicators of the same shape and
+        different provenance are two different facts.
+
+        count, first_utc and last_utc come from the same single pass over the
+        collection that --pivot uses, so they cover every mention of the
+        indicator anywhere - not only the artifact that first named it.
+        """
+        iocs = getattr(self.tri, "iocs", None)
+        if not iocs:
+            return
+        t = self.table("IOCS", "Indicators extracted from this host",
+                       ["indicator", "ioc_type", "why", "count",
+                        "artifact_count", "first_utc", "last_utc",
+                        "artifacts", "mitre"],
+                       "Detection",
+                       "Every indicator any analyzer extracted, with the "
+                       "provenance that made it one. 'why' is where it was "
+                       "picked up and is what separates two indicators of the "
+                       "same shape: an address seen as a failed-login source "
+                       "is a different fact from the same address seen on an "
+                       "outbound admin connection. count, first_utc and "
+                       "last_utc are measured across every artifact in the "
+                       "collection rather than only the one that named it, so "
+                       "an indicator that turns up nowhere else has a count "
+                       "of 0 and that is itself worth knowing. Feed the "
+                       "indicator column to a SIEM; read the why column "
+                       "before you do.")
+        stats = getattr(self.tri, "pivot_stats", {})
+        arts = getattr(self.tri, "pivot_artifacts", {})
+        for value in sorted(iocs, key=lambda v: (ioc_type(v), v.lower())):
+            labels = sorted(iocs[value])
+            count, first, last = stats.get(value, ("", "", ""))
+            where = arts.get(value, [])
+            t.add(value, ioc_type(value), "; ".join(labels),
+                  count if count != "" else 0, len(where), first, last,
+                  "; ".join(where[:12]) + (" ..." if len(where) > 12 else ""),
+                  ioc_mitre(labels))
+
     def t_rule_errors(self):
         """Rules that would not load, and why - the coverage you did not get."""
         t = self.table("RULE_ERRORS", "Detection rules that failed to load",
@@ -7769,7 +7820,8 @@ class TableBuilder:
         # their own right. Ordering them the other way silently dropped every
         # rule hit out of FINDINGS and the console report.
         "t_sensitive_files",
-        "t_hacktools", "t_yara", "t_sigma", "t_pivot", "t_rule_errors",
+        "t_hacktools", "t_yara", "t_sigma", "t_pivot", "t_iocs",
+        "t_rule_errors",
         "t_findings", "t_timeline",
         # why an artifact above is absent, before the list of what is left
         "t_collection_errors",

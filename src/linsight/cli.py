@@ -430,9 +430,14 @@ def main(argv=None):
     tg.add_argument("--process-map", metavar="PATH",
                     help="write ONLY the correlated one-row-per-PID process table "
                          "to a single file (.csv/.html/.json by extension)")
-    tg.add_argument("--html-rows", type=int, default=2000, metavar="N",
-                    help="rows per table embedded in the HTML browser (default 2000; "
-                         "the CSV and JSON exports always get everything)")
+    tg.add_argument("--html-rows", type=int, default=0, metavar="N",
+                    help="rows per table embedded in the HTML browser. 0, the "
+                         "default, embeds every row, so the page carries the "
+                         "whole export and 'Search all' really does search "
+                         "all of it. Set a number to cap it when the page "
+                         "would be too large to open comfortably - the size "
+                         "is printed either way, and the CSV and JSON exports "
+                         "are unaffected.")
 
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colour")
     ap.add_argument("--quiet", action="store_true", help="suppress the console report")

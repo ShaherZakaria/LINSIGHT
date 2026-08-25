@@ -243,6 +243,16 @@ padding:0 8px;margin:0 4px 4px 0;font-size:11px;cursor:pointer;color:var(--accen
 .pill:hover{background:var(--panel2)}
 .empty{color:var(--dim);padding:26px 4px;text-align:center}
 .bartop{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+.card2{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+ padding:10px 12px;margin:10px 0}
+.card2 a.gs{cursor:pointer;color:var(--accent);text-decoration:none}
+.card2 a.gs:hover{text-decoration:underline}
+table.mini{width:100%;margin-top:8px;border-collapse:collapse;font-size:12px;
+ table-layout:fixed}
+table.mini th{text-align:left;color:var(--dim);font-weight:normal;
+ border-bottom:1px solid var(--line);padding:3px 6px}
+table.mini td{padding:3px 6px;border-bottom:1px solid var(--line);
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 input[type=search],select{background:var(--panel);color:var(--fg);
 border:1px solid var(--line);border-radius:5px;padding:5px 9px;font:inherit;outline:none}
 input[type=search]{flex:1}
@@ -334,11 +344,11 @@ var TB=D.tables||{},IDX=D.index||[],V=D.views||{},PIN=D.pinned||[];
 /* The offensive-tool grid the overview reads and the nav pins. Named once:
    the console asks for it in four places and a typo would fail silently. */
 var HT='HACKTOOL_HITS';
-var st={view:null,sev:{},cat:'',tech:'',sel:null,table:null,tq:'',
+var st={view:null,sev:{},cat:'',tech:'',sel:null,table:null,tq:'',gq:'',
         t0:null,t1:null};   /* t0/t1: the time window, epoch seconds, inclusive */
 SEV.forEach(function(s){st.sev[s]=true;});
 var VIEWS=[['overview','Overview'],['findings','Findings'],['attack','ATT&CK'],
-           ['timeline','Timeline']];
+           ['timeline','Timeline'],['search','Search all']];
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
@@ -1147,12 +1157,81 @@ function buildNav(){
 }
 
 /* ---------- render ---------- */
+/* Search every table at once.
+   The per-table box answers "where in this grid", which is the question you
+   have once you already know which grid. The question an examination starts
+   from is the other one - this address, this hash, this filename, anywhere in
+   the evidence - and answering it by opening forty tables in turn is how an
+   indicator gets missed in the one nobody thought to open.
+   Every row of every table is scanned, so this is the whole export and not a
+   sample of it. That costs a pass over the payload, which is why it runs on a
+   debounce rather than on every keystroke. */
+function searchAll(q){
+ q=String(q||'').toLowerCase();
+ var out=[];
+ if(q.length<2)return out;
+ for(var i=0;i<IDX.length;i++){
+  var name=IDX[i].name,t=TB[name];
+  if(!t||!t.rows)continue;
+  var rows=t.rows,n=0,sample=[];
+  for(var r=0;r<rows.length;r++){
+   var row=rows[r],hit=false;
+   for(var c=0;c<row.length;c++){
+    var v=row[c];
+    if(v&&String(v).toLowerCase().indexOf(q)>=0){hit=true;break;}
+   }
+   if(hit){n++;if(sample.length<3)sample.push(row);}
+  }
+  if(n)out.push({name:name,title:t.title,count:n,sample:sample,cols:t.columns,
+                 capped:t.row_count>rows.length,total:t.row_count,
+                 rows:rows.length});
+ }
+ out.sort(function(a,b){return b.count-a.count;});
+ return out;
+}
+function viewSearch(){
+ var q=st.gq||'';
+ var h='<h1>Search all tables</h1>';
+ h+='<div class="controls"><input type="search" id="gq" placeholder="an address, '+
+    'a hash, a filename, a username - anywhere in the evidence..." value="'+
+    esc(q)+'"></div>';
+ if(q.length<2){
+  h+='<p class="desc">Type at least two characters. Every row of every table '+
+     'is searched, so this covers the whole export rather than the table you '+
+     'happen to be looking at.</p>';
+  return h;
+ }
+ var res=searchAll(q);
+ if(!res.length){
+  h+='<div class="empty">Nothing in any table matches '+esc(q)+'.</div>';
+  return h;
+ }
+ var total=0;res.forEach(function(x){total+=x.count;});
+ h+='<p class="desc">'+total.toLocaleString()+' matching row(s) in '+
+    res.length+' table(s). Click a table to open it with this filter applied.</p>';
+ res.forEach(function(x){
+  h+='<div class="card2"><a class="gs" data-t="'+esc(x.name)+'"><b>'+esc(x.name)+
+     '</b> <span class="badge">'+x.count.toLocaleString()+'</span></a> '+
+     '<span class="desc">'+esc(x.title||'')+
+     (x.capped?' - the page holds '+x.rows.toLocaleString()+' of '+
+      x.total.toLocaleString()+' rows, so this searched those':'')+'</span>';
+  h+='<table class="mini"><tr>';
+  x.cols.forEach(function(c){h+='<th>'+esc(c)+'</th>';});
+  h+='</tr>';
+  x.sample.forEach(function(r){
+   h+='<tr>';
+   for(var i=0;i<x.cols.length;i++){h+='<td>'+esc(r[i]==null?'':r[i])+'</td>';}
+   h+='</tr>';});
+  h+='</table></div>';});
+ return h;
+}
 function render(){
  /* Every view except the overview and the matrix is a table, and a table
     renders itself: it owns its sort, its column filters and its caret, none
     of which survive being rebuilt from a string. */
  if(st.view==='table'||vt(st.view)){tRender();markNav();return;}
- el('main').innerHTML=st.view==='attack'?viewAttack():viewOverview();
+ el('main').innerHTML=st.view==='search'?viewSearch()
+  :st.view==='attack'?viewAttack():viewOverview();
  wire();
  markNav();
 }
@@ -1166,9 +1245,27 @@ function goTable(name,q){
  location.hash='t/'+name;
  render();
 }
+var gqTimer=null;
 function wire(){
  wireHisto();
  wireWin();
+ var gq=el('gq');
+ if(gq){
+  gq.oninput=function(){
+   /* debounced: this reads every row of every table, and doing that on each
+      keystroke of a 40 MB export makes the box feel broken */
+   if(gqTimer)clearTimeout(gqTimer);
+   var v=gq.value;
+   gqTimer=setTimeout(function(){
+    st.gq=v;
+    el('main').innerHTML=viewSearch();
+    wire();
+    var b=el('gq');
+    if(b){b.focus();b.setSelectionRange(b.value.length,b.value.length);}
+   },250);};
+  [].forEach.call(document.querySelectorAll('a.gs'),function(a){
+   a.onclick=function(){goTable(a.getAttribute('data-t'),st.gq||'');};});
+ }
  [].forEach.call(document.querySelectorAll('[data-tech]'),function(x){
   x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
  [].forEach.call(document.querySelectorAll('.card[data-sev]'),function(cd){
