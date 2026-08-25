@@ -49,6 +49,7 @@ MODULES = [
     ("collect",   "collection access (directory / tar / zip backends)"),
     ("image",     "disk images: raw, split raw, E01, qcow2, vmdk, vhdx, device"),
     ("volume",    "volume layer: MBR, GPT, LVM2, LUKS"),
+    ("fsbase",    "what every filesystem reader has to answer"),
     ("fs_ext",    "the ext2 / ext3 / ext4 reader"),
     ("fs_xfs",    "the XFS reader"),
     ("fs_btrfs",  "the btrfs reader"),
@@ -95,6 +96,18 @@ def strip_imports(text, name, hoist):
                           else "import %s" % a.name)
             drop.update(range(node.lineno, node.end_lineno + 1))
         elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                # 'from .x import y as z' cannot survive a concatenation: the
+                # import line is what creates z, and in one file only y exists.
+                # Catching it here is the difference between a NameError at
+                # import time and one four minutes into a run.
+                for a in node.names:
+                    if a.asname:
+                        raise SystemExit(
+                            "[!] %s.py: 'from .%s import %s as %s' renames a "
+                            "name across modules, which the single-file build "
+                            "cannot do - export it under the name callers use."
+                            % (name, node.module, a.name, a.asname))
             if not node.level and node.module != "__future__":
                 for a in node.names:
                     hoist.add("from %s import %s%s"
@@ -122,11 +135,55 @@ def docstring_of(text):
     return "", text
 
 
+def top_level_names(text, name):
+    """Every name this module binds at module level."""
+    out = []
+    for node in ast.parse(text, filename=name + ".py").body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            out.append(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                for sub in ast.walk(target):
+                    if isinstance(sub, ast.Name):
+                        out.append(sub.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out.append(node.target.id)
+    return out
+
+
+def check_collisions(seen):
+    """Refuse to build when two modules bind the same top-level name.
+
+    In a package this is harmless - each module has its own namespace, and a
+    private helper called _u32 in two readers is two different functions. In
+    the concatenation it is one namespace, the second definition wins, and the
+    first module silently starts calling the wrong function.
+
+    That is not a theoretical risk. The XFS reader's _u32 is big-endian and
+    the btrfs reader's is little-endian; concatenated in that order, XFS reads
+    every structure through the wrong decoder and reports an empty disk. The
+    package tests pass and the shipped file does not work, which is the worst
+    shape a bug can take, so it is a build failure rather than a warning.
+    """
+    clashes = {n: mods for n, mods in seen.items() if len(mods) > 1}
+    if not clashes:
+        return
+    lines = ["[!] the same top-level name is bound by more than one module.",
+             "    In one file there is one namespace, so the last definition",
+             "    wins and the earlier module calls the wrong one. Give each",
+             "    a distinct name.", ""]
+    for n in sorted(clashes):
+        lines.append("      %-24s %s" % (n, ", ".join(clashes[n])))
+    raise SystemExit("\n".join(lines))
+
+
 def build():
     hoist = set()
     bodies = []
     doc = ""
     missing = []
+    seen = {}
     for name, title in MODULES:
         if not os.path.exists(module_path(name)):
             missing.append(name)
@@ -135,8 +192,13 @@ def build():
         if name == "constants":
             doc, text = docstring_of(text)
         text = strip_imports(text, name, hoist).strip("\n")
+        for bound in top_level_names(text, name):
+            where = seen.setdefault(bound, [])
+            if name not in where:      # rebinding within one module is fine
+                where.append(name)
         if text:
             bodies.append((name, title, text))
+    check_collisions(seen)
 
     def sort_key(stmt):
         # 'import x' before 'from x import y', then alphabetical by module -

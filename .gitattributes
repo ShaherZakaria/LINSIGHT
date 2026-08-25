@@ -4,3 +4,7 @@
 *.py text eol=lf
 *.csv text eol=lf
 *.md text eol=lf
+
+# The fixture builders run through WSL or on the analysis box itself; a CRLF
+# checkout makes /bin/sh reject the shebang the same way it does for Python.
+*.sh text eol=lf
