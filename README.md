@@ -86,6 +86,13 @@ python linsight.py ./coll --json findings.json     # machine-readable
 python linsight.py ./coll --timeline timeline.csv  # merged event timeline
 ```
 
+`--html` is the **findings** document — one page to read top to bottom and hand
+to someone. The artifact tables are a browsable grid rather than a document and
+are not in it; `--export` writes those. The report ends with the list of tables
+that were built and says where they went, so a reader who does not find the
+process table in that file is told where it is rather than left to conclude it
+was never built.
+
 `--window H` sets the incident window used to decide what counts as "recent" (default 72 hours before collection time).
 
 ### 2. Tables

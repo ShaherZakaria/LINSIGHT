@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 from .model import SEVERITIES
@@ -25,6 +26,134 @@ from .report import (
 
 
 # ---------------------------------------------------------------------------
+
+
+#: Files a directory can hold that are the evidence rather than part of it.
+#: A folder holding one Webserver.E01 is not a collection with two files in
+#: it, and reading it as one produces an empty report - which is the failure
+#: this whole function exists to prevent.
+CONTAINER_EXTENSIONS = (
+    ".dd", ".raw", ".img", ".bin", ".e01", ".ex01", ".s01", ".001",
+    ".qcow2", ".qcow", ".vmdk", ".vhdx", ".vhd", ".vdi",
+    ".ad1", ".tar", ".tgz", ".zip", ".gz", ".bz2", ".xz",
+)
+
+#: How many extension-less files to sniff before giving up. A collection
+#: directory holds thousands of command outputs and none of them is a disk;
+#: opening every one to prove that would cost more than the whole parse.
+SNIFF_LIMIT = 64
+
+
+def _collection_markers(path):
+    """Whether this directory is a collection, by the files a collector left.
+
+    Asked before anything else, because a UAC collection that happens to
+    contain a disk image somewhere inside it is still a UAC collection - and
+    reading the image instead would throw away the live_response half that
+    nothing else can parse.
+    """
+    for marker in ("uac.log", "live_response", "results", "uploads",
+                   "collection_context.json", "uploads.json", "bodyfile"):
+        if os.path.exists(os.path.join(path, marker)):
+            return marker
+    for entry in _listdir(path)[:200]:
+        if entry.startswith("[") and entry.endswith("]"):
+            return entry                  # UAC's [root] / [mountpoint]
+    return ""
+
+
+def _listdir(path):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def _containers_in(path):
+    """[(kind, full path)] for the evidence containers sitting in a directory."""
+    found = []
+    sniffed = 0
+    for name in _listdir(path):
+        full = os.path.join(path, name)
+        if not os.path.isfile(full):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        known = ext in CONTAINER_EXTENSIONS
+        if not known:
+            if sniffed >= SNIFF_LIMIT:
+                continue
+            sniffed += 1
+        try:
+            if looks_like_ad1(full):
+                found.append(("ad1", full))
+                continue
+            if looks_like_disk(full):
+                found.append(("disk", full))
+                continue
+        except Exception:
+            continue
+        if known and ext in (".tar", ".tgz", ".zip", ".gz", ".bz2", ".xz"):
+            found.append(("archive", full))
+    return found
+
+
+def _one_evidence_set(found):
+    """Collapse the segments of one split set into the one thing they are.
+
+    A directory holding Webserver.E01 through .E12, or image.001 through .014,
+    holds one disk - and offering to read fourteen of them, or refusing
+    because there are fourteen, would both be wrong.
+    """
+    if len(found) <= 1:
+        return found
+    stems = set()
+    for kind, full in found:
+        base = os.path.basename(full)
+        stem = re.sub(r"\.(?:[eEsSlL]\d{2}|\d{3}|ad\d+|[a-z]{2})$", "", base)
+        stem = re.sub(r"\.(?:dd|raw|img|bin)\.\d+$", "", stem)
+        stems.add((kind, stem.lower()))
+    if len(stems) == 1:
+        return [sorted(found, key=lambda kv: kv[1])[0]]
+    return found
+
+
+def identify_input(path):
+    """What to read, and why - for the plain argument, with nothing declared.
+
+    Returns (kind, target, why). `kind` is one of 'disk', 'ad1',
+    'collection' or 'files'. The reason travels with it because the analyst
+    has to be able to see the decision: reading the wrong thing produces a
+    report, not an error, and a report about the wrong evidence is the most
+    expensive output this tool can produce.
+    """
+    if not os.path.exists(path) and looks_like_disk(path):
+        return "disk", path, "a device path"
+    if os.path.isfile(path):
+        if looks_like_ad1(path):
+            return "ad1", path, "an AD1 logical image header"
+        if looks_like_disk(path):
+            return "disk", path, "a disk container header"
+        return "collection", path, "an archive"
+    if not os.path.isdir(path):
+        return "collection", path, ""
+
+    marker = _collection_markers(path)
+    if marker:
+        return "collection", path, "a collection directory - %s is in it" % marker
+    if os.path.isdir(path):
+        found = _one_evidence_set(_containers_in(path))
+        if len(found) == 1:
+            kind, full = found[0]
+            return kind, full, ("the only piece of evidence in that directory "
+                                "is %s" % os.path.basename(full))
+        if len(found) > 1:
+            names = ", ".join(os.path.basename(f) for _k, f in found[:6])
+            raise SystemExit(
+                "[!] %s holds more than one piece of evidence: %s%s\n"
+                "    Name the one to read, rather than have this pick:\n"
+                "      python linsight.py <that file>"
+                % (path, names, " ..." if len(found) > 6 else ""))
+    return "collection", path, "a directory"
 
 
 def list_volumes(path):
@@ -191,7 +320,14 @@ def main(argv=None):
     ap.add_argument("--max-evidence", type=int, default=25,
                     help="evidence lines printed per finding on the console (default 25)")
     ap.add_argument("--json", metavar="PATH", help="write full findings as JSON")
-    ap.add_argument("--html", metavar="PATH", help="write a self-contained HTML report")
+    ap.add_argument("--html", metavar="PATH",
+                    help="write a self-contained HTML report of the findings - "
+                         "a document to read top to bottom and hand to "
+                         "someone. The artifact tables are a browsable grid "
+                         "rather than a document and are not in it: --export "
+                         "DIR writes those, as browser.html plus csv/ and "
+                         "json/. This report lists them and says where they "
+                         "went.")
     ap.add_argument("--timeline", metavar="PATH", help="write the event timeline as CSV")
     ap.add_argument("--show-timeline", action="store_true",
                     help="also print the timeline on the console")
@@ -411,9 +547,23 @@ def main(argv=None):
         ap.error("--archive wants a .tar/.tar.gz/.zip; %s is a directory - "
                  "use -d instead" % opts.collection)
 
+    # With nothing declared, the argument identifies itself - and says so.
+    # A directory holding one Webserver.E01 is not a collection with two files
+    # in it; reading it as one built five empty tables and reported a host
+    # with nothing on it.
+    detected = ""
     disk_path = opts.disk
-    if not forced and opts.collection and looks_like_disk(opts.collection):
-        disk_path = opts.collection
+    if not forced and opts.collection:
+        kind, target, why = identify_input(opts.collection)
+        detected = why
+        opts.collection = target
+        if kind == "disk":
+            disk_path = target
+        elif kind == "ad1":
+            opts.ad1 = target
+    if detected and not opts.quiet:
+        status("[*] reading %s - %s" % (os.path.basename(opts.collection.rstrip("/\\"))
+                                        or opts.collection, detected))
 
     if not disk_path and not opts.collection and not opts.files:
         if opts.update_sigma:
@@ -431,8 +581,6 @@ def main(argv=None):
     # the collection side. Like every other container it is recognised rather
     # than declared.
     ad1_path = opts.ad1 or ""
-    if not forced and not disk_path and opts.collection             and looks_like_ad1(opts.collection):
-        ad1_path = opts.collection
 
     if ad1_path:
         try:
@@ -502,7 +650,7 @@ def main(argv=None):
     if opts.json:
         write_json(tri, opts.json)
     if opts.html:
-        write_html(tri, opts.html, opts)
+        write_html(tri, opts.html, opts, tb)
     if opts.timeline:
         write_timeline(tri, opts.timeline)
 
