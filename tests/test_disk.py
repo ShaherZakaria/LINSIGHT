@@ -54,6 +54,7 @@ def load(built):
     import linsight.ad1, linsight.distro, linsight.common        # noqa
     import linsight.hosttz, linsight.fsbase                      # noqa
     import linsight.tables                                       # noqa
+    import linsight.writers                                      # noqa
 
     class Flat(object):
         pass
@@ -61,7 +62,7 @@ def load(built):
     flat = Flat()
     for mod in (linsight.image, linsight.volume, linsight.disk, linsight.ad1,
                 linsight.distro, linsight.common, linsight.hosttz,
-                linsight.fsbase, linsight.tables,
+                linsight.fsbase, linsight.tables, linsight.writers,
                 linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs):
         for name in dir(mod):
             if not name.startswith("__"):
@@ -1033,6 +1034,100 @@ def check_addresses(L, res):
         res.ok("one host, one indicator  four spellings, one ipv4 indicator")
 
 
+def check_html_pack(L, res):
+    """Rows must survive the trip into the page and back out of it.
+
+    The console carries every row so that a search across all tables is a
+    search across all the evidence, which as plain JSON is a 228 MB file no
+    browser opens in a sensible time. Gzipped per table it is 14 MB and is
+    decoded a table at a time - so the compression is now load-bearing, and
+    a row that does not come back is evidence lost silently.
+    """
+    print("\nconsole payload - every row back out again")
+    import base64 as _b64, gzip as _gz, json as _json
+
+    def build(name, n, cell="value"):
+        t = L.Table(name, name, ["a", "b", "c"])
+        for i in range(n):
+            t.add("%s-%d" % (cell, i), i, "x" * 20)
+        return t
+
+    def back(table, limit=None):
+        # A payload that will not decode is the failure this is looking for,
+        # so it is reported as one rather than raised - the checks after it
+        # are the ones that say which shape of table broke.
+        try:
+            rows, blob = L._packed_rows(table, limit)
+        except Exception as exc:
+            return ["packing raised %s: %s" % (type(exc).__name__, exc)], True
+        if not blob:
+            return rows, False
+        try:
+            return _json.loads(_gz.decompress(_b64.b64decode(blob))), True
+        except Exception as exc:
+            return ["would not decode: %s: %s" % (type(exc).__name__, exc)], True
+
+    want = [[str(v) for v in r] for r in build("T", 400).iter_rows()]
+    got, packed = back(build("T", 400))
+    if not packed:
+        res.fail("large table packed", "400 rows stayed inline")
+    elif got != want:
+        res.fail("large table packed", "%d rows back, expected %d"
+                 % (len(got), len(want)))
+    else:
+        res.ok("large table packed      400 rows, gzip round trip")
+
+    # The switchover is the fiddly part: rows accumulate as text until they
+    # pass PACK_MIN, and the ones already accumulated have to go into the
+    # compressor rather than be dropped on the floor.
+    wrong = []
+    for n in (0, 1, 2, 60, 61, 62, 63, 64, 65, 200, 1000):
+        want = [[str(v) for v in r] for r in build("T", n).iter_rows()]
+        got, packed = back(build("T", n))
+        if got != want:
+            wrong.append("%d rows -> %d back%s"
+                         % (n, len(got), " (packed)" if packed else " (inline)"))
+    if wrong:
+        res.fail("pack size boundary", wrong[0] +
+                 ("" if len(wrong) == 1 else " (and %d more)" % (len(wrong) - 1)))
+    else:
+        res.ok("pack size boundary      0 to 1000 rows, inline and packed")
+
+    # A forensic export carries web content and log lines verbatim, so the
+    # cells that break HTML and JSON are the normal case, not the edge one.
+    nasty = L.Table("N", "n", ["a", "b"])
+    nasty.add("</script><!--", '"quoted" \\ backslash')
+    nasty.add("caf\u00e9 \u2014 \u4f60\u597d", "tab\there")
+    nasty.add("x" * 9000, "")          # long enough to force the packed path
+    want = [[str(v) for v in r] for r in nasty.iter_rows()]
+    got, packed = back(nasty)
+    if not packed:
+        res.fail("awkward cells", "did not reach the packed path")
+    elif got != want:
+        res.fail("awkward cells", "%r came back as %r"
+                 % (want[0], got[0] if got else None))
+    else:
+        res.ok("awkward cells           script tags, quotes, unicode")
+
+    # The blob is written into the page unquoted, so it must carry nothing
+    # that could end the string or the script element.
+    _rows, blob = L._packed_rows(build("T", 400), None)
+    bad = set(blob) - set("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                          "abcdefghijklmnopqrstuvwxyz0123456789+/=")
+    if bad:
+        res.fail("blob is script-safe", "blob contains %r" % sorted(bad))
+    else:
+        res.ok("blob is script-safe     base64 alphabet only")
+
+    # --html-rows still caps what the page carries
+    rows, blob = L._packed_rows(build("T", 400), 10)
+    got = (_json.loads(_gz.decompress(_b64.b64decode(blob))) if blob else rows)
+    if len(got) != 10:
+        res.fail("row cap honoured", "%d rows with a limit of 10" % len(got))
+    else:
+        res.ok("row cap honoured        --html-rows 10 gives 10")
+
+
 def check_inventory_times(L, res):
     """FILE_INVENTORY has to carry times, and say where they came from."""
     print("\nfile inventory - times, and what they mean")
@@ -1371,6 +1466,7 @@ def main(argv=None):
     check_distribution(L, res)
     check_filename_hunts(L, res)
     check_addresses(L, res)
+    check_html_pack(L, res)
     check_auth_sessions(L, res)
     check_inventory_times(L, res)
     check_timezone(L, res)

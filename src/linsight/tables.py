@@ -181,25 +181,6 @@ class Table:
     def __len__(self):
         return self._count
 
-    def as_dict(self, limit=None):
-        rows = (list(self.iter_rows()) if limit is None
-                else list(itertools.islice(self.iter_rows(), limit)))
-        return {
-            "name": self.name,
-            "title": self.title,
-            "category": self.category,
-            "description": self.description,
-            "sources": self.sources,
-            "columns": self.columns,
-            # self._count, not len(self.rows): once a table has spilled, the
-            # list is only the unflushed tail, and iterating above emptied it -
-            # so this reported every large table as having no rows at all while
-            # still shipping them
-            "row_count": self._count,
-            "rows_included": len(rows),
-            "rows": [[_s(v) for v in r] for r in rows],
-        }
-
 
 def _human_duration(seconds):
     """Seconds -> '3d 04h', '2h 14m', '4m 55s', '41s'.
