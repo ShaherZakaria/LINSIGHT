@@ -75,12 +75,18 @@ def print_console(tri, opts):
     out.write("  %-14s : %s\n" % ("layout", layout))
     for k, label in (("Hostname", "hostname"),
                      ("Hostname (from archive name)", "hostname"),
+                     ("Distribution", "distribution"),
                      ("uname", "kernel"),
+                     ("Kernel release", "kernel"),
                      ("Operating system", "os"), ("System architecture", "arch"),
                      ("Collection finished", "collected"), ("Host UTC offset", "host offset"),
                      ("Time zone", "time zone"), ("Command line", "collector command")):
-        if tri.meta.get(k):
-            out.write("  %-14s : %s\n" % (label, trunc(str(tri.meta[k]), 110)))
+        value = tri.meta.get(k)
+        # 'os' and 'distribution' are the same answer once the distribution is
+        # known, and printing it twice in a five-line header is noise
+        if value and not (k == "Operating system"
+                          and value == tri.meta.get("Distribution")):
+            out.write("  %-14s : %s\n" % (label, trunc(str(value), 110)))
     out.write(c("=" * 100, "head", color) + "\n\n")
 
     out.write(c("  FINDING SUMMARY", "bold", color) + "\n")

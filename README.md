@@ -307,6 +307,59 @@ than returning a partial tree.
 Encrypted AccessData images (`ADCRYPTEDFILE`) are identified and refused —
 decrypt in FTK Imager first.
 
+## Which distribution
+
+Every run establishes what the host was, and says how it knows. It lands in
+`METADATA`, on the console header, and as an `INFO` finding carrying every
+source that had an opinion:
+
+```
+  distribution   : Kali GNU/Linux 2017.1 (kali-rolling)
+  kernel         : 4.13.0-kali1-amd64 (from /boot)
+```
+
+| key | |
+|---|---|
+| `Distribution` | `Ubuntu 24.04.3 LTS` |
+| `Distribution family` | `debian` — which decides whether auth went to `auth.log` or `secure`, and whether package history is `dpkg.log` or `yum.log` |
+| `Distribution version` | `24.04` |
+| `Distribution source` | the file it was believed from, and what that file was |
+| `Kernel release` | recovered from `uname` output, `/proc/version`, or the filenames under `/boot` |
+
+`/etc/os-release` would make this a six-line feature. It is not enough on its
+own, and each fallback below exists because a real case needed it:
+
+- a **pre-2014 host** has no `os-release`, only `/etc/redhat-release` and
+  friends — RHEL 6 is still in cases
+- a **UAC collection** may not contain it at all. On the Ubuntu collection this
+  was tested against, `/etc/os-release` is a symlink that was not followed, and
+  `/etc/lsb-release` answered instead
+- a **logical image often has no `/etc`**. The AD1 above holds `/boot`, `/root`
+  and `/var` — and still says Kali, from the `lsb-release` the installer left in
+  `/var/log`, the kernel filename under `/boot`, and `dpkg.log`
+- a **profile that ran only `uname -n`** records a hostname and no kernel
+  version; the kernel is then recovered from `/boot/config-*` or
+  `/boot/initrd.img-*`, which are named after it
+
+### When the sources disagree
+
+They are all collected, not just the first one that answers, and a
+disagreement between *strong* sources — `os-release`, a release file, the
+package database, a distribution-stamped kernel — is a `MEDIUM` finding:
+
+```
+[MEDIUM] Distribution evidence disagrees
+    That is what a container image read as a host, a chroot, a rescue mount
+    or an edited os-release looks like - and until it is resolved, every path
+    in this report may belong to a different system than the one you think
+    you are reading.
+```
+
+Weak sources never raise one. A stray `/etc/yum.conf` or an `alien` install on
+a Debian box is not a Red Hat machine, and a `-amd64` kernel suffix names a
+flavour rather than a product — so those support an answer and can never
+contradict one. A false alarm about tampering is worse than silence.
+
 ## Without a collection
 
 You do not need a UAC or Velociraptor collection. `--file` parses loose files

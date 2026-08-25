@@ -24,6 +24,7 @@ from .decode import (
     JOURNAL_MAGIC, decompress_bytes, parse_journal, parse_utmp,
     split_log_line)
 from .collect import velo_get, velo_time
+from .distro import describe_distro, identify_distro
 
 
 
@@ -76,6 +77,92 @@ class Triage:
     def event(self, ts, category, description, severity="INFO", source=""):
         if ts is not None:
             self.events.append(Event(ts, category, description, severity, source))
+
+    def identify_distribution(self):
+        """Establish the distribution, whichever layout the evidence arrived as.
+
+        Called for every collection rather than from one layout's metadata
+        pass, because the question is about the host and not about the
+        container it reached us in - a UAC tar, a Velociraptor zip, a disk
+        image and an AD1 all have to answer it the same way.
+        """
+        self.distro = identify_distro(self.col)
+        label = describe_distro(self.distro)
+        info = {}
+        if label:
+            info["Distribution"] = label
+            # A collector often records the OS as 'linux', which is true and
+            # useless. Where that is all there is, the distribution is the
+            # better answer to the same question.
+            current = (self.meta.get("Operating system") or "").strip()
+            if current.lower() in ("", "linux", "gnu/linux", "unix",
+                                   "linux/unix", "posix"):
+                info["Operating system"] = label
+        if self.distro["family"]:
+            info["Distribution family"] = self.distro["family"]
+        if self.distro["version"]:
+            info["Distribution version"] = self.distro["version"]
+        if self.distro["source"]:
+            info["Distribution source"] = "%s%s" % (
+                self.distro["source"],
+                " (%s)" % self.distro["detail"] if self.distro["detail"] else "")
+        if self.distro["kernel"] and not self.meta.get("Kernel release"):
+            info["Kernel release"] = "%s%s" % (
+                self.distro["kernel"],
+                " (from %s)" % self.distro["kernel_source"]
+                if self.distro["kernel_source"] else "")
+        self.meta.update({k: v for k, v in info.items() if v})
+        self._distro_findings()
+
+    def _distro_findings(self):
+        """Say what the host was, and say so when the sources disagree.
+
+        The identification itself is INFO: it is context, not a lead. The
+        disagreement is not. An /etc/os-release naming one distribution while
+        the package database and the kernel name another is what a container
+        image examined as a host looks like, what a chroot looks like, and
+        what an edited os-release looks like - and an analyst who is not told
+        will read every path in this report as if it came off the machine the
+        text file claimed.
+        """
+        d = getattr(self, "distro", None)
+        if not d:
+            return
+        label = describe_distro(d)
+        if label:
+            lines = []
+            for e in d["evidence"]:
+                if not (e.name or e.family):
+                    continue
+                lines.append("%-34s %s%s"
+                             % (e.source,
+                                e.label() or "%s family" % e.family,
+                                "  - %s" % e.detail if e.detail else ""))
+            self.add("INFO", "System", "Distribution: %s" % label,
+                     "Established from %s. Where the logs are, what the "
+                     "package history is called and which rules apply all "
+                     "follow from this."
+                     % (d["source"] or "the evidence below"),
+                     evidence=lines or None,
+                     source=d["source"], count=len(lines) or None)
+        elif d["evidence"]:
+            self.add("INFO", "System", "Distribution could not be named",
+                     "Nothing in this collection names the distribution. The "
+                     "family below is what the package manager's own files "
+                     "say, which still settles where the logs live.",
+                     evidence=["%s  %s" % (e.source, e.family)
+                               for e in d["evidence"] if e.family] or None,
+                     source="distribution")
+        if d["conflict"]:
+            self.add("MEDIUM", "System", "Distribution evidence disagrees",
+                     "Different sources on this host name different "
+                     "distribution families. That is what a container image "
+                     "read as a host, a chroot, a rescue mount or an edited "
+                     "os-release looks like - and until it is resolved, every "
+                     "path in this report may belong to a different system "
+                     "than the one you think you are reading.",
+                     evidence=[d["conflict"]], source="distribution",
+                     mitre="T1036 Masquerading")
 
     def _disk_findings(self):
         """Say, in the findings, what the disk scan could and could not open.
@@ -3449,6 +3536,7 @@ class Triage:
     def run(self):
         steps = [
             self.analyze_collection,
+            self.identify_distribution,     # every layout, not just one
             self.analyze_accounts,          # populates users/uids/gids first
             self.analyze_kernel_taint,
             self.analyze_ld_preload,
