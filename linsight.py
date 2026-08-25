@@ -536,6 +536,51 @@ HACKTOOL_AMBIGUOUS = {
 }
 
 
+def trie_pattern(terms):
+    r"""Many literals as one prefix-tree regex, rather than one alternation.
+
+    'a|ab|ac' makes the engine try every branch at every position. Python's re
+    does not factor common prefixes, so a hundred indicators is a hundred
+    attempts per character - and the indicators an examination produces share
+    prefixes heavily, because they are mostly addresses off the same handful
+    of subnets and paths under the same handful of directories.
+
+    Folding them into 10\.198\.(?:11\.(?:107|200)|136\.103) means the engine
+    fails the whole group on the first character that does not match, which is
+    what makes scanning gigabytes with a large indicator list practical rather
+    than theoretical.
+    """
+    root = {}
+    for term in terms:
+        node = root
+        for ch in term:
+            node = node.setdefault(ch, {})
+        node[""] = {}                     # end of a term
+    return _trie_regex(root)
+
+
+def _trie_regex(node):
+    if not node:
+        return ""
+    if list(node) == [""]:
+        return ""
+    alts, optional = [], False
+    for ch in sorted(node):
+        if ch == "":
+            optional = True
+            continue
+        rest = _trie_regex(node[ch])
+        alts.append(re.escape(ch) + rest)
+    if not alts:
+        return ""
+    if len(alts) == 1:
+        body = alts[0]
+        # a single continuation needs no group unless it is optional
+        return ("(?:%s)?" % body) if optional else body
+    body = "(?:%s)" % "|".join(alts)
+    return body + "?" if optional else body
+
+
 def _tool_regex(groups, loose=False):
     """One alternation for the whole tier, so a cell costs a single pass.
 
@@ -10625,6 +10670,28 @@ def update_sigma_rules(dest, source=None, keep_all=False, timeout=60, quiet=Fals
 # the triage engine
 # ---------------------------------------------------------------------------
 
+def _line_starts(text):
+    """Offsets of every line start, built once per artifact that matched."""
+    out = [0]
+    at = text.find("\n")
+    while at >= 0:
+        out.append(at + 1)
+        at = text.find("\n", at + 1)
+    return out
+
+
+def _line_of(starts, offset):
+    """1-based line number for a character offset."""
+    lo, hi = 0, len(starts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if starts[mid] <= offset:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo or 1
+
+
 class Triage:
     def __init__(self, col, opts):
         self.col = col
@@ -14143,10 +14210,15 @@ class Triage:
                 out.append(t)
         return out
 
-    #: How many extracted indicators to carry into the counting pass. They
-    #: cost one alternative each in a regex that is compiled once, so the cap
-    #: is about the pathological case - a collection that yielded tens of
-    #: thousands of paths - rather than about the ordinary one.
+    #: How many extracted indicators to carry into the counting pass.
+    #:
+    #: This is not free, which is why it is behind --count-iocs. Python's re
+    #: walks an alternation branch by branch at every position, so folding
+    #: thousands of indicators into the pattern multiplies the cost of the
+    #: sweep - and the sweep already reads every text artifact in the
+    #: collection. On a 31 GB disk image with 85,000 files that turned a four
+    #: minute run into a twenty minute one, which is not a trade to make for
+    #: everybody by default.
     IOC_COUNT_LIMIT = 4000
 
     def _ioc_terms(self, already):
@@ -14171,39 +14243,40 @@ class Triage:
                 break
         return out
 
-    def analyze_pivot(self):
-        """Search every collected artifact for the given indicators.
+    def sweep_terms(self, terms):
+        """One pass over every text artifact, matching all terms at once.
 
-        This used to read a hardcoded list of thirteen files, which meant an
-        IP address that appeared only in auth.log, an access log or a shell
-        history was reported as 'not found' - the one answer a pivot must
-        never give wrongly. It now streams every text artifact in the
-        collection, compressed log rotations included.
+        Returns (hits, counts, spans) keyed by the term's index, or None if
+        the pattern would not compile. Shared by the --pivot findings and by
+        the IOCS counting, because both ask the same question of the same
+        bytes and reading the collection twice to answer it would be the most
+        expensive mistake in the run.
 
-        All terms are matched in a single compiled alternation, so searching
-        for four hundred indicators costs one pass over the collection rather
-        than four hundred; that is what makes a bulk '@ioc-list.txt' practical.
-        Matching is case-insensitive because indicator lists and artifacts
-        disagree constantly about the case of hashes and hostnames.
+        Every term is one alternative in one compiled pattern, so a hundred
+        indicators cost one pass rather than a hundred. That is not free
+        either: Python's re walks the alternation branch by branch at each
+        position, so the pattern's size is a real cost on a collection with
+        millions of log lines - which is why the caller decides how many
+        terms are worth it rather than this deciding for them.
         """
-        terms = self._pivot_terms()[: self.opts.pivot_limit]
-        # Every other indicator any analyzer extracted, counted in the same
-        # pass but never reported as a finding. The IOCS table wants a count,
-        # a first and a last for all of them, and a second sweep of the
-        # collection to get it would double the most expensive step in the
-        # run - whereas one more alternative in an alternation that is already
-        # being compiled costs nothing measurable.
-        quiet = self._ioc_terms(set(t.lower() for t in terms))
-        self.pivot_reported = set(terms)
-        terms = terms + quiet
-        if not terms:
-            return
+        # One prefix tree rather than one alternation per term: the engine
+        # then fails a whole subtree on the first character that does not
+        # match, instead of trying every indicator at every position. With a
+        # hundred addresses off the same few subnets that is the difference
+        # between minutes and tens of minutes over the same bytes.
+        #
+        # The trie has no per-term groups, so a match is mapped back to its
+        # term by the text it matched - which is why the terms are deduplicated
+        # case-insensitively before they get here.
+        index = {}
+        for i, t in enumerate(terms):
+            index.setdefault(t.lower(), i)
         try:
-            rx = re.compile("|".join("(%s)" % re.escape(t) for t in terms), re.I)
+            rx = re.compile(trie_pattern(terms), re.I)
         except re.error as e:
             self.add("MEDIUM", "Pivot", "Indicator list could not be compiled",
                      str(e))
-            return
+            return None
         hits = defaultdict(list)                  # term index -> evidence
         counts = defaultdict(lambda: defaultdict(int))   # term -> artifact -> n
         spans = defaultdict(lambda: ["", ""])     # term index -> [first, last]
@@ -14220,33 +14293,106 @@ class Triage:
             host = self.col.host_path(rel)
             # The name is evidence too. Samba writes one log per client as
             # /var/log/samba/log.10.198.11.107, and an indicator that appears
-            # only in a path was being counted as appearing nowhere - which
-            # reads as an address this host never talked to, on a host that
-            # kept a whole logfile for it.
+            # only in a path was counted as appearing nowhere - which reads as
+            # an address this host never talked to, on a host that kept a
+            # whole logfile for it.
             mp = rx.search(host)
             if mp:
-                idx = mp.lastindex - 1 if mp.lastindex else 0
-                counts[idx][host] += 1
-                if len(hits[idx]) < 60:
-                    hits[idx].append((host, 0, "(named by the artifact path)"))
+                idx = index.get(mp.group(0).lower())
+                if idx is not None:
+                    counts[idx][host] += 1
+                    if len(hits[idx]) < 60:
+                        hits[idx].append((host, 0,
+                                          "(named by the artifact path)"))
             raw = decompress_bytes(rel, self.col.read_bytes(rel))
             if raw is None:
                 continue
             if b"\x00" in raw[:4096]:             # binary, not worth grepping
                 continue
-            for n, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
-                m = rx.search(line)
-                if not m:
+            # One scan of the whole artifact, not one call per line. The
+            # per-line form made a Python-level regex call for every line in
+            # the collection - millions of them, almost all matching nothing -
+            # and with a hundred indicators in the alternation that dominated
+            # the entire run. finditer walks the buffer in C and only comes
+            # back for the matches, which are rare; the line number and the
+            # line text are then worked out for those alone.
+            text = raw.decode("utf-8", "replace")
+            newlines = None
+            for m in rx.finditer(text):
+                idx = index.get(m.group(0).lower())
+                if idx is None:
                     continue
-                idx = m.lastindex - 1 if m.lastindex else 0
                 counts[idx][host] += 1
+                start = text.rfind("\n", 0, m.start()) + 1
+                end = text.find("\n", m.end())
+                line = text[start:end if end >= 0 else len(text)]
                 # dated from every hit, not from the sixty kept for evidence:
                 # a span taken over a truncated sample is a narrower window
                 # than the indicator actually spans, which is the one direction
                 # a pivot must not be wrong in
                 span_add(spans[idx], self.log_ts(split_log_line(line)[0]))
                 if len(hits[idx]) < 60 and counts[idx][host] <= 6:
-                    hits[idx].append((host, n, trunc(line.strip(), 200)))
+                    if newlines is None:
+                        newlines = _line_starts(text)
+                    hits[idx].append((host, _line_of(newlines, start),
+                                      trunc(line.strip(), 200)))
+        return hits, counts, spans
+
+    def count_indicators(self):
+        """Measure every extracted indicator across the whole collection.
+
+        Called after the tables are built rather than during the analysis,
+        because that is the first moment the indicator list is complete: half
+        of them are extracted by the table extractors, so a sweep run inside
+        the analyzers would count the analyzer's own indicators and silently
+        leave the rest unmeasured.
+
+        Behind --count-iocs, because it is a second full pass over the
+        artifacts and on a 31 GB image that is minutes rather than seconds.
+        Without it the IOCS table still lists every indicator with its type
+        and its provenance; what is missing is the count, and an empty count
+        says 'not measured' rather than 'measured and found nowhere'.
+        """
+        terms = self._ioc_terms(set(t.lower() for t in self.pivot_stats))
+        if not terms:
+            return
+        swept = self.sweep_terms(terms)
+        if swept is None:
+            return
+        hits, counts, spans = swept
+        for idx, term in enumerate(terms):
+            if hits.get(idx):
+                self.pivot_stats[term] = (sum(counts[idx].values()),
+                                          spans[idx][0], spans[idx][1])
+                self.pivot_artifacts[term] = sorted(counts[idx])
+            else:
+                # searched for, found nowhere - which is a measurement, and a
+                # different answer from having not looked
+                self.pivot_stats.setdefault(term, (0, "", ""))
+
+    def analyze_pivot(self):
+        """Search every collected artifact for the given indicators.
+
+        This used to read a hardcoded list of thirteen files, which meant an
+        IP address that appeared only in auth.log, an access log or a shell
+        history was reported as 'not found' - the one answer a pivot must
+        never give wrongly. It now streams every text artifact in the
+        collection, compressed log rotations included.
+
+        All terms are matched in a single compiled alternation, so searching
+        for four hundred indicators costs one pass over the collection rather
+        than four hundred; that is what makes a bulk '@ioc-list.txt' practical.
+        Matching is case-insensitive because indicator lists and artifacts
+        disagree constantly about the case of hashes and hostnames.
+        """
+        terms = self._pivot_terms()[: self.opts.pivot_limit]
+        self.pivot_reported = set(terms)
+        if not terms:
+            return
+        swept = self.sweep_terms(terms)
+        if swept is None:
+            return
+        hits, counts, spans = swept
         self.pivot_hits = []
         for idx, term in enumerate(terms):
             ev = hits.get(idx)
@@ -14255,8 +14401,6 @@ class Triage:
             total = sum(counts[idx].values())
             self.pivot_stats[term] = (total, spans[idx][0], spans[idx][1])
             self.pivot_artifacts[term] = sorted(counts[idx])
-            if term not in self.pivot_reported:
-                continue                 # counted for the IOCS table, not a finding
             for host, n, line in ev:
                 self.pivot_hits.append((term, host, n, line))
             self.add("HIGH", "Pivot", "Cross-artifact hits for '%s'" % term,
@@ -14476,6 +14620,53 @@ class Table:
             "rows_included": len(rows),
             "rows": [[_s(v) for v in r] for r in rows],
         }
+
+
+def _human_duration(seconds):
+    """Seconds -> '3d 04:12', '02:14', '41s' - the way `last` reads."""
+    if seconds in ("", None):
+        return ""
+    try:
+        n = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if n < 0:
+        return ""
+    if n < 60:
+        return "%ds" % n
+    days, rest = divmod(n, 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return "%dd %02d:%02d" % (days, hours, rest // 60)
+    return "%02d:%02d" % (hours, rest // 60)
+
+
+def _duration_seconds(text):
+    """`last`'s own '(01:23)' or '(2+03:04)' -> seconds.
+
+    'still logged in' and 'gone - no logout' start with a letter and come back
+    empty rather than zero: a session of unknown length is not a session of no
+    length, and a zero here would sort with the forty-second ones.
+    """
+    s = str(text or "").strip().strip("()")
+    if not s or not s[0].isdigit():
+        return ""
+    days = 0
+    if "+" in s:
+        head, _, s = s.partition("+")
+        try:
+            days = int(head)
+        except ValueError:
+            return ""
+    try:
+        nums = [int(p) for p in s.split(":")]
+    except ValueError:
+        return ""
+    if len(nums) == 2:
+        return days * 86400 + nums[0] * 3600 + nums[1] * 60
+    if len(nums) == 3:
+        return days * 86400 + nums[0] * 3600 + nums[1] * 60 + nums[2]
+    return ""
 
 
 def _fs_ts(when):
@@ -17454,11 +17645,95 @@ class TableBuilder:
                     t.add(self.col.host_path(rel), i, s,
                           "yes" if "NOPASSWD" in s.upper() else "")
 
+    #: The utmp record types the session pairing below turns on.
+    UT_BOOT = "BOOT_TIME"
+    UT_RUNLVL = "RUN_LVL"
+    UT_USER = "USER_PROCESS"
+    UT_DEAD = "DEAD_PROCESS"
+
+    def _wtmp_sessions(self):
+        """Login sessions rebuilt from wtmp, with how long each one lasted.
+
+        How long someone was logged in is usually the question the login
+        records are being read for. A root session held open for three days
+        across the window is a different fact from a root login that lasted
+        forty seconds, and wtmp does not store the difference: it stores a
+        login record and, later, a logout record on the same terminal, and the
+        duration is the gap between them. `last` does that pairing on a live
+        host. Nothing does it for a disk image, where there is no `last`
+        output and the wtmp file is the only thing there is.
+
+        Pairing is by terminal in file order, the way last does it. A boot or
+        shutdown record closes everything still open before it: those sessions
+        never had a logout written, and the moment the machine went down is
+        the honest end for them rather than a blank or a guess.
+        """
+        cached = getattr(self, "_wtmp_session_cache", None)
+        if cached is not None:
+            return cached
+        out = []
+        seen_files = set()
+        for rel in self._log_files() + self.col.rootfs_glob("/var/log/wtmp*"):
+            base = os.path.basename(rel).lower()
+            if not base.startswith("wtmp") or base.endswith(".db"):
+                continue
+            if rel.lower() in seen_files:
+                continue
+            seen_files.add(rel.lower())
+            raw = decompress_bytes(rel, self.col.read_bytes(rel))
+            if not raw:
+                continue
+            host = self.col.host_path(rel)
+            open_on = {}                    # terminal -> the session open on it
+            for r in parse_utmp(raw):
+                when, kind, line = r["time"], r["type"], r["line"]
+                if kind == self.UT_BOOT or (kind == self.UT_RUNLVL
+                                            and r["user"] in ("shutdown",
+                                                              "runlevel")):
+                    ended = ("ended at reboot" if kind == self.UT_BOOT
+                             else "ended at shutdown")
+                    for sess in open_on.values():
+                        sess["end"] = when
+                        sess["state"] = ended
+                    open_on = {}
+                    continue
+                if kind == self.UT_USER and r["user"] and line:
+                    prev = open_on.get(line)
+                    if prev is not None:
+                        # a second login on the same terminal with no logout
+                        # between them: the first one ended here, and saying
+                        # so beats leaving it open until the next reboot
+                        prev["end"] = when
+                        prev["state"] = "no logout record"
+                    sess = {"user": r["user"], "line": line, "host": r["host"],
+                            "ip": r["ip"], "pid": r["pid"], "start": when,
+                            "end": None, "state": "", "source": host}
+                    open_on[line] = sess
+                    out.append(sess)
+                elif kind == self.UT_DEAD and line and line in open_on:
+                    sess = open_on.pop(line)
+                    sess["end"] = when
+                    sess["state"] = "closed"
+            for sess in open_on.values():
+                sess["state"] = "still open at the end of this wtmp"
+        self._wtmp_session_cache = out
+        return out
+
     def t_logins(self):
         t = self.table("LOGINS", "Login history",
-                       ["user", "terminal", "source_host", "start", "end", "duration",
+                       ["user", "terminal", "source_host", "start", "end",
+                        "duration", "duration_seconds", "state", "pid",
                         "source"], "Authentication",
-                       "last / lastb / who, every variant UAC captured.")
+                       "Every login session: from last/lastb/who where the "
+                       "collector ran them, and from wtmp itself otherwise - "
+                       "which is the only source on a disk image. The wtmp "
+                       "sessions are rebuilt by pairing each login with the "
+                       "logout on the same terminal, so the duration is "
+                       "measured rather than reported. state says how the "
+                       "session ended, because 'no logout record' and 'still "
+                       "open' are different facts that otherwise both look "
+                       "like a blank end time. duration_seconds is the same "
+                       "number unformatted, so the table sorts by it.")
         rx = re.compile(r"^(\S+)\s+(\S+)\s+(\S*)\s{2,}(\w{3}\s+\w{3}\s+\d+\s+[\d:]+)"
                         r"\s*-?\s*(\S+)?\s*(\(.*\))?\s*$")
         for rel in sorted(self.col.glob("live_response/system/last*.txt")) + \
@@ -17469,14 +17744,32 @@ class TableBuilder:
                     continue
                 m = rx.match(s)
                 if m:
+                    dur = (m.group(6) or "").strip("()")
                     t.add(m.group(1), m.group(2), m.group(3), m.group(4),
-                          m.group(5) or "", (m.group(6) or "").strip("()"),
-                          os.path.basename(rel))
+                          m.group(5) or "", dur, _duration_seconds(dur),
+                          "", "", os.path.basename(rel))
                 else:
                     f = s.split()
                     if f:
                         t.add(f[0], f[1] if len(f) > 1 else "", "",
-                              " ".join(f[2:]), "", "", os.path.basename(rel))
+                              " ".join(f[2:]), "", "", "", "", "",
+                              os.path.basename(rel))
+
+        # And the sessions wtmp itself describes. On a disk image this is the
+        # whole table; anywhere else it is the cross-check, measured from the
+        # records rather than taken from what `last` printed.
+        for sess in self._wtmp_sessions():
+            start, end = sess["start"], sess["end"]
+            secs = ""
+            if start and end:
+                secs = int((end - start).total_seconds())
+                if secs < 0:
+                    secs = ""          # clock moved; a negative span is not one
+            t.add(sess["user"], sess["line"], sess["host"] or sess["ip"],
+                  start.strftime("%Y-%m-%d %H:%M:%S") if start else "",
+                  end.strftime("%Y-%m-%d %H:%M:%S") if end else "",
+                  _human_duration(secs), secs, sess["state"], sess["pid"],
+                  sess["source"])
 
     # message shape -> (event label, regex whose named groups fill user/ip/port)
     # (event label, regex, class) - class 'priv' feeds PRIVILEGE_ACTIVITY.
@@ -21347,11 +21640,25 @@ class TableBuilder:
                        "is a different fact from the same address seen on an "
                        "outbound admin connection. count, first_utc and "
                        "last_utc are measured across every artifact in the "
-                       "collection rather than only the one that named it, so "
-                       "an indicator that turns up nowhere else has a count "
-                       "of 0 and that is itself worth knowing. Feed the "
+                       "collection rather than only the one that named it. "
+                       "They are filled for the terms the run pivoted on; "
+                       "--count-iocs measures every indicator instead, at the "
+                       "cost of a much slower sweep. An empty count means not "
+                       "measured, and a 0 means measured and found nowhere "
+                       "else - which is itself worth knowing. Feed the "
                        "indicator column to a SIEM; read the why column "
                        "before you do.")
+        # Measured here rather than during the analysis: half the indicators
+        # in this table are extracted by the table extractors above, so a
+        # sweep run any earlier would count the analyzers' own and quietly
+        # leave the rest unmeasured.
+        if getattr(self.tri.opts, "count_iocs", False):
+            status("[*] counting %s indicator(s) across the collection "
+                   "(--count-iocs)" % format(len(iocs), ","))
+            try:
+                self.tri.count_indicators()
+            except Exception as exc:
+                status("[!] indicator counting failed: %s" % exc)
         stats = getattr(self.tri, "pivot_stats", {})
         arts = getattr(self.tri, "pivot_artifacts", {})
         for value in sorted(iocs, key=lambda v: (ioc_type(v), v.lower())):
@@ -21359,7 +21666,7 @@ class TableBuilder:
             count, first, last = stats.get(value, ("", "", ""))
             where = arts.get(value, [])
             t.add(value, ioc_type(value), "; ".join(labels),
-                  count if count != "" else 0, len(where), first, last,
+                  count, len(where), first, last,
                   "; ".join(where[:12]) + (" ..." if len(where) > 12 else ""),
                   ioc_mitre(labels))
 
@@ -25064,6 +25371,16 @@ def main(argv=None):
                          "list of indicators, one per line, '#' for comments - "
                          "all terms are matched in one pass, so a long list "
                          "costs no more than a short one.")
+    ap.add_argument("--count-iocs", action="store_true",
+                    help="also count every extracted indicator across the "
+                         "whole collection, filling count/first_utc/last_utc "
+                         "in the IOCS table for all of them rather than only "
+                         "for the terms that were pivoted on. It folds them "
+                         "into the same single pass --pivot makes, but that "
+                         "pass then reads every text artifact against a much "
+                         "larger pattern: on a 31 GB image it took a four "
+                         "minute run to twenty. The indicators, their types "
+                         "and their provenance are in IOCS either way.")
     ap.add_argument("--pivot-limit", type=int, default=500,
                     help="max indicators to search for (default 500)")
     ap.add_argument("--deep", action="store_true",

@@ -595,6 +595,38 @@ The owner column comes from the longest home that fits the path, because homes
 nest: with both `/var` and `/var/www` in `passwd`, a file under `/var/www`
 belongs to the account that lives there.
 
+### How long each session lasted
+
+`LOGINS` carries every login session with its **duration**, rebuilt by pairing
+each login in `wtmp` with the logout on the same terminal — the pairing `last`
+does on a live host and nothing does for a disk image, where there is no `last`
+output and the `wtmp` file is all there is.
+
+```
+user     terminal  source_host        start                duration   state
+shaher   tty2      tty2               2025-07-23 20:38:29  75d 14:41  ended at reboot
+root     pts/0     192.168.210.131    2019-10-05 11:20:59  00:12      closed
+```
+
+A root session held open for three days across the window is a different fact
+from a root login that lasted forty seconds, and that difference is the reason
+the login records are usually being read.
+
+`state` says how the session ended, because "no logout record" and "still open"
+otherwise both look like a blank end time:
+
+| state | |
+|---|---|
+| `closed` | a matching logout record |
+| `ended at reboot` / `ended at shutdown` | still open when the machine went down — no logout was ever written, and that moment is the honest end |
+| `no logout record` | a second login took the terminal first |
+| `still open at the end of this wtmp` | never closed within this file |
+
+`duration_seconds` is the same number unformatted, so the table sorts by it. On
+the collection this was built against, `LOGINS` did not exist at all before —
+the collector never ran `last` — and now holds 257 sessions and 903 days of
+measured session time.
+
 ### Every indicator, in one table
 
 `IOCS` is the list of indicators this run extracted — addresses, hashes,
@@ -616,10 +648,18 @@ on which analyzer picked it up, and that is recorded at the moment of
 extraction rather than guessed at afterwards. Two indicators of the same shape
 and different provenance are two different facts.
 
-The counts come from the same single pass over the collection that `--pivot`
-uses, so they cover every mention anywhere — not only the artifact that first
-named it. An indicator that turns up nowhere else has a count of `0`, and that
-is itself worth knowing: it means nothing corroborates it.
+The counts come from a pass over every text artifact, so they cover every
+mention anywhere — not only the artifact that first named it. They are filled
+for the terms the run pivoted on; **`--count-iocs`** measures every indicator
+instead, at the cost of a second sweep (2 minutes on a 230 MB collection, where
+it measured 100 of 102). An empty count means *not measured*; a `0` means
+measured and found nowhere else, which is itself worth knowing.
+
+Both sweeps compile the indicators into one prefix-tree regex rather than one
+alternation per term, so the engine fails a whole subtree on the first
+character that does not match. With a hundred addresses off the same few
+subnets that is the difference between two minutes and over ten — and it speeds
+up a bulk `--pivot @ioc-list.txt` by the same mechanism.
 
 `IOC_HITS` is the other half — one row per *hit*, with the line quoted, for the
 terms `--pivot` was given.

@@ -341,6 +341,16 @@ def main(argv=None):
                          "list of indicators, one per line, '#' for comments - "
                          "all terms are matched in one pass, so a long list "
                          "costs no more than a short one.")
+    ap.add_argument("--count-iocs", action="store_true",
+                    help="also count every extracted indicator across the "
+                         "whole collection, filling count/first_utc/last_utc "
+                         "in the IOCS table for all of them rather than only "
+                         "for the terms that were pivoted on. It folds them "
+                         "into the same single pass --pivot makes, but that "
+                         "pass then reads every text artifact against a much "
+                         "larger pattern: on a 31 GB image it took a four "
+                         "minute run to twenty. The indicators, their types "
+                         "and their provenance are in IOCS either way.")
     ap.add_argument("--pivot-limit", type=int, default=500,
                     help="max indicators to search for (default 500)")
     ap.add_argument("--deep", action="store_true",

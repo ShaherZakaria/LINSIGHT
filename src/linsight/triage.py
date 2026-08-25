@@ -14,6 +14,7 @@ import sys
 from .model import Event, Finding, SEV_RANK
 from .term import Progress, status, trunc
 from .common import (
+    trie_pattern,
     ACCEPTED_LOGIN_RE, BASELINE_SUID, BENIGN_HIDDEN, COMPILED_CMD_PATTERNS,
     DANGEROUS_SUID_NAMES, PRIVILEGED_GROUPS, PRIV_HINT_RE, ROOTKIT_NAMES,
     SUSPICIOUS_PORTS, SYSTEM_BIN_DIRS, SYSTEM_CFG_DIRS, TMPFS_DIRS,
@@ -32,6 +33,28 @@ from .hosttz import describe_hosttz, format_offset, resolve_hosttz
 # ---------------------------------------------------------------------------
 # the triage engine
 # ---------------------------------------------------------------------------
+
+def _line_starts(text):
+    """Offsets of every line start, built once per artifact that matched."""
+    out = [0]
+    at = text.find("\n")
+    while at >= 0:
+        out.append(at + 1)
+        at = text.find("\n", at + 1)
+    return out
+
+
+def _line_of(starts, offset):
+    """1-based line number for a character offset."""
+    lo, hi = 0, len(starts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if starts[mid] <= offset:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo or 1
+
 
 class Triage:
     def __init__(self, col, opts):
@@ -3551,10 +3574,15 @@ class Triage:
                 out.append(t)
         return out
 
-    #: How many extracted indicators to carry into the counting pass. They
-    #: cost one alternative each in a regex that is compiled once, so the cap
-    #: is about the pathological case - a collection that yielded tens of
-    #: thousands of paths - rather than about the ordinary one.
+    #: How many extracted indicators to carry into the counting pass.
+    #:
+    #: This is not free, which is why it is behind --count-iocs. Python's re
+    #: walks an alternation branch by branch at every position, so folding
+    #: thousands of indicators into the pattern multiplies the cost of the
+    #: sweep - and the sweep already reads every text artifact in the
+    #: collection. On a 31 GB disk image with 85,000 files that turned a four
+    #: minute run into a twenty minute one, which is not a trade to make for
+    #: everybody by default.
     IOC_COUNT_LIMIT = 4000
 
     def _ioc_terms(self, already):
@@ -3579,39 +3607,40 @@ class Triage:
                 break
         return out
 
-    def analyze_pivot(self):
-        """Search every collected artifact for the given indicators.
+    def sweep_terms(self, terms):
+        """One pass over every text artifact, matching all terms at once.
 
-        This used to read a hardcoded list of thirteen files, which meant an
-        IP address that appeared only in auth.log, an access log or a shell
-        history was reported as 'not found' - the one answer a pivot must
-        never give wrongly. It now streams every text artifact in the
-        collection, compressed log rotations included.
+        Returns (hits, counts, spans) keyed by the term's index, or None if
+        the pattern would not compile. Shared by the --pivot findings and by
+        the IOCS counting, because both ask the same question of the same
+        bytes and reading the collection twice to answer it would be the most
+        expensive mistake in the run.
 
-        All terms are matched in a single compiled alternation, so searching
-        for four hundred indicators costs one pass over the collection rather
-        than four hundred; that is what makes a bulk '@ioc-list.txt' practical.
-        Matching is case-insensitive because indicator lists and artifacts
-        disagree constantly about the case of hashes and hostnames.
+        Every term is one alternative in one compiled pattern, so a hundred
+        indicators cost one pass rather than a hundred. That is not free
+        either: Python's re walks the alternation branch by branch at each
+        position, so the pattern's size is a real cost on a collection with
+        millions of log lines - which is why the caller decides how many
+        terms are worth it rather than this deciding for them.
         """
-        terms = self._pivot_terms()[: self.opts.pivot_limit]
-        # Every other indicator any analyzer extracted, counted in the same
-        # pass but never reported as a finding. The IOCS table wants a count,
-        # a first and a last for all of them, and a second sweep of the
-        # collection to get it would double the most expensive step in the
-        # run - whereas one more alternative in an alternation that is already
-        # being compiled costs nothing measurable.
-        quiet = self._ioc_terms(set(t.lower() for t in terms))
-        self.pivot_reported = set(terms)
-        terms = terms + quiet
-        if not terms:
-            return
+        # One prefix tree rather than one alternation per term: the engine
+        # then fails a whole subtree on the first character that does not
+        # match, instead of trying every indicator at every position. With a
+        # hundred addresses off the same few subnets that is the difference
+        # between minutes and tens of minutes over the same bytes.
+        #
+        # The trie has no per-term groups, so a match is mapped back to its
+        # term by the text it matched - which is why the terms are deduplicated
+        # case-insensitively before they get here.
+        index = {}
+        for i, t in enumerate(terms):
+            index.setdefault(t.lower(), i)
         try:
-            rx = re.compile("|".join("(%s)" % re.escape(t) for t in terms), re.I)
+            rx = re.compile(trie_pattern(terms), re.I)
         except re.error as e:
             self.add("MEDIUM", "Pivot", "Indicator list could not be compiled",
                      str(e))
-            return
+            return None
         hits = defaultdict(list)                  # term index -> evidence
         counts = defaultdict(lambda: defaultdict(int))   # term -> artifact -> n
         spans = defaultdict(lambda: ["", ""])     # term index -> [first, last]
@@ -3628,33 +3657,106 @@ class Triage:
             host = self.col.host_path(rel)
             # The name is evidence too. Samba writes one log per client as
             # /var/log/samba/log.10.198.11.107, and an indicator that appears
-            # only in a path was being counted as appearing nowhere - which
-            # reads as an address this host never talked to, on a host that
-            # kept a whole logfile for it.
+            # only in a path was counted as appearing nowhere - which reads as
+            # an address this host never talked to, on a host that kept a
+            # whole logfile for it.
             mp = rx.search(host)
             if mp:
-                idx = mp.lastindex - 1 if mp.lastindex else 0
-                counts[idx][host] += 1
-                if len(hits[idx]) < 60:
-                    hits[idx].append((host, 0, "(named by the artifact path)"))
+                idx = index.get(mp.group(0).lower())
+                if idx is not None:
+                    counts[idx][host] += 1
+                    if len(hits[idx]) < 60:
+                        hits[idx].append((host, 0,
+                                          "(named by the artifact path)"))
             raw = decompress_bytes(rel, self.col.read_bytes(rel))
             if raw is None:
                 continue
             if b"\x00" in raw[:4096]:             # binary, not worth grepping
                 continue
-            for n, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
-                m = rx.search(line)
-                if not m:
+            # One scan of the whole artifact, not one call per line. The
+            # per-line form made a Python-level regex call for every line in
+            # the collection - millions of them, almost all matching nothing -
+            # and with a hundred indicators in the alternation that dominated
+            # the entire run. finditer walks the buffer in C and only comes
+            # back for the matches, which are rare; the line number and the
+            # line text are then worked out for those alone.
+            text = raw.decode("utf-8", "replace")
+            newlines = None
+            for m in rx.finditer(text):
+                idx = index.get(m.group(0).lower())
+                if idx is None:
                     continue
-                idx = m.lastindex - 1 if m.lastindex else 0
                 counts[idx][host] += 1
+                start = text.rfind("\n", 0, m.start()) + 1
+                end = text.find("\n", m.end())
+                line = text[start:end if end >= 0 else len(text)]
                 # dated from every hit, not from the sixty kept for evidence:
                 # a span taken over a truncated sample is a narrower window
                 # than the indicator actually spans, which is the one direction
                 # a pivot must not be wrong in
                 span_add(spans[idx], self.log_ts(split_log_line(line)[0]))
                 if len(hits[idx]) < 60 and counts[idx][host] <= 6:
-                    hits[idx].append((host, n, trunc(line.strip(), 200)))
+                    if newlines is None:
+                        newlines = _line_starts(text)
+                    hits[idx].append((host, _line_of(newlines, start),
+                                      trunc(line.strip(), 200)))
+        return hits, counts, spans
+
+    def count_indicators(self):
+        """Measure every extracted indicator across the whole collection.
+
+        Called after the tables are built rather than during the analysis,
+        because that is the first moment the indicator list is complete: half
+        of them are extracted by the table extractors, so a sweep run inside
+        the analyzers would count the analyzer's own indicators and silently
+        leave the rest unmeasured.
+
+        Behind --count-iocs, because it is a second full pass over the
+        artifacts and on a 31 GB image that is minutes rather than seconds.
+        Without it the IOCS table still lists every indicator with its type
+        and its provenance; what is missing is the count, and an empty count
+        says 'not measured' rather than 'measured and found nowhere'.
+        """
+        terms = self._ioc_terms(set(t.lower() for t in self.pivot_stats))
+        if not terms:
+            return
+        swept = self.sweep_terms(terms)
+        if swept is None:
+            return
+        hits, counts, spans = swept
+        for idx, term in enumerate(terms):
+            if hits.get(idx):
+                self.pivot_stats[term] = (sum(counts[idx].values()),
+                                          spans[idx][0], spans[idx][1])
+                self.pivot_artifacts[term] = sorted(counts[idx])
+            else:
+                # searched for, found nowhere - which is a measurement, and a
+                # different answer from having not looked
+                self.pivot_stats.setdefault(term, (0, "", ""))
+
+    def analyze_pivot(self):
+        """Search every collected artifact for the given indicators.
+
+        This used to read a hardcoded list of thirteen files, which meant an
+        IP address that appeared only in auth.log, an access log or a shell
+        history was reported as 'not found' - the one answer a pivot must
+        never give wrongly. It now streams every text artifact in the
+        collection, compressed log rotations included.
+
+        All terms are matched in a single compiled alternation, so searching
+        for four hundred indicators costs one pass over the collection rather
+        than four hundred; that is what makes a bulk '@ioc-list.txt' practical.
+        Matching is case-insensitive because indicator lists and artifacts
+        disagree constantly about the case of hashes and hostnames.
+        """
+        terms = self._pivot_terms()[: self.opts.pivot_limit]
+        self.pivot_reported = set(terms)
+        if not terms:
+            return
+        swept = self.sweep_terms(terms)
+        if swept is None:
+            return
+        hits, counts, spans = swept
         self.pivot_hits = []
         for idx, term in enumerate(terms):
             ev = hits.get(idx)
@@ -3663,8 +3765,6 @@ class Triage:
             total = sum(counts[idx].values())
             self.pivot_stats[term] = (total, spans[idx][0], spans[idx][1])
             self.pivot_artifacts[term] = sorted(counts[idx])
-            if term not in self.pivot_reported:
-                continue                 # counted for the IOCS table, not a finding
             for host, n, line in ev:
                 self.pivot_hits.append((term, host, n, line))
             self.add("HIGH", "Pivot", "Cross-artifact hits for '%s'" % term,
