@@ -404,7 +404,8 @@ class Collection:
         self._tar = None
         self._zip = None
         self._sizes = {}
-        self._names = {}          # lowercase relative name -> real member name
+        self._names = {}          # lowercase relative name -> the same name, cased
+        self._raw = {}            # lowercase relative name -> archive member name
         self.prefix = ""          # archive dir that holds the layout's marker
         self.layout = "uac"       # 'uac' or 'velociraptor'; see _find_prefix
         self._load()
@@ -413,6 +414,43 @@ class Collection:
         self.velo = VelociraptorResults(self) if self.layout == "velociraptor" else None
 
     # -- loading ------------------------------------------------------------
+    @staticmethod
+    def _norm_member(name):
+        """Archive member name -> collection-relative path.
+
+        Two things had to stop happening here.
+
+        `tar -C dir -cf out.tar .` writes every member as './[root]/etc/passwd',
+        and the old code kept that raw name as the value in _names while keying
+        on the stripped one. glob() then returned './[root]/...', which
+        resolve() could not look up, so read_bytes() returned None for every
+        artifact found by glob - silently. Findings reached by an exact path
+        (/etc/passwd) still fired, so the collection looked parsed while every
+        log matched by a pattern had vanished.
+
+        And the strip itself was lstrip('./'), a character class rather than a
+        prefix: './.bash_history' came out as 'bash_history' and './.ssh/x' as
+        '.ssh/x' only by luck of the next character. Dotfiles are exactly the
+        persistence artifacts this tool exists to find.
+        """
+        n = (name or "").replace("\\", "/")
+        while n.startswith("./"):
+            n = n[2:]
+        return n.lstrip("/")
+
+    def _add_member(self, rel, raw, size):
+        """Record one file under its normalised name.
+
+        _names carries the normalised name so that everything a glob or a walk
+        hands back can be fed straight to read_bytes(); _raw carries whatever
+        the archive actually calls it, which only _open() needs.
+        """
+        key = rel.lower()
+        self._names[key] = rel
+        self._sizes[key] = size
+        if raw != rel:
+            self._raw[key] = raw
+
     def _load(self):
         if os.path.isdir(self.path):
             self.kind = "dir"
@@ -421,11 +459,11 @@ class Collection:
                 for fn in filenames:
                     full = os.path.join(dirpath, fn)
                     rel = os.path.relpath(full, base).replace(os.sep, "/")
-                    self._names[rel.lower()] = rel
                     try:
-                        self._sizes[rel.lower()] = os.path.getsize(full)
+                        size = os.path.getsize(full)
                     except OSError:
-                        self._sizes[rel.lower()] = 0
+                        size = 0
+                    self._add_member(rel, rel, size)
         elif zipfile.is_zipfile(self.path):
             self.kind = "zip"
             self._zip = zipfile.ZipFile(self.path)
@@ -435,9 +473,10 @@ class Collection:
                     continue
                 if zi.flag_bits & 0x1:
                     encrypted += 1
-                rel = zi.filename.lstrip("./")
-                self._names[rel.lower()] = zi.filename
-                self._sizes[rel.lower()] = zi.file_size
+                rel = self._norm_member(zi.filename)
+                if not rel:
+                    continue
+                self._add_member(rel, zi.filename, zi.file_size)
             self._check_sealed(encrypted)
         else:
             self.kind = "tar"
@@ -445,9 +484,10 @@ class Collection:
             for ti in self._tar.getmembers():
                 if not ti.isfile():
                     continue
-                rel = ti.name.lstrip("./")
-                self._names[rel.lower()] = ti.name
-                self._sizes[rel.lower()] = ti.size
+                rel = self._norm_member(ti.name)
+                if not rel:
+                    continue
+                self._add_member(rel, ti.name, ti.size)
         if not self._names:
             raise SystemExit("[!] no readable files found in %s" % self.path)
 
@@ -643,11 +683,14 @@ class Collection:
     def _open(self, real):
         if self.kind == "dir":
             return open(os.path.join(self.path, real), "rb")
+        # back to whatever the archive calls it - './[root]/etc/passwd' where
+        # the rest of the tool says '[root]/etc/passwd'
+        member = self._raw.get(real.lower(), real)
         if self.kind == "zip":
-            return self._zip.open(real, "r")
-        f = self._tar.extractfile(real)
+            return self._zip.open(member, "r")
+        f = self._tar.extractfile(member)
         if f is None:
-            raise IOError("not a regular file: %s" % real)
+            raise IOError("not a regular file: %s" % member)
         return f
 
     def read_bytes(self, rel, limit=None):
@@ -723,6 +766,7 @@ class FilesCollection(Collection):
         self._zip = None
         self._sizes = {}
         self._names = {}
+        self._raw = {}             # unused here - members are already normalised
         self._disk = {}            # synthetic member name -> real path on disk
         self.prefix = ""
         self.layout = "uac"
