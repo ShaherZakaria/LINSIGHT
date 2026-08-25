@@ -569,11 +569,6 @@ class Triage:
                     if val and label not in info:
                         info[label] = str(val)
         if "Hostname" not in info:
-            rel = self.col.rootfs("/etc/hostname")
-            txt = (self.col.text(rel) or "").strip() if rel else ""
-            if txt:
-                info["Hostname"] = txt.splitlines()[0].strip()
-        if "Hostname" not in info:
             m = re.match(r"(?i)^collection-(.+?)-\d{4}-\d{2}-\d{2}",
                          os.path.basename(self.col.path))
             if m:
@@ -655,9 +650,30 @@ class Triage:
                      evidence=[trunc(w) for w in warnings[:10]], source=src,
                      times=warn_ts, count=len(warnings))
 
+    def host_identity(self):
+        """Host identity read off the filesystem copy itself.
+
+        For the inputs whose own metadata carries it, this changes nothing:
+        uac.log states the hostname outright and a Velociraptor collection
+        has it recovered from its artifacts. But those are the only two
+        things analyze_collection() knows how to read, and a disk image, an
+        AD1 and a plain directory tree are none of them - so every disk
+        report named its host 'collection' while /etc/hostname sat in the
+        evidence, unread, and every syslog line in the export carried the
+        name in its second field.
+        """
+        if self.meta.get("Hostname"):
+            return
+        rel = self.col.rootfs("/etc/hostname")
+        txt = (self.col.text(rel) or "").strip() if rel else ""
+        if txt:
+            self.meta["Hostname"] = txt.splitlines()[0].strip()
+
     def analyze_collection(self):
         if self.col.layout == "velociraptor":
-            return self.analyze_velociraptor_collection()
+            self.analyze_velociraptor_collection()
+            self.host_identity()
+            return
         src = "uac.log"
         lines = self.col.lines(src)
         info = {}
@@ -698,6 +714,8 @@ class Triage:
                 if msg.startswith(key + ":"):
                     info[key] = msg.split(":", 1)[1].strip()
         self.meta.update(info)
+        # a disk or an AD1 has no uac.log at all, so none of the above ran
+        self.host_identity()
         if last_ts:
             self.collection_time = last_ts
             self.meta["Collection started"] = (

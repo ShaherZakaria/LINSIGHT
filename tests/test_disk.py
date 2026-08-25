@@ -55,6 +55,7 @@ def load(built):
     import linsight.hosttz, linsight.fsbase                      # noqa
     import linsight.tables                                       # noqa
     import linsight.writers                                      # noqa
+    import linsight.triage                                       # noqa
 
     class Flat(object):
         pass
@@ -63,6 +64,7 @@ def load(built):
     for mod in (linsight.image, linsight.volume, linsight.disk, linsight.ad1,
                 linsight.distro, linsight.common, linsight.hosttz,
                 linsight.fsbase, linsight.tables, linsight.writers,
+                linsight.triage,
                 linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs):
         for name in dir(mod):
             if not name.startswith("__"):
@@ -1128,6 +1130,68 @@ def check_html_pack(L, res):
         res.ok("row cap honoured        --html-rows 10 gives 10")
 
 
+class _HostCol(object):
+    """A collection that has an /etc/hostname, or does not."""
+
+    def __init__(self, text):
+        self._text = text
+
+    def rootfs(self, path):
+        return "[root]" + path if self._text is not None else None
+
+    def text(self, rel):
+        return self._text
+
+
+class _MetaOnly(object):
+    """Just enough of Triage for host_identity, which reads only these."""
+
+    def __init__(self, meta, col):
+        self.meta = meta
+        self.col = col
+
+
+#: (what /etc/hostname holds, what meta already had, expected Hostname)
+HOST_CASES = (
+    ("VulnOSv2\n", {}, "VulnOSv2"),
+    ("VulnOSv2", {}, "VulnOSv2"),
+    ("  web01  \n", {}, "web01"),
+    # some hosts keep a comment or a second line under it
+    ("web01\n# set by cloud-init\n", {}, "web01"),
+    # the collector's own statement wins - uac.log names the host outright,
+    # and the filesystem copy is the fallback, not the correction
+    ("VulnOSv2\n", {"Hostname": "shaher-VMware"}, "shaher-VMware"),
+    # nothing to read, nothing to say
+    ("", {}, None),
+    ("   \n", {}, None),
+    (None, {}, None),
+)
+
+
+def check_host_identity(L, res):
+    """A disk image has no uac.log, and used to have no hostname either.
+
+    analyze_collection() reads uac.log or a Velociraptor context and knows
+    nothing else, so a disk, an AD1 and a plain directory tree came out with
+    no Hostname at all - every console titled 'collection' - while
+    /etc/hostname sat in the evidence unread.
+    """
+    print("\nhost identity - the name the host calls itself")
+    wrong = []
+    for text, meta, want in HOST_CASES:
+        m = dict(meta)
+        L.Triage.host_identity(_MetaOnly(m, _HostCol(text)))
+        got = m.get("Hostname")
+        if got != want:
+            wrong.append("%r + %r -> %r, expected %r" % (text, meta, got, want))
+    if wrong:
+        res.fail("hostname from the filesystem", wrong[0] +
+                 ("" if len(wrong) == 1 else " (and %d more)" % (len(wrong) - 1)))
+    else:
+        res.ok("hostname from /etc/hostname %d cases, and uac.log still wins"
+               % len(HOST_CASES))
+
+
 def check_inventory_times(L, res):
     """FILE_INVENTORY has to carry times, and say where they came from."""
     print("\nfile inventory - times, and what they mean")
@@ -1464,6 +1528,7 @@ def main(argv=None):
     check_refusals(L, res)
     check_ad1(L, res)
     check_distribution(L, res)
+    check_host_identity(L, res)
     check_filename_hunts(L, res)
     check_addresses(L, res)
     check_html_pack(L, res)
