@@ -53,6 +53,7 @@ def load(built):
     import linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs   # noqa
     import linsight.ad1, linsight.distro, linsight.common        # noqa
     import linsight.hosttz, linsight.fsbase                      # noqa
+    import linsight.tables                                       # noqa
 
     class Flat(object):
         pass
@@ -60,7 +61,7 @@ def load(built):
     flat = Flat()
     for mod in (linsight.image, linsight.volume, linsight.disk, linsight.ad1,
                 linsight.distro, linsight.common, linsight.hosttz,
-                linsight.fsbase,
+                linsight.fsbase, linsight.tables,
                 linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs):
         for name in dir(mod):
             if not name.startswith("__"):
@@ -771,6 +772,148 @@ def check_filename_hunts(L, res):
                % len(SENSITIVE_CASES))
 
 
+# (timestamp, syslog ident, pid, event, user, message) as AUTH_LOG holds them.
+# The order is the order the rows arrive in, which is not time order: auth.log
+# is read alongside its rotated auth.log.1 and auth.log.*.gz, and the glob
+# returns them by name. The live file is listed first here, and it is newer.
+AUTH_SESSION_ROWS = (
+    # --- auth.log, the live file -------------------------------------------
+    # dave's session began before the rotation, so its open is in the older
+    # file below and only its close is here. Pairing the rows as they arrive
+    # drops this close on an empty stack and leaves the open dangling.
+    ("2026-07-25 08:00:00", "sshd", "5555", "session closed", "dave",
+     "pam_unix(sshd:session): session closed for user dave"),
+    # two sudo sessions by different users, overlapping. sudo writes no pid at
+    # all, so the user is the only thing that tells them apart.
+    ("2026-07-25 10:00:00", "sudo", "", "session opened", "root",
+     "pam_unix(sudo:session): session opened for user root by alice(uid=1000)"),
+    ("2026-07-25 10:01:00", "sudo", "", "session opened", "bob",
+     "pam_unix(sudo:session): session opened for user bob by alice(uid=1000)"),
+    ("2026-07-25 10:02:00", "sudo", "", "session closed", "root",
+     "pam_unix(sudo:session): session closed for user root"),
+    ("2026-07-25 10:03:00", "sudo", "", "session closed", "bob",
+     "pam_unix(sudo:session): session closed for user bob"),
+    # nested sudo by one user: the inner session closes first, so a close has
+    # to take the most recent open rather than replacing it.
+    ("2026-07-25 11:00:00", "sudo", "", "session opened", "root",
+     "pam_unix(sudo:session): session opened for user root by alice(uid=1000)"),
+    ("2026-07-25 11:00:30", "sudo", "", "session opened", "root",
+     "pam_unix(sudo:session): session opened for user root by alice(uid=1000)"),
+    ("2026-07-25 11:00:40", "sudo", "", "session closed", "root",
+     "pam_unix(sudo:session): session closed for user root"),
+    ("2026-07-25 11:10:00", "sudo", "", "session closed", "root",
+     "pam_unix(sudo:session): session closed for user root"),
+    # a close whose open is in a file that has already been deleted must not
+    # invent a session
+    ("2026-07-25 12:00:00", "cron", "4444", "session closed", "root",
+     "pam_unix(cron:session): session closed for user root"),
+
+    # --- auth.log.1, rotated, and older -------------------------------------
+    ("2026-07-24 17:00:00", "sshd", "1111", "session opened", "alice",
+     "pam_unix(sshd:session): session opened for user alice(uid=1000) by (uid=0)"),
+    ("2026-07-24 18:00:00", "sshd", "1111", "session closed", "alice",
+     "pam_unix(sshd:session): session closed for user alice"),
+    # overlapping ssh sessions for one user, told apart only by pid
+    ("2026-07-24 19:00:00", "sshd", "2222", "session opened", "bob",
+     "pam_unix(sshd:session): session opened for user bob(uid=1001) by (uid=0)"),
+    ("2026-07-24 19:05:00", "sshd", "3333", "session opened", "bob",
+     "pam_unix(sshd:session): session opened for user bob(uid=1001) by (uid=0)"),
+    ("2026-07-24 19:06:00", "sshd", "2222", "session closed", "bob",
+     "pam_unix(sshd:session): session closed for user bob"),
+    # 3333 is never closed - the log ends first
+    # GDM's syslog ident really is 'gdm-password]' and systemd's user manager
+    # is '(systemd)'. PAM's own message is where the service name is clean.
+    ("2026-07-24 20:00:00", "gdm-password]", "", "session opened", "carol",
+     "pam_unix(gdm-password:session): session opened for user carol(uid=1002) by (uid=0)"),
+    ("2026-07-24 20:30:00", "gdm-password]", "", "session closed", "carol",
+     "pam_unix(gdm-password:session): session closed for user carol"),
+    ("2026-07-24 21:00:00", "(systemd)", "", "session opened", "carol",
+     "pam_unix(systemd-user:session): session opened for user carol(uid=1002) by (uid=0)"),
+    # dave's open, one file older than its close at the top
+    ("2026-07-24 23:50:00", "sshd", "5555", "session opened", "dave",
+     "pam_unix(sshd:session): session opened for user dave(uid=1003) by (uid=0)"),
+)
+
+STILL_OPEN = "still open at the end of this log"
+
+AUTH_SESSION_WANT = (
+    # (user, service, pid, start, end, state)
+    ("alice", "sshd", "1111", "2026-07-24 17:00:00", "2026-07-24 18:00:00", "closed"),
+    ("bob", "sshd", "2222", "2026-07-24 19:00:00", "2026-07-24 19:06:00", "closed"),
+    ("bob", "sshd", "3333", "2026-07-24 19:05:00", "", STILL_OPEN),
+    ("carol", "gdm-password", "", "2026-07-24 20:00:00", "2026-07-24 20:30:00", "closed"),
+    ("carol", "systemd-user", "", "2026-07-24 21:00:00", "", STILL_OPEN),
+    ("dave", "sshd", "5555", "2026-07-24 23:50:00", "2026-07-25 08:00:00", "closed"),
+    ("root", "sudo", "", "2026-07-25 10:00:00", "2026-07-25 10:02:00", "closed"),
+    ("bob", "sudo", "", "2026-07-25 10:01:00", "2026-07-25 10:03:00", "closed"),
+    ("root", "sudo", "", "2026-07-25 11:00:00", "2026-07-25 11:10:00", "closed"),
+    ("root", "sudo", "", "2026-07-25 11:00:30", "2026-07-25 11:00:40", "closed"),
+)
+
+
+class _TablesOnly(object):
+    """Just enough of TableBuilder for _auth_sessions, which reads only this."""
+
+    def __init__(self, tables):
+        self.tables = tables
+
+
+def check_auth_sessions(L, res):
+    """PAM's session opened/closed pairs, which is where sudo and cron live.
+
+    No fixture: this is a decision about a list of log lines, and the cases
+    that matter are the ones a real auth.log made hard - rotated files
+    arriving out of order, services that log no pid, and a close whose open
+    was in a file that has already been deleted.
+    """
+    print("\nauth.log sessions - PAM's own record of a login")
+    cols = ["timestamp_utc", "timestamp_raw", "host", "process", "pid",
+            "event", "event_class", "user", "target_user", "target_group",
+            "source_ip", "port", "tty", "pwd", "command", "result",
+            "message", "source"]
+    auth = L.Table("AUTH_LOG", "auth", cols)
+    for ts, proc, pid, event, user, msg in AUTH_SESSION_ROWS:
+        auth.add_dict({"timestamp_utc": ts, "process": proc, "pid": pid,
+                       "event": event, "user": user, "message": msg,
+                       "source": "[root]/var/log/auth.log"})
+    got = L.TableBuilder._auth_sessions(_TablesOnly([auth]))
+    got = sorted((s["user"], s["service"], s["pid"], s["start"], s["end"],
+                  s["state"]) for s in got)
+    want = sorted(AUTH_SESSION_WANT)
+    if got != want:
+        extra = [g for g in got if g not in want]
+        missing = [w for w in want if w not in got]
+        why = []
+        if extra:
+            why.append("unexpected %r" % (extra[0],))
+        if missing:
+            why.append("missing %r" % (missing[0],))
+        res.fail("auth.log session pairing", "; ".join(why) or
+                 "%d sessions, expected %d" % (len(got), len(want)))
+    else:
+        res.ok("auth.log session pairing  %d sessions, rotated order and "
+               "pidless services" % len(got))
+
+    # A session that ends before it starts is the signature of pairing the
+    # rows in the order the files were read. It is worth its own assertion
+    # because the pairing still looks plausible per row when it happens.
+    backwards = [s for s in L.TableBuilder._auth_sessions(_TablesOnly([auth]))
+                 if s["end"] and s["end"] < s["start"]]
+    if backwards:
+        res.fail("auth.log session order",
+                 "%s session ends %s, before it starts %s"
+                 % (backwards[0]["service"], backwards[0]["end"],
+                    backwards[0]["start"]))
+    else:
+        res.ok("auth.log session order    no session ends before it starts")
+
+    # No AUTH_LOG at all is the common case, not an error.
+    if L.TableBuilder._auth_sessions(_TablesOnly([])) != []:
+        res.fail("auth.log absent", "sessions invented with no AUTH_LOG")
+    else:
+        res.ok("auth.log absent           no table, no sessions")
+
+
 def check_inventory_times(L, res):
     """FILE_INVENTORY has to carry times, and say where they came from."""
     print("\nfile inventory - times, and what they mean")
@@ -1108,6 +1251,7 @@ def main(argv=None):
     check_ad1(L, res)
     check_distribution(L, res)
     check_filename_hunts(L, res)
+    check_auth_sessions(L, res)
     check_inventory_times(L, res)
     check_timezone(L, res)
     check_robustness(L, res)
