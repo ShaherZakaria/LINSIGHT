@@ -219,6 +219,25 @@ def _human_duration(seconds):
     return "%02d:%02d" % (hours, rest // 60)
 
 
+#: 'pam_unix(sshd:session): session opened ...' -> the service that opened it.
+PAM_SERVICE_RE = re.compile(r"pam_\w+\(([^:)]+):session\)")
+
+
+def _span_seconds(start, end):
+    """Seconds between two 'YYYY-MM-DD HH:MM:SS' strings, or ''."""
+    if not start or not end:
+        return ""
+    try:
+        a = datetime.strptime(str(start)[:19], "%Y-%m-%d %H:%M:%S")
+        b = datetime.strptime(str(end)[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return ""
+    secs = int((b - a).total_seconds())
+    # a syslog year rollover, or a clock that moved: a negative span is not a
+    # duration, and printing one would be worse than printing none
+    return secs if secs >= 0 else ""
+
+
 def _duration_seconds(text):
     """`last`'s own '(01:23)' or '(2+03:04)' -> seconds.
 
@@ -3297,21 +3316,115 @@ class TableBuilder:
         self._wtmp_session_cache = out
         return out
 
+    def _auth_sessions(self):
+        """Sessions paired out of auth.log / secure, from PAM's own records.
+
+        PAM writes 'session opened for user X' and later 'session closed for
+        user X' around every session it sets up, and that is a wider net than
+        wtmp casts. wtmp records logins that took a terminal; PAM records
+        every session there was - sudo, su, cron, systemd's user manager -
+        and most of those never touch wtmp at all. A sudo session that ran for
+        forty minutes at three in the morning is exactly the kind of thing
+        this table should be able to show, and wtmp has no idea it happened.
+
+        It is also the copy that survives differently. wtmp is a binary an
+        intruder can truncate in one command; auth.log is text that is
+        usually shipped somewhere else as well, so the two disagreeing is
+        itself worth seeing - which is why both are kept rather than merged,
+        each carrying the file it came from.
+
+        Pairing is on the service, its pid and the user. The pid is what
+        ties an open to its close when several sessions overlap, but not
+        every service logs one - sudo and su write no pid at all - so the
+        user carries the pairing when it is missing. Opens on one key are
+        held as a stack and a close takes the most recent, which is what
+        nested sudo actually does.
+
+        The rows are sorted before pairing. auth.log is read together with
+        its rotated auth.log.1 and auth.log.*.gz, and those arrive in
+        filename order, not time order; pairing them as they come produces
+        sessions that end before they start.
+        """
+        auth = next((x for x in self.tables if x.name == "AUTH_LOG"), None)
+        if auth is None or not len(auth):
+            return []
+        cols = [str(c) for c in auth.columns]
+        try:
+            i_ts, i_proc, i_pid = (cols.index("timestamp_utc"),
+                                   cols.index("process"), cols.index("pid"))
+            i_ev, i_user, i_src = (cols.index("event"), cols.index("user"),
+                                   cols.index("source"))
+        except ValueError:
+            return []
+        i_ip = cols.index("source_ip") if "source_ip" in cols else -1
+        i_tty = cols.index("tty") if "tty" in cols else -1
+        i_msg = cols.index("message") if "message" in cols else -1
+        recs = []
+        for row in auth.iter_rows():
+            event = str(row[i_ev]) if i_ev < len(row) else ""
+            if event not in ("session opened", "session closed"):
+                continue
+            proc = str(row[i_proc]) if i_proc < len(row) else ""
+            # PAM names the service in its own message, and that is the clean
+            # answer. The syslog ident is not: GDM really does log as
+            # 'gdm-password]' and systemd's user manager as '(systemd)', which
+            # are faithful to the log and useless as a column to group on.
+            msg = str(row[i_msg]) if 0 <= i_msg < len(row) else ""
+            ms = PAM_SERVICE_RE.search(msg)
+            if ms:
+                proc = ms.group(1)
+            recs.append((str(row[i_ts]) if i_ts < len(row) else "", event, proc,
+                         str(row[i_pid]) if i_pid < len(row) else "",
+                         str(row[i_user]) if i_user < len(row) else "",
+                         str(row[i_ip]) if 0 <= i_ip < len(row) else "",
+                         str(row[i_tty]) if 0 <= i_tty < len(row) else "",
+                         str(row[i_src]) if i_src < len(row) else ""))
+        # undated rows keep their order and go last; they cannot be placed.
+        recs.sort(key=lambda r: (r[0] == "", r[0]))
+        out, open_on = [], {}
+        for when, event, proc, pid, user, ip, tty, src in recs:
+            key = (proc, pid, user)
+            if event == "session opened":
+                sess = {"user": user, "service": proc, "pid": pid,
+                        "start": when, "end": "", "state": "",
+                        "host": ip, "line": tty, "source": src}
+                open_on.setdefault(key, []).append(sess)
+                out.append(sess)
+                continue
+            stack = open_on.get(key)
+            if stack:
+                sess = stack.pop()
+                sess["end"] = when
+                sess["state"] = "closed"
+        for stack in open_on.values():
+            for sess in stack:
+                sess["state"] = "still open at the end of this log"
+        return out
+
     def t_logins(self):
         t = self.table("LOGINS", "Login history",
-                       ["user", "terminal", "source_host", "start", "end",
-                        "duration", "duration_seconds", "state", "pid",
+                       ["user", "service", "terminal", "source_host", "start",
+                        "end", "duration", "duration_seconds", "state", "pid",
                         "source"], "Authentication",
-                       "Every login session: from last/lastb/who where the "
-                       "collector ran them, and from wtmp itself otherwise - "
-                       "which is the only source on a disk image. The wtmp "
-                       "sessions are rebuilt by pairing each login with the "
-                       "logout on the same terminal, so the duration is "
-                       "measured rather than reported. state says how the "
-                       "session ended, because 'no logout record' and 'still "
-                       "open' are different facts that otherwise both look "
-                       "like a blank end time. duration_seconds is the same "
-                       "number unformatted, so the table sorts by it.")
+                       "Every login session, from all three records of one: "
+                       "last/lastb/who where the collector ran them, wtmp "
+                       "paired login-to-logout by terminal, and PAM's own "
+                       "'session opened'/'session closed' in auth.log or "
+                       "secure paired by service, pid and user. The last of "
+                       "those "
+                       "is the widest net - wtmp only knows about sessions "
+                       "that took a terminal, while PAM records sudo, su, "
+                       "cron and systemd's user manager too - and it is the "
+                       "copy that survives a truncated wtmp. One session can "
+                       "therefore appear more than once, from different "
+                       "sources; the source column says which, and two "
+                       "records of one session disagreeing is itself worth "
+                       "seeing. Duration is measured from the pair rather "
+                       "than reported, state says how the session ended "
+                       "because 'no logout record' and 'still open' otherwise "
+                       "both look like a blank end time, and duration_seconds "
+                       "is the same number unformatted so the table sorts on "
+                       "it.")
         rx = re.compile(r"^(\S+)\s+(\S+)\s+(\S*)\s{2,}(\w{3}\s+\w{3}\s+\d+\s+[\d:]+)"
                         r"\s*-?\s*(\S+)?\s*(\(.*\))?\s*$")
         for rel in sorted(self.col.glob("live_response/system/last*.txt")) + \
@@ -3323,13 +3436,13 @@ class TableBuilder:
                 m = rx.match(s)
                 if m:
                     dur = (m.group(6) or "").strip("()")
-                    t.add(m.group(1), m.group(2), m.group(3), m.group(4),
+                    t.add(m.group(1), "", m.group(2), m.group(3), m.group(4),
                           m.group(5) or "", dur, _duration_seconds(dur),
                           "", "", os.path.basename(rel))
                 else:
                     f = s.split()
                     if f:
-                        t.add(f[0], f[1] if len(f) > 1 else "", "",
+                        t.add(f[0], "", f[1] if len(f) > 1 else "", "",
                               " ".join(f[2:]), "", "", "", "", "",
                               os.path.basename(rel))
 
@@ -3343,11 +3456,19 @@ class TableBuilder:
                 secs = int((end - start).total_seconds())
                 if secs < 0:
                     secs = ""          # clock moved; a negative span is not one
-            t.add(sess["user"], sess["line"], sess["host"] or sess["ip"],
+            t.add(sess["user"], "login", sess["line"],
+                  sess["host"] or sess["ip"],
                   start.strftime("%Y-%m-%d %H:%M:%S") if start else "",
                   end.strftime("%Y-%m-%d %H:%M:%S") if end else "",
                   _human_duration(secs), secs, sess["state"], sess["pid"],
                   sess["source"])
+
+        # and what PAM recorded, which covers the sessions wtmp never sees
+        for sess in self._auth_sessions():
+            secs = _span_seconds(sess["start"], sess["end"])
+            t.add(sess["user"], sess["service"], sess["line"], sess["host"],
+                  sess["start"], sess["end"], _human_duration(secs), secs,
+                  sess["state"], sess["pid"], sess["source"])
 
     # message shape -> (event label, regex whose named groups fill user/ip/port)
     # (event label, regex, class) - class 'priv' feeds PRIVILEGE_ACTIVITY.
@@ -8027,7 +8148,7 @@ class TableBuilder:
         "t_system_info", "t_env", "t_hardware", "t_storage", "t_storage_raw",
         "t_mounts",
         "t_device_profile",
-        "t_users", "t_groups", "t_sudoers", "t_logins", "t_auth_events",
+        "t_users", "t_groups", "t_sudoers", "t_auth_events", "t_logins",
         "t_failed_logins", "t_privilege_activity", "t_ssh",
         "t_remote_access", "t_memory_output",
         "t_cron", "t_systemd_units", "t_init_scripts", "t_history",
@@ -8112,7 +8233,7 @@ class TableBuilder:
         "t_velo_results",
     ))
     OFFLINE_EXTRACTORS = frozenset((
-        "t_users", "t_groups", "t_sudoers", "t_logins", "t_auth_events",
+        "t_users", "t_groups", "t_sudoers", "t_auth_events", "t_logins",
         "t_failed_logins", "t_privilege_activity", "t_ssh", "t_remote_access",
         "t_cron", "t_systemd_units", "t_init_scripts", "t_history",
         "t_editor_history", "t_ld_preload",
