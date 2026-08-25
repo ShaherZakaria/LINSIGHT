@@ -197,6 +197,16 @@ class Table:
         }
 
 
+def _fs_ts(when):
+    """A filesystem timestamp as the string every other table prints, or ''."""
+    if not when:
+        return ""
+    try:
+        return when.strftime("%Y-%m-%d %H:%M:%S")
+    except (AttributeError, ValueError):
+        return ""
+
+
 def _s(v):
     """Cell -> display string."""
     if v is None:
@@ -7477,9 +7487,64 @@ class TableBuilder:
             t.add(host or rel, size, human_size(size),
                   self._unparsed_reason(host or rel), trunc(preview, 400))
 
+    # -- disk images ---------------------------------------------------------
+    def t_disk_layout(self):
+        """What was on the disk, including what could not be read.
+
+        This table only has rows when the collection is a disk. It exists so
+        that a partition holding a filesystem this tool does not parse, or one
+        behind LUKS, is a line in the output rather than an absence - the
+        difference between "there was nothing there" and "nothing here could
+        read it" is the whole answer in some cases.
+        """
+        rows = getattr(self.col, "report", None)
+        if not callable(rows):
+            return
+        t = self.table("DISK_LAYOUT", "Disk volumes",
+                       ["volume", "scheme", "label", "type", "filesystem",
+                        "uuid", "offset", "size", "size_human", "mounted_at",
+                        "detail"],
+                       "Collection",
+                       "Every volume the partition, LVM and LUKS scan found on "
+                       "the imaged disk, mounted or not. A volume with no "
+                       "mount point was seen and not read, and the detail "
+                       "column says why.")
+        for row in rows():
+            t.add(row["volume"], row["scheme"], row["label"], row["type"],
+                  row["filesystem"], row["uuid"], row["offset"], row["size"],
+                  human_size(row["size"]), row["mounted_at"], row["detail"])
+
+    def t_deleted_files(self):
+        """Inodes that were deleted and still carry their metadata.
+
+        The name is gone with the directory entry, so what is left is an inode
+        number, a size, an owner and a set of times. That still answers "was
+        something removed from this host during the window", which nothing
+        else in this tool and no mounted filesystem can answer at all.
+        """
+        nodes = getattr(self.col, "deleted_nodes", None)
+        if not nodes:
+            return
+        t = self.table("DELETED_FILES", "Deleted inodes",
+                       ["inode", "path", "mode", "uid", "owner", "gid",
+                        "group", "size", "size_human", "atime_utc",
+                        "mtime_utc", "ctime_utc", "crtime_utc", "dtime_utc"],
+                       "Filesystem",
+                       "Inodes with a deletion time and no remaining links, "
+                       "recovered from the inode tables. The filename is not "
+                       "recoverable - it lived in the directory entry that was "
+                       "overwritten - so these are dated and sized, not named.")
+        for node in nodes:
+            t.add(node.inode, node.path, node.mode_string(), node.uid,
+                  self.uid_name(str(node.uid)), node.gid,
+                  self.gid_name(str(node.gid)), node.size,
+                  human_size(node.size), _fs_ts(node.atime),
+                  _fs_ts(node.mtime), _fs_ts(node.ctime), _fs_ts(node.crtime),
+                  _fs_ts(node.dtime))
+
     # -- driver -------------------------------------------------------------
     EXTRACTORS = [
-        "t_metadata", "t_collection_log",
+        "t_metadata", "t_disk_layout", "t_collection_log",
         "t_processes", "t_ps_raw", "t_proc_pid", "t_proc_maps", "t_proc_environ",
         "t_proc_fds", "t_process_master", "t_process_tree",
         "t_process_tree_raw", "t_process_hashes",
@@ -7499,7 +7564,8 @@ class TableBuilder:
         "t_suid", "t_getcap", "t_mac_policy",
         "t_writable", "t_hidden_files", "t_unknown_owner",
         "t_socket_files",
-        "t_dev_files", "t_bodyfile", "t_file_hashes",
+        "t_dev_files", "t_bodyfile", "t_deleted_files",
+        "t_file_hashes",
         "t_user_artifacts",
         "t_packages", "t_package_logs", "t_chkrootkit",
         # /var/log: the binary stores first, then the text logs
@@ -7579,6 +7645,7 @@ class TableBuilder:
         "t_editor_history", "t_ld_preload",
         "t_suid", "t_getcap", "t_mac_policy", "t_writable", "t_hidden_files",
         "t_unknown_owner", "t_socket_files", "t_dev_files", "t_bodyfile",
+        "t_deleted_files", "t_disk_layout",
         "t_file_hashes", "t_user_artifacts", "t_package_logs",
         "t_journal", "t_audit_log", "t_login_records", "t_wtmpdb", "t_lastlog",
         "t_web_logs", "t_web_config", "t_samba_logs", "t_firewall_log",

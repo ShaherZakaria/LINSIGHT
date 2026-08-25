@@ -6,8 +6,12 @@ import os
 import sys
 
 from .model import SEVERITIES
+from .common import human_size
 from .term import status
 from .collect import Collection, FilesCollection, parse_file_spec
+from .image import ImageError, looks_like_disk, open_image
+from .disk import DEFAULT_MAX_FILES, DiskCollection, DiskError
+from .volume import READABLE_FS, scan
 from .rules import (
     sigma_cache_count, sigma_cache_dir, sigma_cache_manifest,
     update_sigma_rules)
@@ -21,16 +25,82 @@ from .report import (
 
 # ---------------------------------------------------------------------------
 
+
+def list_volumes(path):
+    """Print what is on a disk, and stop.
+
+    The cheap question to ask first of an unfamiliar image: which container is
+    it, how is it partitioned, what is inside the LVM, what is encrypted, and
+    which volume is the one a walk would read. It costs a pass over the
+    metadata rather than a walk of the filesystem, so it answers in a second
+    on a disk that would take twenty minutes to examine.
+    """
+    try:
+        image = open_image(path)
+    except ImageError as exc:
+        print("[!] %s" % exc, file=sys.stderr)
+        return 2
+    try:
+        volumes, notes, scheme = scan(image)
+        print("%s" % image.path)
+        print("  container    %s" % image.description)
+        print("  size         %s (%d bytes)"
+              % (human_size(image.size), image.size))
+        if len(image.parts) > 1:
+            print("  segments     %d files, %s .. %s"
+                  % (len(image.parts), os.path.basename(image.parts[0]),
+                     os.path.basename(image.parts[-1])))
+        print("  partitioning %s" % scheme)
+        print("")
+        head = ("volume", "scheme", "type", "filesystem", "size", "offset",
+                "label")
+        rows = [head]
+        for vol in volumes:
+            rows.append((vol.name, vol.scheme, vol.type_name or "-",
+                         vol.fstype or "-", human_size(vol.size),
+                         str(getattr(vol, "offset", "-")),
+                         vol.label or "-"))
+        widths = [max(len(r[i]) for r in rows) for i in range(len(head))]
+        for i, row in enumerate(rows):
+            print("  " + "  ".join(c.ljust(widths[j])
+                                   for j, c in enumerate(row)).rstrip())
+            if i == 0:
+                print("  " + "  ".join("-" * w for w in widths))
+        for vol in volumes:
+            if vol.detail:
+                print("\n  %s: %s" % (vol.name, vol.detail))
+        for note in notes:
+            print("\n  [!] %s" % note)
+        readable = [v for v in volumes if v.fstype in READABLE_FS]
+        print("")
+        if readable:
+            print("  %d volume(s) can be read: %s"
+                  % (len(readable), ", ".join(v.name for v in readable)))
+            print("  run without --list-volumes to examine, or --disk-volume "
+                  "NAME to pick one")
+        else:
+            print("  no volume on this disk holds a filesystem this tool "
+                  "reads (ext2/3/4, xfs, btrfs)")
+        return 0
+    finally:
+        image.close()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Parse a UAC or Velociraptor Linux collection and highlight "
-                    "critical / interesting events.",
+        description="Parse a UAC or Velociraptor Linux collection, or a disk "
+                    "image, and highlight critical / interesting events.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  python linsight.py ./uac-host-linux-20260324\n"
                "  python linsight.py collection.tar.gz --html report.html --json out.json\n"
                "  python linsight.py ./coll --min-severity HIGH --timeline timeline.csv\n"
                "  python linsight.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3\n"
+               "  python linsight.py ./disk.dd            # a raw disk image\n"
+               "  python linsight.py evidence.E01         # the whole E01 set\n"
+               "  python linsight.py vm.qcow2 --html report.html\n"
+               "  python linsight.py ./disk.dd --list-volumes  # what is on it\n"
+               "  sudo python linsight.py /dev/sda        # the live disk\n"
                "  python linsight.py --file /var/log/auth.log\n"
                "  python linsight.py --file ./loose-logs/ --file ps.txt\n"
                "  python linsight.py --file capture.txt:/var/log/auth.log\n"
@@ -51,11 +121,47 @@ def main(argv=None):
                          "stands. Append ':/host/path' to say what a file is "
                          "when the name does not: "
                          "--file capture.txt:/var/log/auth.log")
-    ap.add_argument("collection", nargs="?",
-                    help="collection directory, .tar, .tar.gz or .zip - UAC "
-                         "output or a Velociraptor offline collector zip; the "
-                         "layout is detected, not declared. Optional only when "
-                         "--update-sigma is refreshing rules on its own")
+    ap.add_argument("collection", nargs="?", metavar="COLLECTION|DISK",
+                    help="a collection directory, .tar, .tar.gz or .zip (UAC "
+                         "output or a Velociraptor offline collector zip), or "
+                         "a disk: a raw/dd image, an E01 set, a qcow2, vmdk, "
+                         "vhdx or vhd, or a device such as /dev/sda. Which of "
+                         "the two it is, and for a collection which tool "
+                         "produced it, is detected rather than declared. "
+                         "Optional only when --update-sigma is refreshing "
+                         "rules on its own")
+    dg = ap.add_argument_group(
+        "disks",
+        "Point the same parsers at a disk instead of a collection. The image "
+        "is read directly - no loop device, no mount, no root, nothing "
+        "written to the evidence. Partition tables, LVM volume groups and "
+        "LUKS containers are walked through; the root filesystem is the one "
+        "that holds /etc, and whatever /etc/fstab places is mounted where the "
+        "host had it. A volume that cannot be opened is reported by name, "
+        "because an encrypted partition and an absence of evidence must not "
+        "look alike in the output.")
+    dg.add_argument("--disk", metavar="PATH",
+                    help="read PATH as a disk even when it would not be "
+                         "recognised as one - a headerless image, a damaged "
+                         "partition table, a device node")
+    dg.add_argument("--list-volumes", action="store_true",
+                    help="print what is on the disk - container, partitions, "
+                         "logical volumes, filesystems - and stop. The first "
+                         "thing to run against an unfamiliar image: it costs "
+                         "one pass over the metadata, not a filesystem walk.")
+    dg.add_argument("--disk-volume", metavar="NAME",
+                    help="read this volume (part1, p2, vg/lv) instead of the "
+                         "one that holds /etc")
+    dg.add_argument("--disk-max-files", type=int, default=DEFAULT_MAX_FILES,
+                    metavar="N",
+                    help="stop the filesystem walk after N names (default "
+                         "%s). A truncated walk becomes a HIGH finding, "
+                         "because an absence in a partial read is not evidence "
+                         "of absence." % format(DEFAULT_MAX_FILES, ","))
+    dg.add_argument("--no-deleted", action="store_true",
+                    help="skip the deleted-inode scan. It reads every inode "
+                         "table on the filesystem, which on a multi-terabyte "
+                         "disk is the slowest part of the load.")
     ap.add_argument("--min-severity", default="INFO", choices=SEVERITIES,
                     help="lowest severity to print on the console (default INFO)")
     ap.add_argument("--window", type=int, default=72, metavar="H",
@@ -248,14 +354,44 @@ def main(argv=None):
     if opts.files and opts.collection:
         ap.error("--file parses loose files instead of a collection; pass one "
                  "or the other, not both")
+    if opts.disk and (opts.files or opts.collection):
+        ap.error("--disk names the disk to read; do not also pass a "
+                 "collection or --file")
 
-    if not opts.collection and not opts.files:
+    # A disk is recognised rather than declared: a .dd, an .E01, a qcow2 or a
+    # device given as the ordinary argument goes to the disk backend, and
+    # --disk only exists for the image that carries no recognisable header at
+    # all. Requiring a flag would mean an analyst who forgets it gets "no
+    # readable files found", which reads as a fault in the evidence.
+    disk_path = opts.disk
+    if not disk_path and opts.collection and looks_like_disk(opts.collection):
+        disk_path = opts.collection
+
+    if not disk_path and not opts.collection and not opts.files:
         if opts.update_sigma:
             return 0                    # a rule refresh on its own
-        ap.error("a collection or --file is required (or --update-sigma on its "
-                 "own to refresh the rule cache)")
+        ap.error("a collection, a disk or --file is required (or "
+                 "--update-sigma on its own to refresh the rule cache)")
 
-    if opts.files:
+    if opts.list_volumes:
+        if not disk_path:
+            ap.error("--list-volumes needs a disk; pass an image, a device, "
+                     "or --disk PATH")
+        return list_volumes(disk_path)
+
+    if disk_path:
+        try:
+            col = DiskCollection(
+                disk_path, quiet=opts.quiet,
+                max_files=max(1, opts.disk_max_files),
+                want_volume=opts.disk_volume,
+                deleted_limit=0 if opts.no_deleted else 200000)
+        except (DiskError, ImageError) as exc:
+            ap.error(str(exc))
+        status("[*] read %s file(s) off %s, %d filesystem(s) mounted"
+               % (format(len(col._names) - 1, ","),
+                  os.path.basename(col.path), len(col.mounts)))
+    elif opts.files:
         specs = []
         for raw in opts.files:
             path, dest = parse_file_spec(raw)

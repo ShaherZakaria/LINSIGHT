@@ -48,7 +48,9 @@ happened to capture.
 |---|---|---|---|---|
 | Reads the UAC `[root]/` filesystem half | yes | yes | partial | no |
 | Parses `live_response/` command output | **yes** | no | no | no |
-| Disk images (E01 / VMDK / VHDX) | no | **yes — its core strength** | **yes** | no |
+| Disk images (E01 / qcow2 / VMDK / VHDX) | yes — stdlib only, no mount | **yes — its core strength** | **yes** | no |
+| Filesystems read directly | ext2/3/4, XFS, btrfs | **ext, XFS, btrfs, NTFS, FAT, APFS, HFS+, ZFS, ...** | **broad, via TSK** | no |
+| Deleted inodes and crtime off a disk | yes (ext, XFS v5) | **yes** | **yes** | no |
 | Severity-ranked findings | **yes** | no, records only | no, a timeline | rule hits only |
 | Sigma | built in, no install | verify current status | via plugins | **its core** |
 | Install footprint | **none** | pip + dependencies | heavy | pip + dependencies |

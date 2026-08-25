@@ -5,16 +5,17 @@
 <h1 align="center">linsight</h1>
 
 <p align="center">
-  Parse a Linux triage collection and surface the things worth looking at first.
+  Parse a Linux triage collection or a disk image, and surface the things worth looking at first.
 </p>
 
-Point it at a [UAC](https://github.com/tclahr/uac) or [Velociraptor](https://docs.velociraptor.app/docs/offline_triage/) offline collection and it produces two things: a severity-ranked set of **findings**, and every interesting artifact normalised into browsable **tables**. Single file, standard library only, Python 3.8+.
+Point it at a [UAC](https://github.com/tclahr/uac) or [Velociraptor](https://docs.velociraptor.app/docs/offline_triage/) offline collection, at a disk image, or at a disk, and it produces two things: a severity-ranked set of **findings**, and every interesting artifact normalised into browsable **tables**. Single file, standard library only, Python 3.8+.
 
 ```
 python linsight.py ./uac-host-linux-20260324234043.tar.gz
+python linsight.py ./web01.E01
 ```
 
-No collection? `--file` runs the same parsers over loose files — one `auth.log`, a folder of them, a copied-out `/etc`. See [Without a collection](#without-a-collection).
+No collection and no image? `--file` runs the same parsers over loose files — one `auth.log`, a folder of them, a copied-out `/etc`. See [Without a collection](#without-a-collection).
 
 ## Why
 
@@ -42,6 +43,8 @@ Both collection layouts are detected from the collection itself, never declared:
 | Velociraptor | `results/*.json` | `uploads/<accessor>/` |
 
 It reads an **extracted directory** or the **archive directly** — `.tar`, `.tar.gz`, `.zip`. Reading the archive avoids extracting a multi-GB collection twice.
+
+The third kind of input is a disk. See [Disks](#disks).
 
 ## Output
 
@@ -110,6 +113,148 @@ It narrows what happened, never what exists. A row is only filtered when it *is*
 One file, no server, no network: the payload is embedded and the CSS and JS are inline, because the box that reads a triage collection is routinely the box that is not allowed to fetch anything. Open it with a double click — there is nothing to serve it from.
 
 `--html-rows N` caps how many rows of each table the page carries (default 2000); the CSV and JSON exports always hold everything.
+
+## Disks
+
+Point it at a disk image and everything above runs unchanged:
+
+```bash
+python linsight.py ./web01.dd
+python linsight.py ./evidence.E01           # the whole segment set
+python linsight.py ./vm.qcow2 --html report.html
+sudo python linsight.py /dev/sda            # the disk still in the machine
+```
+
+This is not a second tool bolted on. A disk holds `/etc/passwd`, `/var/log/auth.log*`
+and `/home/*/.bash_history` — the paths every parser here already asks for — so a
+disk is a fourth backend behind the same collection interface. The 147 analyzers,
+the 88 tables, Sigma and YARA, the timeline and the console all run over an image
+without knowing one is involved.
+
+Nothing is mounted, no loop device is created, no kernel driver touches the
+evidence, and nothing is written to the image. On an image file it needs no root.
+
+### What it reads
+
+| layer | formats |
+|---|---|
+| container | raw/dd, split raw (`.001`/`.002`, `.aa`/`.ab`), **E01** (multi-segment, compressed), **qcow2** (v2/v3, compressed clusters, backing chains), **vmdk** (sparse, streamOptimized, 2 GB split, flat descriptors), **vhdx**, **vhd** (dynamic and fixed), and block devices (`/dev/sda`, `\\.\PhysicalDrive0`) |
+| volume | MBR including the extended chain, GPT, **LVM2** (linear and striped, volume groups spanning several PVs), LUKS1/LUKS2 (identified, never opened) |
+| filesystem | **ext2 / ext3 / ext4** (extent trees and indirect blocks, inline data), **XFS** v4 and v5 (shortform, block, leaf and node directories; extent and B+tree forks; bigtime and nrext64), **btrfs** (chunk tree, subvolumes, inline and compressed extents — zlib, zstd, lzo) |
+
+Anything it recognises but cannot read faithfully — a VirtualBox VDI, an Ex01,
+a differencing VHDX, a striped btrfs across several disks — fails by name and
+says what would convert it. That is deliberate: a disk that quietly reads as
+empty produces an examination that finds nothing, and "found nothing" is the
+one answer a triage tool must never invent.
+
+### Look before you walk
+
+```bash
+python linsight.py ./web01.E01 --list-volumes
+```
+
+```
+web01.E01
+  container    E01, 4 segment(s), 3216 chunk(s), 78% compressed
+  size         512.0 GB (549755813888 bytes)
+  partitioning gpt
+
+  volume            scheme  type       filesystem  size      offset      label
+  ----------------  ------  ---------  ----------  --------  ----------  -----
+  p1                gpt     efi-system  fat        512.0 MB  1048576     EFI
+  p2                gpt     linux       ext4       1.0 GB    537919488   boot
+  p3                gpt     linux-lvm   lvm2-pv    510.5 GB  1611661312
+  rhel/root         lvm     lvm-lv      xfs        450.0 GB
+  rhel/home         lvm     lvm-lv      xfs        56.0 GB
+  rhel/swap         lvm     lvm-lv      swap       4.0 GB
+```
+
+One pass over the metadata, not a walk of the filesystem — seconds on a disk
+that takes twenty minutes to examine.
+
+### Which volume gets read
+
+The root filesystem is the one that holds `/etc`, asked of the filesystem rather
+than of the partition table: `/boot` and `/` are both type `linux` in a GPT and
+only one of them has `/etc/passwd` in it. Everything else `/etc/fstab` places —
+matched by UUID, by label, or by device-mapper name — is mounted where the host
+had it, so `/boot/grub/grub.cfg` and `/home/analyst/.bash_history` end up at the
+paths the rules match on. `--disk-volume NAME` overrides the choice.
+
+A volume that cannot be opened is a row in `DISK_LAYOUT` and a `MEDIUM` finding,
+not an absence:
+
+```
+[MEDIUM] Encrypted volume not examined
+    A LUKS container on this disk was identified and could not be opened.
+    Whatever is on it has not been looked at by any check in this report.
+      | p2 | linux-luks | luks | LUKS2 'vault', uuid 4f2c...
+```
+
+### Two things a collection cannot give you
+
+**A real bodyfile.** It is built here from the inodes rather than parsed from one
+a collector produced, so `BODYFILE` carries **crtime** on ext4, XFS v5 and btrfs.
+A binary whose creation time falls inside the incident window and whose mtime
+reads 2019 is a timestomp — stated, not suspected.
+
+**Deleted files.** `DELETED_FILES` lists inodes with a deletion time and no
+remaining links, recovered from the inode tables. The name is gone with the
+directory entry that was overwritten, so these are dated, sized and owned rather
+than named — which still answers "was something removed from `/tmp` during the
+window", a question no mounted filesystem can answer at all.
+
+And one it cannot: nothing that existed only in RAM. There is no process list on
+a dead disk, no socket table, no loaded-module list. Those tables come out empty
+and the report says why, rather than leaving an empty `PROCESSES` to be read as a
+host that had no processes.
+
+### A disk you have already mounted
+
+If the image is mounted — by a forensic mounter, `losetup`, or because you are
+looking at the machine itself — point `--file` at the mountpoint. A directory
+whose top level looks like a host tree is mounted as it stands:
+
+```bash
+python linsight.py --file /mnt/evidence
+python linsight.py --file E:```
+
+That path costs the crtime and the deleted inodes, because those come from
+reading the filesystem structures rather than from the kernel's view of them.
+Read the image directly when you can.
+
+### Scale
+
+The walk holds one record per name, so a large disk is bounded rather than
+unbounded: `--disk-max-files` stops it (default 3,000,000) and a truncated walk
+becomes a `HIGH` finding, because an absence in a partial read is not evidence of
+absence. `--no-deleted` skips the inode-table sweep, which is the slowest part of
+loading a multi-terabyte disk.
+
+### Testing
+
+The disk stack is tested against images built by the tools that own the formats —
+`mkfs.ext4`, `mkfs.xfs`, `mkfs.btrfs`, `sfdisk`, `qemu-img`, `ewfacquire`,
+`cryptsetup` — not against images this project writes and reads back:
+
+```bash
+sh tools/mkfixtures.sh tests/fixtures        # ext2/3/4, XFS v4/v5, btrfs, LUKS, MBR/GPT
+sh tools/mkcontainers.sh tests/fixtures      # E01, qcow2, vmdk, vhdx, vhd, vdi
+python3 tools/mklvm.py tests/fixtures/ext4.img tests/fixtures/lvm-ext4.dd
+python tests/test_disk.py                    # and --built for the shipped file
+```
+
+Every container is checked byte-for-byte against the raw image it was made from,
+which is the only way to prove a container reader is right rather than merely
+self-consistent. Every filesystem reader has to return the same planted tree,
+with the same content, modes and symlink targets. Fixtures are not committed;
+anything missing is skipped by name, and a run that tests nothing fails.
+
+The one exception is LVM: `pvcreate` needs root, so `tools/mklvm.py` writes the
+LVM2 metadata from the on-disk format. That fixture covers the linear layout a
+default install produces. Striped and mirrored segments are implemented against
+the format and are not covered by it.
 
 ## Without a collection
 
@@ -241,13 +386,17 @@ python linsight.py --help
 
 [`COMPARISON.md`](COMPARISON.md) places linsight against Dissect, Plaso/Timesketch
 and the rest — including the cases where you should reach for one of those
-instead. Short version: Dissect is the better tool for the copied filesystem and
-for disk images; linsight parses the `live_response/` command output that neither
-Dissect nor Plaso reads, and ranks what it finds.
+instead. Short version: linsight reads the same three inputs an incident
+actually arrives as — a triage collection, a disk, or a handful of loose files —
+and ranks what it finds. Dissect remains the deeper filesystem toolkit and the
+one to reach for on formats linsight refuses; Plaso builds the exhaustive
+supertimeline. Neither parses the `live_response/` command output, which is
+where the volatile half of a UAC collection lives.
 
 ## Caveats
 
-- Linux collections only. Windows/macOS artifacts are not parsed.
+- Linux only. Windows and macOS artifacts are not parsed, and an NTFS or APFS volume on a disk is named in `DISK_LAYOUT` and left unread.
+- On a disk, only what survives a shutdown is there. Process, socket and module tables come out empty; the report says so.
 - Findings are leads, not verdicts. Every one names the artifact it came from; confirm against the evidence before acting on it.
 - A full export of a mid-size collection is hundreds of MB of CSV. Use `--scope` or `--csv-dir` with a narrower need if you do not want all of it.
 

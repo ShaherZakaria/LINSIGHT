@@ -105,13 +105,17 @@ import os
 import re
 import shutil
 import sqlite3
+import stat as statmod
 import struct
 import sys
 import tarfile
 import tempfile
 import time
 import urllib.parse
+import uuid
 import zipfile
+import zlib
+from collections import OrderedDict
 from collections import defaultdict
 from datetime import datetime
 from datetime import timedelta
@@ -2294,6 +2298,4651 @@ def velo_time(value):
         return None
 
 # -------------------------------------------------------------------------
+# disk images: raw, split raw, E01, qcow2, vmdk, vhdx, device
+# -------------------------------------------------------------------------
+
+"""Disk images: whatever the imager wrote, as one addressable run of bytes.
+
+Everything above this module asks the same question - give me `n` bytes at
+offset `o` of the disk - and gets the same answer whether those bytes are
+sitting in a dd file, spread over sixty E01 segments, deflated inside a qcow2
+cluster, or on the physical drive still plugged into the workstation. Which
+container it was is a fact for the report, not a branch in the parser.
+
+The formats here are the ones an image actually arrives in:
+
+  raw / dd     one file, a split set (.001/.002, .aa/.ab, .dd.1), or a device
+  E01 / EWF    EnCase, including multi-segment sets and compressed chunks
+  qcow2        QEMU/KVM and libvirt, v2 and v3, backing files and compression
+  vmdk         VMware, both the sparse binary form and a text descriptor
+                 pointing at flat or split extents
+  vhdx / vhd   Hyper-V, dynamic and fixed
+
+A format that is recognised but cannot be read faithfully raises rather than
+returning something plausible. A disk image that silently reads as zeroes
+past the first gigabyte produces an examination that finds nothing, and
+"found nothing" is the one answer a triage tool must never invent.
+
+Reads go through a chunk cache sized to whatever the container's own unit is -
+a qcow2 cluster, an EWF chunk - so walking a filesystem, which reads the same
+few metadata blocks thousands of times, decompresses each of them once.
+"""
+
+
+
+
+class ImageError(Exception):
+    """The container could not be opened, or cannot be read faithfully."""
+
+
+def _u32le(b, o=0):
+    return struct.unpack_from("<I", b, o)[0]
+
+
+def _u64le(b, o=0):
+    return struct.unpack_from("<Q", b, o)[0]
+
+
+# ---------------------------------------------------------------------------
+# the interface everything above this module sees
+# ---------------------------------------------------------------------------
+
+class Image:
+    """Random access to the bytes of a disk, however they are stored.
+
+    Subclasses implement `_read_raw`, which is handed a chunk-aligned offset
+    and must return exactly that chunk (short only at the end of the disk).
+    `read` does the rest: cache, assembly, and zero-fill past the end.
+
+    `chunk` is set by the subclass to the container's own unit. Matching it
+    means one cache entry is one decompression, never a fraction of one.
+    """
+
+    #: sector size to assume when nothing in the container says otherwise
+    sector_size = 512
+    #: bytes per cache entry
+    chunk = 1 << 16
+    #: how many chunks to keep - 512 x 64 KiB is 32 MiB, which is the working
+    #: set of a filesystem walk with room to spare
+    cache_entries = 512
+
+    def __init__(self, path, size=0, description=""):
+        self.path = path
+        self.size = size
+        self.description = description or self.__class__.__name__
+        self.parts = [path]           # every file the image is made of
+        self._cache = OrderedDict()
+
+    # -- subclass hook ------------------------------------------------------
+    def _read_raw(self, offset, length):
+        raise NotImplementedError
+
+    # -- reading ------------------------------------------------------------
+    def _chunk_at(self, base):
+        try:
+            return self._cache[base]
+        except KeyError:
+            pass
+        data = self._read_raw(base, self.chunk)
+        if len(data) < self.chunk:
+            data = data + b"\x00" * (self.chunk - len(data))
+        self._cache[base] = data
+        if len(self._cache) > self.cache_entries:
+            self._cache.popitem(last=False)
+        return data
+
+    def read(self, offset, length):
+        """`length` bytes at `offset`, zero-filled past the end of the disk."""
+        if length <= 0 or offset < 0:
+            return b""
+        if self.size and offset >= self.size:
+            return b"\x00" * length
+        out = bytearray()
+        end = offset + length
+        pos = offset
+        while pos < end:
+            base = pos - (pos % self.chunk)
+            data = self._chunk_at(base)
+            start = pos - base
+            take = min(self.chunk - start, end - pos)
+            out += data[start:start + take]
+            pos += take
+        return bytes(out)
+
+    def close(self):
+        self._cache.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __repr__(self):
+        return "<%s %s %d bytes>" % (self.__class__.__name__,
+                                     os.path.basename(self.path), self.size)
+
+
+class _FileImage(Image):
+    """Base for the containers that read from files on disk."""
+
+    def __init__(self, path, size=0, description=""):
+        Image.__init__(self, path, size, description)
+        self._fh = None
+
+    def _file(self):
+        if self._fh is None:
+            self._fh = open(self.path, "rb")
+        return self._fh
+
+    def close(self):
+        Image.close(self)
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            finally:
+                self._fh = None
+
+
+# ---------------------------------------------------------------------------
+# raw: one file, a split set, or a live device
+# ---------------------------------------------------------------------------
+
+class RawImage(Image):
+    """A dd image: one file, or a set of segments read as one run of bytes.
+
+    Segments are concatenated in the order given, and the boundary between
+    two of them is invisible to the caller - a read that spans it is one read
+    here and one read to whoever asked. That is the whole point: a filesystem
+    structure does not stop at the point the imager's output hit 2 GB.
+    """
+
+    def __init__(self, paths, description=""):
+        paths = [paths] if isinstance(paths, str) else list(paths)
+        if not paths:
+            raise ImageError("no image file given")
+        self._spans = []              # (start, end, path)
+        total = 0
+        for p in paths:
+            n = os.path.getsize(p)
+            self._spans.append((total, total + n, p))
+            total += n
+        Image.__init__(self, paths[0], total,
+                       description or ("raw image" if len(paths) == 1
+                                       else "raw image, %d segments" % len(paths)))
+        self.parts = paths
+        self._open = {}
+
+    def _handle(self, path):
+        fh = self._open.get(path)
+        if fh is None:
+            fh = self._open[path] = open(path, "rb")
+        return fh
+
+    def _read_raw(self, offset, length):
+        out = bytearray()
+        end = offset + length
+        for start, stop, path in self._spans:
+            if stop <= offset or start >= end:
+                continue
+            fh = self._handle(path)
+            fh.seek(offset + len(out) - start)
+            want = min(stop, end) - (offset + len(out))
+            got = fh.read(want)
+            out += got
+            if len(got) < want:
+                break
+        return bytes(out)
+
+    def close(self):
+        Image.close(self)
+        for fh in self._open.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._open.clear()
+
+
+class DeviceImage(Image):
+    """A block device or physical drive, read directly.
+
+    Reads on a Windows physical drive have to be sector-aligned in both offset
+    and length or the handle returns nothing at all, so every read is widened
+    to the chunk grid and trimmed afterwards - which the chunk cache was doing
+    anyway. `chunk` is therefore a multiple of the sector size by construction.
+    """
+
+    def __init__(self, path):
+        self._fh = open(path, "rb", buffering=0)
+        self.read_errors = 0
+        size = self._device_size(path, self._fh)
+        Image.__init__(self, path, size, "device %s" % path)
+
+    @staticmethod
+    def _device_size(path, fh):
+        try:
+            return os.lseek(fh.fileno(), 0, os.SEEK_END)
+        except OSError:
+            pass
+        if sys.platform == "win32":
+            size = _win_drive_length(path)
+            if size:
+                return size
+        raise ImageError("cannot determine the size of %s - open it as "
+                         "Administrator/root, or image it to a file first" % path)
+
+    def _read_raw(self, offset, length):
+        if self.size:
+            length = min(length, max(0, self.size - offset))
+        if not length:
+            return b""
+        try:
+            os.lseek(self._fh.fileno(), offset, os.SEEK_SET)
+            return os.read(self._fh.fileno(), length)
+        except OSError:
+            # A bad sector is a fact about the disk, not a reason to stop -
+            # the rest of the filesystem is still evidence. The count is kept
+            # so the report can say how much of the disk would not read,
+            # rather than presenting the zeroes as if they were content.
+            self.read_errors += 1
+            return b"\x00" * length
+
+    def close(self):
+        Image.close(self)
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+def _win_drive_length(path):
+    """IOCTL_DISK_GET_LENGTH_INFO, for a \\\\.\\PhysicalDriveN that will not seek."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return 0
+    GENERIC_READ = 0x80000000
+    FILE_SHARE = 0x00000003
+    OPEN_EXISTING = 3
+    IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    handle = k32.CreateFileW(path, GENERIC_READ, FILE_SHARE, None,
+                             OPEN_EXISTING, 0, None)
+    if handle == wintypes.HANDLE(-1).value:
+        return 0
+    try:
+        buf = ctypes.create_string_buffer(8)
+        got = wintypes.DWORD(0)
+        ok = k32.DeviceIoControl(handle, IOCTL_DISK_GET_LENGTH_INFO, None, 0,
+                                 buf, 8, ctypes.byref(got), None)
+        return _u64le(buf.raw) if ok else 0
+    finally:
+        k32.CloseHandle(handle)
+
+
+# ---------------------------------------------------------------------------
+# EWF / E01
+# ---------------------------------------------------------------------------
+
+EWF_SIG = b"EVF\x09\x0d\x0a\xff\x00"
+EWF_L_SIG = b"LVF\x09\x0d\x0a\xff\x00"
+EWF2_SIG = b"EVF2\x0d\x0a\x81\x00"
+
+
+class E01Image(Image):
+    """An EnCase evidence file set.
+
+    A segment is a chain of sections; the ones that matter are `volume`/`disk`,
+    which say how big the disk is and how it is cut into chunks, and the
+    `sectors`/`table` pairs, which say where each chunk landed and whether it
+    was deflated on the way in. Chunks are numbered across the whole set, so
+    the segments are read in order and their tables appended.
+
+    The compressed length of a chunk is not stored anywhere: it is the
+    distance to the next chunk's offset, which is why the table is kept as a
+    list of (offset, compressed) with a sentinel end rather than a dict.
+    """
+
+    def __init__(self, paths):
+        paths = [paths] if isinstance(paths, str) else list(paths)
+        self._segments = []
+        self._offsets = []            # (segment index, file offset, compressed)
+        self._ends = []               # end offset of each chunk in its segment
+        self.sectors_per_chunk = 0
+        self.bytes_per_sector = 512
+        self.chunk_count = 0
+        media_size = 0
+        compressed_chunks = 0
+
+        for idx, path in enumerate(paths):
+            fh = open(path, "rb")
+            self._segments.append(fh)
+            sig = fh.read(8)
+            if sig == EWF2_SIG:
+                raise ImageError(
+                    "%s is Ex01 (EnCase 7 format), which this reader does not "
+                    "parse. Convert it with ewfexport, or image to raw."
+                    % os.path.basename(path))
+            if sig not in (EWF_SIG, EWF_L_SIG):
+                raise ImageError("%s is not an EWF segment"
+                                 % os.path.basename(path))
+            if sig == EWF_L_SIG:
+                raise ImageError(
+                    "%s is a logical evidence file (L01): it holds selected "
+                    "files, not a disk. Point --file at their export instead."
+                    % os.path.basename(path))
+            media_size = self._read_segment(fh, idx, media_size)
+
+        for _seg, _off, comp in self._offsets:
+            compressed_chunks += 1 if comp else 0
+        if not self._offsets:
+            raise ImageError("no chunk table found in the E01 set")
+        self.chunk = self.sectors_per_chunk * self.bytes_per_sector or (1 << 16)
+        Image.__init__(self, paths[0], media_size,
+                       "E01, %d segment(s), %d chunk(s)%s"
+                       % (len(paths), len(self._offsets),
+                          ", %d%% compressed"
+                          % (100 * compressed_chunks // len(self._offsets))
+                          if compressed_chunks else ", uncompressed"))
+        self.parts = paths
+
+    # -- segment parsing ----------------------------------------------------
+    def _read_segment(self, fh, idx, media_size):
+        fh.seek(0, os.SEEK_END)
+        seg_size = fh.tell()
+        offset = 13                   # signature(8) + start-of-fields(1) + segno(2) + pad(2)
+        seen = set()
+        pending_sectors = None        # (start, end) of the last `sectors` section
+        while 0 < offset < seg_size and offset not in seen:
+            seen.add(offset)
+            fh.seek(offset)
+            desc = fh.read(76)
+            if len(desc) < 76:
+                break
+            stype = desc[:16].split(b"\x00", 1)[0].decode("ascii", "replace")
+            nxt = _u64le(desc, 16)
+            size = _u64le(desc, 24)
+            body_at = offset + 76
+            body_len = max(0, int(size) - 76)
+
+            if stype in ("volume", "disk"):
+                fh.seek(body_at)
+                media_size = self._read_volume(fh.read(min(body_len, 1052)),
+                                               media_size)
+            elif stype == "sectors":
+                pending_sectors = (body_at, offset + int(size))
+            elif stype in ("table", "table2"):
+                if stype == "table":
+                    fh.seek(body_at)
+                    self._read_table(fh, idx, body_at, body_len,
+                                     pending_sectors)
+            elif stype in ("next", "done"):
+                break
+            if nxt == offset or nxt == 0:
+                break
+            offset = nxt
+        return media_size
+
+    def _read_volume(self, body, media_size):
+        """How big the disk is, and how it was cut into chunks.
+
+        The SMART and EnCase forms of this section put the counts in the same
+        four places; they differ in what comes after, which nothing here needs.
+        The sector count is the one field whose width changed: EnCase 5 and
+        earlier wrote 4 bytes with 4 of padding behind them, EnCase 6 widened
+        it to 8. Reading 8 covers both - the padding is zero - unless the
+        result is absurd, which is what says the extra bytes are not padding.
+        """
+        chunk_count = _u32le(body, 4)
+        spc = _u32le(body, 8)
+        bps = _u32le(body, 12)
+        sectors = _u64le(body, 16) if len(body) >= 24 else _u32le(body, 16)
+        if sectors > (1 << 48):                # not a disk; the field is 32-bit
+            sectors = _u32le(body, 16)
+        if spc:
+            self.sectors_per_chunk = spc
+        if bps:
+            self.bytes_per_sector = bps
+        if chunk_count:
+            self.chunk_count = chunk_count
+        if sectors:
+            return sectors * (bps or 512)
+        # no sector count: the chunk table still says how much was acquired
+        if chunk_count and spc and bps:
+            return chunk_count * spc * bps
+        return media_size
+
+    def _read_table(self, fh, idx, body_at, body_len, pending_sectors):
+        head = fh.read(24)
+        if len(head) < 24:
+            return
+        count = _u32le(head, 0)
+        base = _u64le(head, 8)
+        if count <= 0 or count > 4 * 1024 * 1024:
+            return
+        raw = fh.read(4 * count)
+        if len(raw) < 4 * count:
+            return
+        entries = struct.unpack("<%dI" % count, raw)
+        # the length of a compressed chunk is the gap to the next one; the last
+        # one runs to the end of the `sectors` section it lives in
+        seg_end = pending_sectors[1] if pending_sectors else body_at + body_len
+        starts = [base + (e & 0x7FFFFFFF) for e in entries]
+        for i, e in enumerate(entries):
+            start = starts[i]
+            end = starts[i + 1] if i + 1 < count else seg_end
+            if end <= start:
+                end = start + self.sectors_per_chunk * self.bytes_per_sector + 4
+            self._offsets.append((idx, start, bool(e & 0x80000000)))
+            self._ends.append(end)
+
+    # -- reading ------------------------------------------------------------
+    def _read_raw(self, offset, length):
+        index = offset // self.chunk
+        if index >= len(self._offsets):
+            return b""
+        seg, start, compressed = self._offsets[index]
+        end = self._ends[index]
+        fh = self._segments[seg]
+        fh.seek(start)
+        raw = fh.read(max(0, end - start))
+        if compressed:
+            try:
+                data = zlib.decompress(raw)
+            except zlib.error:
+                try:
+                    data = zlib.decompressobj().decompress(raw)
+                except zlib.error:
+                    return b"\x00" * self.chunk
+        else:
+            data = raw[:self.chunk]
+        return data[:self.chunk]
+
+    def close(self):
+        Image.close(self)
+        for fh in self._segments:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._segments = []
+
+
+# ---------------------------------------------------------------------------
+# qcow2
+# ---------------------------------------------------------------------------
+
+QCOW_MAGIC = b"QFI\xfb"
+
+# qcow2 v3 incompatible feature bits. A bit not named here changes how clusters
+# are addressed, so an image carrying one is refused rather than read through a
+# mapping that no longer describes it.
+QCOW_INCOMPAT_DIRTY = 0x1
+QCOW_INCOMPAT_CORRUPT = 0x2
+QCOW_INCOMPAT_DATA_FILE = 0x4
+QCOW_INCOMPAT_COMPRESSION = 0x8
+
+
+class QCow2Image(_FileImage):
+    """A QEMU qcow2 image, v2 or v3.
+
+    Two levels of table map a virtual offset onto a cluster in the file, and
+    an unmapped cluster falls through to the backing file - which is opened
+    recursively, because a VM snapshot chain is the normal case and reading
+    only the top layer of one gives a filesystem with holes in it rather than
+    an error.
+    """
+
+    def __init__(self, path, _depth=0):
+        _FileImage.__init__(self, path)
+        fh = self._file()
+        head = fh.read(104)
+        if head[:4] != QCOW_MAGIC:
+            raise ImageError("%s is not a qcow2 image" % os.path.basename(path))
+        (version, backing_off, backing_size, cluster_bits, size,
+         crypt) = struct.unpack_from(">IQIIQI", head, 4)
+        if version not in (2, 3):
+            raise ImageError("qcow version %d is not supported" % version)
+        if crypt:
+            raise ImageError(
+                "%s is an encrypted qcow2 image. Decrypt it with qemu-img "
+                "first - this reader will not guess at the key."
+                % os.path.basename(path))
+        self.version = version
+        self.cluster_bits = cluster_bits
+        self.chunk = 1 << cluster_bits
+        self.l2_bits = cluster_bits - 3
+        self.l1_size, self.l1_offset = struct.unpack_from(">IQ", head, 36)
+        self.size = size
+        self.compression = "zlib"
+        self.dirty = False
+        if version == 3:
+            incompat = struct.unpack_from(">Q", head, 72)[0]
+            header_len = struct.unpack_from(">I", head, 100)[0]
+            # v3 incompatible bits: 1 dirty, 2 corrupt, 4 external data file,
+            # 8 compression type, 16 extended L2 entries
+            if incompat & QCOW_INCOMPAT_COMPRESSION and header_len > 104:
+                fh.seek(104)
+                self.compression = "zstd" if fh.read(1) == b"\x01" else "zlib"
+            if incompat & QCOW_INCOMPAT_DATA_FILE:
+                raise ImageError(
+                    "%s keeps its data in an external file named in the "
+                    "header, which this reader does not follow - "
+                    "'qemu-img convert' it to a plain image first."
+                    % os.path.basename(path))
+            unknown = incompat & ~(QCOW_INCOMPAT_DIRTY | QCOW_INCOMPAT_CORRUPT
+                                   | QCOW_INCOMPAT_DATA_FILE
+                                   | QCOW_INCOMPAT_COMPRESSION)
+            if unknown:
+                raise ImageError(
+                    "%s uses qcow2 incompatible features 0x%x that this reader "
+                    "does not implement - reading it would return plausible "
+                    "wrong bytes, so it is refused."
+                    % (os.path.basename(path), unknown))
+            # dirty and corrupt are facts about the image, not reasons to
+            # refuse it: an image pulled from a host mid-write is exactly the
+            # kind that gets examined, and saying so beats declining to look
+            self.dirty = bool(incompat & (QCOW_INCOMPAT_DIRTY
+                                          | QCOW_INCOMPAT_CORRUPT))
+        # the L1 table is small and read once
+        fh.seek(self.l1_offset)
+        raw = fh.read(8 * self.l1_size)
+        self.l1 = struct.unpack(">%dQ" % (len(raw) // 8), raw) if raw else ()
+        self._l2_cache = OrderedDict()
+
+        self.backing = None
+        if backing_off and backing_size:
+            fh.seek(backing_off)
+            name = fh.read(backing_size).decode("utf-8", "replace")
+            self.backing = self._open_backing(path, name, _depth)
+
+        parts = [path] + (list(self.backing.parts) if self.backing else [])
+        self.parts = parts
+        self.description = ("qcow2 v%d, %d KiB clusters%s%s%s"
+                            % (version, self.chunk // 1024,
+                               ", %s compression" % self.compression
+                               if self.compression != "zlib" else "",
+                               ", backed by %s" % os.path.basename(
+                                   self.backing.path) if self.backing else "",
+                               ", marked dirty" if self.dirty else ""))
+
+    @staticmethod
+    def _open_backing(path, name, depth):
+        if depth > 16:
+            raise ImageError("qcow2 backing chain is more than 16 deep")
+        cand = name if os.path.isabs(name) else \
+            os.path.join(os.path.dirname(os.path.abspath(path)), name)
+        if not os.path.exists(cand):
+            raise ImageError(
+                "%s is backed by %s, which is not beside it. A qcow2 overlay "
+                "without its backing file is a disk with holes in it, so this "
+                "is refused rather than read." % (os.path.basename(path), name))
+        with open(cand, "rb") as bh:
+            magic = bh.read(4)
+        if magic == QCOW_MAGIC:
+            return QCow2Image(cand, depth + 1)
+        return RawImage([cand])
+
+    def _l2_table(self, offset):
+        table = self._l2_cache.get(offset)
+        if table is None:
+            fh = self._file()
+            fh.seek(offset)
+            raw = fh.read(self.chunk)
+            n = len(raw) // 8
+            table = struct.unpack(">%dQ" % n, raw[:n * 8]) if n else ()
+            self._l2_cache[offset] = table
+            if len(self._l2_cache) > 64:
+                self._l2_cache.popitem(last=False)
+        return table
+
+    def _read_raw(self, offset, length):
+        l1_index = offset >> (self.cluster_bits + self.l2_bits)
+        if l1_index >= len(self.l1):
+            return self._from_backing(offset)
+        l1e = self.l1[l1_index] & 0x00FFFFFFFFFFFE00
+        if not l1e:
+            return self._from_backing(offset)
+        l2 = self._l2_table(l1e)
+        l2_index = (offset >> self.cluster_bits) & ((1 << self.l2_bits) - 1)
+        if l2_index >= len(l2):
+            return self._from_backing(offset)
+        entry = l2[l2_index]
+        if entry & (1 << 62):
+            return self._read_compressed(entry)
+        host = entry & 0x00FFFFFFFFFFFE00
+        if not host:
+            return self._from_backing(offset)
+        if entry & 1:                              # all-zeroes cluster
+            return b"\x00" * self.chunk
+        fh = self._file()
+        fh.seek(host)
+        return fh.read(self.chunk)
+
+    def _read_compressed(self, entry):
+        bits = 62 - (self.cluster_bits - 8)
+        host = entry & ((1 << bits) - 1)
+        sectors = ((entry >> bits) & ((1 << (62 - bits)) - 1)) + 1
+        fh = self._file()
+        fh.seek(host)
+        # the run may start mid-sector, so read one sector more than the count
+        raw = fh.read(sectors * 512 + 512)
+        try:
+            if self.compression == "zstd":
+                return _zstd(raw)[:self.chunk]
+            return zlib.decompressobj(-zlib.MAX_WBITS).decompress(raw)[:self.chunk]
+        except Exception:
+            return b"\x00" * self.chunk
+
+    def _from_backing(self, offset):
+        if self.backing is None:
+            return b"\x00" * self.chunk
+        return self.backing.read(offset, self.chunk)
+
+    def close(self):
+        _FileImage.close(self)
+        if self.backing is not None:
+            self.backing.close()
+
+
+def _zstd(raw):
+    try:
+        from compression import zstd                # Python 3.14+
+        return zstd.decompress(raw)
+    except ImportError:
+        pass
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+    except ImportError:
+        raise ImageError("this image uses zstd compression and no zstd "
+                         "decompressor is available (Python 3.14+, or the "
+                         "zstandard package)")
+
+
+# ---------------------------------------------------------------------------
+# vmdk
+# ---------------------------------------------------------------------------
+
+VMDK_SPARSE_MAGIC = b"KDMV"
+
+
+class VmdkImage(Image):
+    """A VMware virtual disk.
+
+    Two things arrive called .vmdk. One is a text descriptor listing extents
+    that live in other files - which is what VMware writes for a flat or a
+    2 GB-split disk, and where the bytes are in those other files. The other
+    is the sparse binary format, with a grain directory and grain tables.
+    Both end up here as one addressable disk, and a descriptor whose extents
+    are themselves sparse nests one inside the other.
+    """
+
+    def __init__(self, path):
+        self._extents = []            # (start, end, Image, offset within it)
+        self._owned = []
+        with open(path, "rb") as fh:
+            head = fh.read(4)
+        if head == VMDK_SPARSE_MAGIC:
+            inner = _VmdkSparse(path)
+            self._owned.append(inner)
+            self._extents.append((0, inner.size, inner, 0))
+            total = inner.size
+            desc = "vmdk sparse, %d KiB grains" % (inner.chunk // 1024)
+        else:
+            total, desc = self._from_descriptor(path)
+        Image.__init__(self, path, total, desc)
+        self.parts = [path] + [p for img in self._owned for p in img.parts]
+        self.chunk = min((img.chunk for _s, _e, img, _o in self._extents),
+                         default=1 << 16)
+
+    def _from_descriptor(self, path):
+        with open(path, "rb") as fh:
+            text = fh.read(1 << 20).decode("utf-8", "replace")
+        if "# Disk DescriptorFile" not in text and "createType" not in text:
+            raise ImageError("%s is neither a sparse vmdk nor a vmdk "
+                             "descriptor" % os.path.basename(path))
+        base = os.path.dirname(os.path.abspath(path))
+        total = 0
+        kinds = set()
+        for line in text.splitlines():
+            m = re.match(r'^\s*(RW|RDONLY|NOACCESS)\s+(\d+)\s+(\w+)\s+"([^"]+)"'
+                         r'(?:\s+(\d+))?', line)
+            if not m:
+                continue
+            sectors, kind, name, skip = (int(m.group(2)), m.group(3).upper(),
+                                         m.group(4), int(m.group(5) or 0))
+            length = sectors * 512
+            kinds.add(kind)
+            if kind in ("ZERO",):
+                self._extents.append((total, total + length, None, 0))
+                total += length
+                continue
+            target = name if os.path.isabs(name) else os.path.join(base, name)
+            if not os.path.exists(target):
+                raise ImageError(
+                    "%s lists the extent %s, which is not beside it - a split "
+                    "vmdk has to be kept together"
+                    % (os.path.basename(path), name))
+            if kind == "SPARSE":
+                img = _VmdkSparse(target)
+                self._owned.append(img)
+                self._extents.append((total, total + img.size, img, 0))
+                total += img.size
+            else:                                  # FLAT / VMFS / VMFSRAW
+                img = RawImage([target])
+                self._owned.append(img)
+                self._extents.append((total, total + length, img, skip * 512))
+                total += length
+        if not self._extents:
+            raise ImageError("%s lists no extents" % os.path.basename(path))
+        return total, ("vmdk descriptor, %d extent(s) (%s)"
+                       % (len(self._extents), "/".join(sorted(kinds)).lower()))
+
+    def _read_raw(self, offset, length):
+        out = bytearray()
+        end = offset + length
+        for start, stop, img, skew in self._extents:
+            if stop <= offset or start >= end:
+                continue
+            here = offset + len(out)
+            want = min(stop, end) - here
+            if img is None:
+                out += b"\x00" * want
+            else:
+                out += img.read(here - start + skew, want)
+        return bytes(out)
+
+    def close(self):
+        Image.close(self)
+        for img in self._owned:
+            img.close()
+
+
+class _VmdkSparse(_FileImage):
+    """One monolithicSparse / twoGbMaxExtentSparse / streamOptimized extent."""
+
+    def __init__(self, path):
+        _FileImage.__init__(self, path)
+        fh = self._file()
+        head = fh.read(80)
+        if head[:4] != VMDK_SPARSE_MAGIC:
+            raise ImageError("%s is not a sparse vmdk extent"
+                             % os.path.basename(path))
+        (version, flags, capacity, grain_size, desc_off, desc_size,
+         gte_per_gt, rgd_off, gd_off, overhead) = struct.unpack_from(
+            "<IIQQQQIQQQ", head, 4)
+        self.size = capacity * 512
+        self.chunk = max(512, grain_size * 512)
+        self.gte_per_gt = gte_per_gt or 512
+        self.compressed = bool(flags & (1 << 16))
+        self._gd = []
+        table_off = gd_off or rgd_off
+        if table_off in (0, 0xFFFFFFFFFFFFFFFF):
+            # streamOptimized keeps the directory at the end, pointed at by the
+            # footer - the last sector before the end-of-stream marker
+            table_off = self._stream_gd(fh)
+        if table_off:
+            entries = (self.size + self.chunk * self.gte_per_gt - 1) // \
+                      (self.chunk * self.gte_per_gt)
+            fh.seek(table_off * 512)
+            raw = fh.read(4 * entries)
+            self._gd = struct.unpack("<%dI" % (len(raw) // 4), raw)
+        self._gt_cache = OrderedDict()
+        self.description = "vmdk sparse v%d" % version
+
+    def _stream_gd(self, fh):
+        fh.seek(0, os.SEEK_END)
+        end = fh.tell()
+        # footer marker: the second-to-last sector holds a copy of the header
+        for back in (1024, 1536, 512):
+            if end < back:
+                continue
+            fh.seek(end - back)
+            blob = fh.read(512)
+            if blob[:4] == VMDK_SPARSE_MAGIC:
+                return struct.unpack_from("<Q", blob, 56)[0]
+        return 0
+
+    def _grain_table(self, sector):
+        table = self._gt_cache.get(sector)
+        if table is None:
+            fh = self._file()
+            fh.seek(sector * 512)
+            raw = fh.read(4 * self.gte_per_gt)
+            table = struct.unpack("<%dI" % (len(raw) // 4), raw)
+            self._gt_cache[sector] = table
+            if len(self._gt_cache) > 64:
+                self._gt_cache.popitem(last=False)
+        return table
+
+    def _read_raw(self, offset, length):
+        grain = offset // self.chunk
+        gd_index = grain // self.gte_per_gt
+        if gd_index >= len(self._gd) or not self._gd[gd_index]:
+            return b"\x00" * self.chunk
+        table = self._grain_table(self._gd[gd_index])
+        gt_index = grain % self.gte_per_gt
+        if gt_index >= len(table) or not table[gt_index]:
+            return b"\x00" * self.chunk
+        fh = self._file()
+        at = table[gt_index] * 512
+        if not self.compressed:
+            fh.seek(at)
+            return fh.read(self.chunk)
+        fh.seek(at)
+        marker = fh.read(12)
+        if len(marker) < 12:
+            return b"\x00" * self.chunk
+        size = _u32le(marker, 8)
+        raw = fh.read(size)
+        try:
+            return zlib.decompress(raw)[:self.chunk]
+        except zlib.error:
+            return b"\x00" * self.chunk
+
+
+# ---------------------------------------------------------------------------
+# vhdx / vhd
+# ---------------------------------------------------------------------------
+
+VHDX_SIG = b"vhdxfile"
+VHD_COOKIE = b"conectix"
+
+_BAT_GUID = b"\x66\x77\xC2\x2D\x23\xF6\x00\x42\x9D\x64\x11\x5E\x9B\xFD\x4A\x08"
+_META_GUID = b"\x06\xA2\x7C\x8B\x90\x47\x9A\x4B\xB8\xFE\x57\x5F\x05\x0F\x88\x6E"
+_M_SIZE = b"\x24\x42\xA5\x2F\x1B\xCD\x76\x48\xB2\x11\x5D\xBE\xD8\x3B\xF4\xB8"
+_M_SECTOR = b"\x1D\xBF\x41\x81\x6F\xA9\x09\x47\xBA\x47\xF2\x33\xA8\xFA\xAB\x5F"
+_M_PARAMS = b"\x37\x67\xA1\xCA\x36\xFA\x43\x4D\xB3\xB6\x33\xF0\xAA\x44\xE7\x6B"
+
+
+class VhdxImage(_FileImage):
+    """A Hyper-V VHDX, dynamic or fixed.
+
+    The block allocation table interleaves payload entries with sector-bitmap
+    entries at a ratio the metadata gives, so the index of a block is not the
+    index of its BAT entry - getting that wrong reads a bitmap as data every
+    few hundred megabytes, which looks like scattered corruption rather than
+    like a bug.
+    """
+
+    def __init__(self, path):
+        _FileImage.__init__(self, path)
+        fh = self._file()
+        if fh.read(8) != VHDX_SIG:
+            raise ImageError("%s is not a VHDX" % os.path.basename(path))
+        regions = self._read_regions(fh)
+        if _BAT_GUID not in regions or _META_GUID not in regions:
+            raise ImageError("%s has no BAT or metadata region"
+                             % os.path.basename(path))
+        meta = self._read_metadata(fh, regions[_META_GUID][0])
+        self.size = meta.get("size", 0)
+        self.sector_size = meta.get("sector", 512)
+        self.chunk = meta.get("block", 2 * 1024 * 1024)
+        if meta.get("has_parent"):
+            raise ImageError(
+                "%s is a differencing VHDX and its parent is not read by this "
+                "reader. Merge it with Convert-VHD or qemu-img first."
+                % os.path.basename(path))
+        self.chunk_ratio = max(1, (1 << 23) * self.sector_size // self.chunk)
+        bat_off, bat_len = regions[_BAT_GUID]
+        fh.seek(bat_off)
+        raw = fh.read(bat_len)
+        self._bat = struct.unpack("<%dQ" % (len(raw) // 8), raw[:len(raw) // 8 * 8])
+        self.description = ("vhdx, %d MiB blocks, %d sector"
+                            % (self.chunk // (1 << 20), self.sector_size))
+
+    @staticmethod
+    def _read_regions(fh):
+        out = {}
+        for at in (0x30000, 0x40000):
+            fh.seek(at)
+            head = fh.read(16)
+            if head[:4] != b"regi":
+                continue
+            count = _u32le(head, 8)
+            raw = fh.read(32 * min(count, 2047))
+            for i in range(len(raw) // 32):
+                guid = raw[i * 32:i * 32 + 16]
+                off = _u64le(raw, i * 32 + 16)
+                length = _u32le(raw, i * 32 + 24)
+                out.setdefault(guid, (off, length))
+            if out:
+                break
+        return out
+
+    @staticmethod
+    def _read_metadata(fh, offset):
+        fh.seek(offset)
+        head = fh.read(32)
+        if head[:8] != b"metadata":
+            return {}
+        count = struct.unpack_from("<H", head, 10)[0]
+        raw = fh.read(32 * min(count, 2047))
+        out = {}
+        for i in range(len(raw) // 32):
+            item = raw[i * 32:i * 32 + 16]
+            at = _u32le(raw, i * 32 + 16)
+            length = _u32le(raw, i * 32 + 20)
+            fh.seek(offset + at)
+            body = fh.read(length)
+            if item == _M_SIZE and len(body) >= 8:
+                out["size"] = _u64le(body)
+            elif item == _M_SECTOR and len(body) >= 4:
+                out["sector"] = _u32le(body)
+            elif item == _M_PARAMS and len(body) >= 8:
+                out["block"] = _u32le(body)
+                out["has_parent"] = bool(_u32le(body, 4) & 0x2)
+        return out
+
+    def _read_raw(self, offset, length):
+        block = offset // self.chunk
+        index = block + block // self.chunk_ratio
+        if index >= len(self._bat):
+            return b"\x00" * self.chunk
+        entry = self._bat[index]
+        state = entry & 0x7
+        if state != 6:                # anything but FULLY_PRESENT reads as zero
+            return b"\x00" * self.chunk
+        at = ((entry >> 20) & ((1 << 44) - 1)) * (1 << 20)
+        fh = self._file()
+        fh.seek(at)
+        return fh.read(self.chunk)
+
+
+class VhdImage(_FileImage):
+    """A pre-VHDX Hyper-V/Virtual PC disk, fixed or dynamic."""
+
+    def __init__(self, path):
+        _FileImage.__init__(self, path)
+        fh = self._file()
+        fh.seek(0, os.SEEK_END)
+        end = fh.tell()
+        fh.seek(max(0, end - 512))
+        footer = fh.read(512)
+        if footer[:8] != VHD_COOKIE:
+            fh.seek(0)
+            footer = fh.read(512)
+            if footer[:8] != VHD_COOKIE:
+                raise ImageError("%s is not a VHD" % os.path.basename(path))
+        self.size = struct.unpack_from(">Q", footer, 48)[0]
+        disk_type = struct.unpack_from(">I", footer, 60)[0]
+        self._bat = ()
+        self.chunk = 1 << 21
+        if disk_type == 2:                          # fixed
+            self.description = "vhd, fixed"
+            self.chunk = 1 << 16
+            self._flat = True
+            return
+        if disk_type == 4:
+            raise ImageError("%s is a differencing VHD; merge it first"
+                             % os.path.basename(path))
+        self._flat = False
+        head_off = struct.unpack_from(">Q", footer, 16)[0]
+        fh.seek(head_off)
+        dyn = fh.read(1024)
+        if dyn[:8] != b"cxsparse":
+            raise ImageError("%s has no dynamic disk header"
+                             % os.path.basename(path))
+        bat_off = struct.unpack_from(">Q", dyn, 16)[0]
+        max_entries = struct.unpack_from(">I", dyn, 28)[0]
+        self.chunk = struct.unpack_from(">I", dyn, 32)[0] or (1 << 21)
+        fh.seek(bat_off)
+        raw = fh.read(4 * max_entries)
+        self._bat = struct.unpack(">%dI" % (len(raw) // 4), raw)
+        # the sector bitmap in front of each block is padded to a sector
+        self._bitmap = ((self.chunk // 512 // 8) + 511) // 512 * 512
+        self.description = "vhd, dynamic, %d KiB blocks" % (self.chunk // 1024)
+
+    def _read_raw(self, offset, length):
+        fh = self._file()
+        if self._flat:
+            fh.seek(offset)
+            return fh.read(self.chunk)
+        index = offset // self.chunk
+        if index >= len(self._bat) or self._bat[index] == 0xFFFFFFFF:
+            return b"\x00" * self.chunk
+        fh.seek(self._bat[index] * 512 + self._bitmap)
+        return fh.read(self.chunk)
+
+
+# ---------------------------------------------------------------------------
+# what is this file, and what else belongs with it
+# ---------------------------------------------------------------------------
+
+# A split raw set, by how the imager numbered it. The pattern has to name the
+# whole set from any one member, because an analyst points at whichever
+# segment they happened to click on.
+SPLIT_PATTERNS = (
+    re.compile(r"^(?P<stem>.+?)\.(?P<n>\d{3})$"),          # image.001
+    re.compile(r"^(?P<stem>.+?\.(?:dd|raw|img|bin))\.(?P<n>\d+)$"),
+    re.compile(r"^(?P<stem>.+?)\.(?P<n>[a-z]{2})$"),        # split -b: .aa .ab
+)
+
+E01_SEG = re.compile(r"^(?P<stem>.+)\.(?P<n>[Ee][0-9A-Za-z]{2})$")
+
+
+def _split_set(path):
+    """Every segment of a split raw set that `path` belongs to, in order."""
+    directory, name = os.path.split(os.path.abspath(path))
+    for rx in SPLIT_PATTERNS:
+        m = rx.match(name)
+        if not m:
+            continue
+        stem, width = m.group("stem"), len(m.group("n"))
+        alpha = m.group("n").isalpha()
+        found = []
+        for other in os.listdir(directory or "."):
+            om = rx.match(other)
+            if om and om.group("stem") == stem and len(om.group("n")) == width \
+                    and om.group("n").isalpha() == alpha:
+                found.append(other)
+        if len(found) > 1:
+            found.sort()
+            return [os.path.join(directory, f) for f in found]
+    return [os.path.abspath(path)]
+
+
+def e01_set(path):
+    """Every segment of an E01 set, in EnCase's own ordering.
+
+    EnCase counts E01..E99 and then rolls over into EAA..ZZZ, so a plain
+    lexical sort puts EAA before E02 and the disk reads as a few gigabytes
+    followed by nonsense. Numeric segments sort before alphabetic ones and
+    each group sorts within itself.
+    """
+    directory, name = os.path.split(os.path.abspath(path))
+    m = E01_SEG.match(name)
+    if not m:
+        return [os.path.abspath(path)]
+    stem = m.group("stem")
+    found = []
+    for other in os.listdir(directory or "."):
+        om = E01_SEG.match(other)
+        if om and om.group("stem") == stem:
+            found.append(other)
+    if not found:
+        return [os.path.abspath(path)]
+
+    def key(fn):
+        tag = E01_SEG.match(fn).group("n")[1:]
+        return (0, int(tag)) if tag.isdigit() else (1, tag.upper())
+
+    found.sort(key=key)
+    return [os.path.join(directory, f) for f in found]
+
+
+#: extensions that say "this is a disk", used when sniffing cannot
+DISK_EXTENSIONS = (".dd", ".raw", ".img", ".bin", ".e01", ".ex01", ".s01",
+                   ".qcow2", ".qcow", ".qed", ".vmdk", ".vhdx", ".vhd",
+                   ".vdi", ".001")
+
+
+def sniff(path):
+    """What kind of container is this? A name, or '' if it is not a disk."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(2048)
+    except OSError:
+        return ""
+    if head[:8] in (EWF_SIG, EWF_L_SIG) or head[:8] == EWF2_SIG:
+        return "e01"
+    if head[:4] == QCOW_MAGIC:
+        return "qcow2"
+    if head[:4] == VMDK_SPARSE_MAGIC:
+        return "vmdk"
+    if head[:8] == VHDX_SIG:
+        return "vhdx"
+    if head[:8] == VHD_COOKIE:
+        return "vhd"
+    if head[:21] == b"# Disk DescriptorFile" or b"createType=" in head[:2048]:
+        return "vmdk"
+    if head[:4] == b"<<< ":                        # VirtualBox VDI
+        return "vdi"
+    # a VHD footer lives at the end, and a fixed VHD has nothing at the front
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(-512, os.SEEK_END)
+            if fh.read(8) == VHD_COOKIE:
+                return "vhd"
+    except OSError:
+        pass
+    return "raw" if _looks_like_a_disk(head) else ""
+
+
+def _looks_like_a_disk(head):
+    """Whether a headerless file starts with something a disk starts with.
+
+    A raw image has no magic of its own, so the question is whether the first
+    sector is a partition table or a filesystem superblock. Anything else is
+    someone's tarball and should be routed to the collection reader instead.
+    """
+    if len(head) < 1082:
+        return False
+    if head[510:512] == b"\x55\xaa":               # MBR / protective MBR
+        return True
+    if head[512:520] == b"EFI PART":               # GPT with a 512 sector
+        return True
+    if head[1024 + 56:1024 + 58] == b"\x53\xef":   # ext superblock magic
+        return True
+    if head[:4] == b"XFSB":
+        return True
+    return False
+
+
+class VdiUnsupported(ImageError):
+    pass
+
+
+def open_image(path, quiet=False):
+    """Open whatever kind of disk container `path` is.
+
+    Split sets and E01 segment sets are gathered here: an analyst points at
+    one file and gets the whole disk, because pointing at `image.003` and
+    quietly examining a third of a disk is the failure this has to prevent.
+    """
+    path = os.path.abspath(path)
+    if _is_device(path):
+        return DeviceImage(path)
+    if not os.path.exists(path):
+        raise ImageError("%s does not exist" % path)
+
+    kind = sniff(path)
+    if kind == "e01":
+        return E01Image(e01_set(path))
+    if kind == "qcow2":
+        return QCow2Image(path)
+    if kind == "vmdk":
+        return VmdkImage(path)
+    if kind == "vhdx":
+        return VhdxImage(path)
+    if kind == "vhd":
+        return VhdImage(path)
+    if kind == "vdi":
+        raise VdiUnsupported(
+            "%s is a VirtualBox VDI, which this reader does not parse. "
+            "'VBoxManage clonemedium disk %s out.raw --format RAW' converts it."
+            % (os.path.basename(path), os.path.basename(path)))
+    segments = _split_set(path)
+    if kind == "raw" or len(segments) > 1 or \
+            os.path.splitext(path)[1].lower() in DISK_EXTENSIONS:
+        return RawImage(segments)
+    raise ImageError("%s does not look like a disk image - no partition table, "
+                     "no filesystem superblock, no container header"
+                     % os.path.basename(path))
+
+
+def _is_device(path):
+    if path.replace("/", "\\").upper().startswith("\\\\.\\"):
+        return True
+    try:
+        import stat
+        mode = os.stat(path).st_mode
+        return stat.S_ISBLK(mode) or stat.S_ISCHR(mode)
+    except (OSError, AttributeError):
+        return False
+
+
+def looks_like_disk(path):
+    """Cheap yes/no, for deciding whether to route an argument here at all."""
+    if _is_device(path):
+        return True
+    if not os.path.isfile(path):
+        return False
+    if os.path.splitext(path)[1].lower() in DISK_EXTENSIONS:
+        return True
+    return bool(sniff(path))
+
+# -------------------------------------------------------------------------
+# volume layer: MBR, GPT, LVM2, LUKS
+# -------------------------------------------------------------------------
+
+"""The volume layer: what a disk is cut into before a filesystem starts.
+
+Between "here are the bytes of a disk" and "here is a filesystem" sits a layer
+that is easy to skip and expensive to skip wrongly. A RHEL, Ubuntu or SUSE
+server install puts the root filesystem inside LVM by default, so a partition
+scan that stops at the partition table finds a physical volume, no filesystem,
+and reports a disk with nothing on it. That is the failure this module exists
+to prevent - it is not a missing feature, it is a wrong answer.
+
+So the scan goes all the way down:
+
+    disk -> MBR or GPT partitions -> LVM2 physical volumes -> logical volumes
+                                  -> LUKS containers (identified, not opened)
+                                  -> filesystems
+
+and every level is reported, including the levels that hold nothing. A LUKS
+partition is named as encrypted rather than passed over in silence, because
+"the evidence is behind a passphrase" and "there was no evidence" have to look
+different in the output.
+
+Each volume that comes out is itself an Image - the same read(offset, length)
+the filesystem readers already take - so a filesystem does not know or care
+whether it sits on a partition, on a logical volume striped over three disks,
+or on the bare device.
+"""
+
+
+
+
+SECTOR = 512
+
+
+def _vol_u16(b, o=0):
+    return struct.unpack_from("<H", b, o)[0]
+
+
+def _vol_u32(b, o=0):
+    return struct.unpack_from("<I", b, o)[0]
+
+
+def _vol_u64(b, o=0):
+    return struct.unpack_from("<Q", b, o)[0]
+
+
+def _guid(raw):
+    """A GPT type GUID as its canonical string (first three fields LE)."""
+    try:
+        return str(uuid.UUID(bytes_le=raw)).upper()
+    except (ValueError, TypeError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# what a volume is
+# ---------------------------------------------------------------------------
+
+class Volume(Image):
+    """A window onto a parent image: one partition, or the whole disk.
+
+    Subclassing Image is the point. A filesystem reader is handed one of these
+    and reads from offset 0 of "its" disk; whether that maps onto a partition
+    1 MiB into a dd file or onto four stripes of a logical volume is settled
+    here and nowhere else.
+    """
+
+    def __init__(self, parent, offset, length, scheme="whole", index=0,
+                 type_name="", label="", path=""):
+        self.parent = parent
+        self.offset = offset
+        self.scheme = scheme
+        self.index = index
+        self.type_name = type_name
+        self.label = label
+        self.fstype = ""
+        self.detail = ""
+        self.chunk = parent.chunk
+        Image.__init__(self, path or parent.path, length,
+                       "%s %s" % (scheme, index) if scheme != "whole" else "disk")
+        self.cache_entries = 8       # the parent already caches; do not double
+
+    def _read_raw(self, offset, length):
+        if self.size:
+            length = min(length, max(0, self.size - offset))
+        if length <= 0:
+            return b""
+        return self.parent.read(self.offset + offset, length)
+
+    @property
+    def name(self):
+        if self.scheme == "lvm":
+            return self.label
+        if self.scheme == "whole":
+            return "disk"
+        return "%s%d" % ("p" if self.scheme == "gpt" else "part", self.index)
+
+    def describe(self):
+        bits = [self.name]
+        if self.label and self.scheme != "lvm":
+            bits.append("'%s'" % self.label)
+        if self.type_name:
+            bits.append(self.type_name)
+        bits.append(self.fstype or "no filesystem recognised")
+        if self.detail:
+            bits.append(self.detail)
+        return " | ".join(bits)
+
+
+# ---------------------------------------------------------------------------
+# partition tables
+# ---------------------------------------------------------------------------
+
+MBR_TYPES = {
+    0x00: "empty", 0x05: "extended", 0x0B: "fat32", 0x0C: "fat32-lba",
+    0x07: "ntfs/exfat", 0x0F: "extended-lba", 0x82: "linux-swap",
+    0x83: "linux", 0x85: "linux-extended", 0x8E: "linux-lvm",
+    0xA5: "freebsd", 0xEE: "gpt-protective", 0xEF: "efi-system",
+    0xFD: "linux-raid",
+}
+
+GPT_TYPES = {
+    "0FC63DAF-8483-4772-8E79-3D69D8477DE4": "linux",
+    "E6D6D379-F507-44C2-A23C-238F2A3DF928": "linux-lvm",
+    "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F": "linux-swap",
+    "CA7D7CCB-63ED-4C53-861C-1742536059CC": "linux-luks",
+    "A19D880F-05FC-4D3B-A006-743F0F84911E": "linux-raid",
+    "44479540-F297-41B2-9AF7-D131D5F0458A": "linux-root-x86",
+    "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709": "linux-root-x86-64",
+    "B921B045-1DF0-41C3-AF44-4C6F280D3FAE": "linux-root-arm64",
+    "933AC7E1-2EB4-4F13-B844-0E14E2AEF915": "linux-home",
+    "3B8F8425-20E0-4F3B-907F-1A25A76F98E8": "linux-srv",
+    "BC13C2FF-59E6-4262-A352-B275FD6F7172": "linux-extended-boot",
+    "C12A7328-F81F-11D2-BA4B-00A0C93EC93B": "efi-system",
+    "21686148-6449-6E6F-744E-656564454649": "bios-boot",
+    "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7": "microsoft-basic-data",
+    "E3C9E316-0B5C-4DB8-817D-F92DF00215AE": "microsoft-reserved",
+    "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC": "windows-recovery",
+}
+
+EXTENDED = (0x05, 0x0F, 0x85, 0xC5)
+
+
+def read_mbr(image, quiet=True):
+    """MBR primary partitions, and the logical partitions in the EBR chain."""
+    sector = image.read(0, SECTOR)
+    if len(sector) < SECTOR or sector[510:512] != b"\x55\xAA":
+        return []
+    out = []
+    extended_at = 0
+    for i in range(4):
+        raw = sector[446 + i * 16:462 + i * 16]
+        ptype = raw[4]
+        start = _vol_u32(raw, 8)
+        count = _vol_u32(raw, 12)
+        if not count or not ptype:
+            continue
+        if ptype == 0xEE:                          # a GPT disk; read_gpt has it
+            return []
+        if ptype in EXTENDED:
+            extended_at = start
+            continue
+        out.append(Volume(image, start * SECTOR, count * SECTOR, "mbr",
+                          len(out) + 1, MBR_TYPES.get(ptype, "type 0x%02x" % ptype)))
+    if extended_at:
+        out.extend(_read_ebr_chain(image, extended_at, len(out)))
+    return out
+
+
+def _read_ebr_chain(image, base, first_index):
+    """The linked list of extended boot records, guarded against a loop."""
+    out = []
+    at = base
+    seen = set()
+    while at and at not in seen and len(out) < 128:
+        seen.add(at)
+        sector = image.read(at * SECTOR, SECTOR)
+        if len(sector) < SECTOR or sector[510:512] != b"\x55\xAA":
+            break
+        nxt = 0
+        for i in range(2):
+            raw = sector[446 + i * 16:462 + i * 16]
+            ptype = raw[4]
+            start = _vol_u32(raw, 8)
+            count = _vol_u32(raw, 12)
+            if not count or not ptype:
+                continue
+            if ptype in EXTENDED:
+                nxt = base + start
+                continue
+            out.append(Volume(image, (at + start) * SECTOR, count * SECTOR,
+                              "mbr", first_index + len(out) + 1,
+                              MBR_TYPES.get(ptype, "type 0x%02x" % ptype)))
+        at = nxt
+    return out
+
+
+def read_gpt(image):
+    """GPT partitions from the primary header, falling back to the backup."""
+    for header_lba in (1,):
+        head = image.read(header_lba * SECTOR, SECTOR)
+        if head[:8] == b"EFI PART":
+            break
+    else:
+        head = b""
+    if head[:8] != b"EFI PART":
+        # the backup header lives in the last sector
+        if image.size >= SECTOR:
+            head = image.read(image.size - SECTOR, SECTOR)
+        if head[:8] != b"EFI PART":
+            return []
+    entry_lba = _vol_u64(head, 72)
+    count = _vol_u32(head, 80)
+    entry_size = _vol_u32(head, 84)
+    if not (0 < count <= 8192) or not (128 <= entry_size <= 4096):
+        return []
+    raw = image.read(entry_lba * SECTOR, count * entry_size)
+    out = []
+    for i in range(count):
+        e = raw[i * entry_size:(i + 1) * entry_size]
+        if len(e) < 128 or e[:16] == b"\x00" * 16:
+            continue
+        first, last = _vol_u64(e, 32), _vol_u64(e, 40)
+        if last < first:
+            continue
+        name = e[56:128].decode("utf-16-le", "replace").split("\x00", 1)[0]
+        guid = _guid(e[:16])
+        out.append(Volume(image, first * SECTOR, (last - first + 1) * SECTOR,
+                          "gpt", i + 1, GPT_TYPES.get(guid, guid.lower()), name))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# LUKS
+# ---------------------------------------------------------------------------
+
+LUKS_MAGIC = b"LUKS\xba\xbe"
+
+
+def luks_detail(vol):
+    """'' if this is not LUKS, else a description of what is locked up in it."""
+    head = vol.read(0, 4096)
+    if head[:6] != LUKS_MAGIC:
+        return ""
+    version = struct.unpack_from(">H", head, 6)[0]
+    if version == 1:
+        cipher = head[8:40].split(b"\x00", 1)[0].decode("ascii", "replace")
+        mode = head[40:72].split(b"\x00", 1)[0].decode("ascii", "replace")
+        digest = head[72:104].split(b"\x00", 1)[0].decode("ascii", "replace")
+        uuid_s = head[168:208].split(b"\x00", 1)[0].decode("ascii", "replace")
+        return "LUKS1 %s-%s, %s, uuid %s" % (cipher, mode, digest, uuid_s)
+    if version == 2:
+        label = head[24:72].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        uuid_s = head[168:208].split(b"\x00", 1)[0].decode("ascii", "replace")
+        return "LUKS2%s, uuid %s" % (" '%s'" % label if label else "", uuid_s)
+    return "LUKS v%d" % version
+
+
+# ---------------------------------------------------------------------------
+# LVM2
+# ---------------------------------------------------------------------------
+
+LVM_LABEL = b"LABELONE"
+LVM_MDA_MAGIC = b" LVM2 x[5A%r0N*>"
+
+
+class LvmPhysicalVolume:
+    """One LVM2 physical volume: its identity, its data area, its metadata."""
+
+    def __init__(self, vol, pv_uuid, data_offset, metadata):
+        self.volume = vol
+        self.uuid = pv_uuid
+        self.data_offset = data_offset
+        self.metadata = metadata
+
+
+def read_lvm_label(vol):
+    """The LVM2 label in the first four sectors, or None.
+
+    A label is looked for in sectors 0-3 rather than at sector 1, because
+    where it lands depends on how the PV was created and a PV whose label sits
+    in sector 0 is common enough that assuming sector 1 loses whole volume
+    groups.
+    """
+    for sector in range(4):
+        head = vol.read(sector * SECTOR, SECTOR)
+        if head[:8] != LVM_LABEL:
+            continue
+        if head[24:32] != b"LVM2 001":
+            continue
+        contents = _vol_u32(head, 20)
+        body = vol.read(sector * SECTOR + contents, SECTOR)
+        pv_uuid = body[:32].decode("ascii", "replace")
+        # disk_locn lists: data areas then metadata areas, each zero-terminated
+        at = 40
+        data_offset = 0
+        while at + 16 <= len(body):
+            off, size = _vol_u64(body, at), _vol_u64(body, at + 8)
+            at += 16
+            if off == 0 and size == 0:
+                break
+            if not data_offset:
+                data_offset = off
+        mdas = []
+        while at + 16 <= len(body):
+            off, size = _vol_u64(body, at), _vol_u64(body, at + 8)
+            at += 16
+            if off == 0 and size == 0:
+                break
+            mdas.append((off, size))
+        text = ""
+        for off, size in mdas:
+            text = _read_mda(vol, off, size)
+            if text:
+                break
+        if not text:
+            return None
+        return LvmPhysicalVolume(vol, pv_uuid, data_offset, text)
+    return None
+
+
+def _read_mda(vol, offset, size):
+    """The current metadata text out of one metadata area."""
+    head = vol.read(offset, 512)
+    if head[4:20] != LVM_MDA_MAGIC:
+        return ""
+    start = _vol_u64(head, 24)
+    at = 40
+    while at + 24 <= len(head):
+        rloc_off, rloc_size = _vol_u64(head, at), _vol_u64(head, at + 8)
+        at += 24
+        if rloc_off == 0 and rloc_size == 0:
+            break
+        if rloc_size == 0 or rloc_size > (16 << 20):
+            continue
+        # the metadata area is a ring buffer: a record can wrap past its end
+        area_size = _vol_u64(head, 32) or size
+        if rloc_off + rloc_size <= area_size:
+            raw = vol.read(start + rloc_off, rloc_size)
+        else:
+            first = area_size - rloc_off
+            raw = (vol.read(start + rloc_off, first)
+                   + vol.read(start + 512, rloc_size - first))
+        text = raw.decode("utf-8", "replace")
+        if "{" in text:
+            return text
+    return ""
+
+
+_LVM_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}=,]|#[^\n]*|[^\s\[\]{}=,]+')
+
+
+def parse_lvm_metadata(text):
+    """LVM's own config format -> nested dicts.
+
+    It is not JSON and not YAML: bare keys, '=' for scalars, braces for
+    sections, brackets for lists, '#' comments. Small enough to tokenise here
+    rather than reach for anything.
+    """
+    tokens = [t for t in _LVM_TOKEN.findall(text) if not t.startswith("#")]
+    pos = [0]
+
+    def value():
+        tok = tokens[pos[0]]
+        if tok == "[":
+            pos[0] += 1
+            items = []
+            while pos[0] < len(tokens) and tokens[pos[0]] != "]":
+                if tokens[pos[0]] == ",":
+                    pos[0] += 1
+                    continue
+                items.append(value())
+            pos[0] += 1
+            return items
+        pos[0] += 1
+        if tok.startswith('"'):
+            return tok[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        try:
+            return int(tok)
+        except ValueError:
+            return tok
+
+    def section():
+        out = {}
+        while pos[0] < len(tokens):
+            tok = tokens[pos[0]]
+            if tok == "}":
+                pos[0] += 1
+                return out
+            pos[0] += 1
+            if pos[0] >= len(tokens):
+                break
+            nxt = tokens[pos[0]]
+            if nxt == "{":
+                pos[0] += 1
+                out[tok.strip('"')] = section()
+            elif nxt == "=":
+                pos[0] += 1
+                out[tok.strip('"')] = value()
+        return out
+
+    return section()
+
+
+class LvmVolume(Image):
+    """A logical volume, assembled from the extents its segments name.
+
+    Linear and striped segments are mapped properly. A mirror or a RAID
+    segment is read from its first leg, which is the correct copy of the data
+    for every layout LVM offers - and is recorded in `detail` so the report
+    says which leg was read rather than implying there was only one.
+    """
+
+    def __init__(self, vg_name, lv_name, extent_size, segments, pvs):
+        self.vg_name = vg_name
+        self.lv_name = lv_name
+        self.scheme = "lvm"
+        self.index = 0
+        self.label = "%s/%s" % (vg_name, lv_name)
+        self.type_name = "lvm-lv"
+        self.fstype = ""
+        self.detail = ""
+        self._map = []                 # (lv_start, lv_end, pv, pv_offset)
+        self.extent_size = extent_size
+        total = 0
+        stripe_note = ""
+        for seg in segments:
+            count = seg.get("extent_count", 0)
+            length = count * extent_size
+            stripes = seg.get("stripes") or []
+            kind = seg.get("type", "striped")
+            pairs = [(stripes[i], stripes[i + 1])
+                     for i in range(0, len(stripes) - 1, 2)]
+            if kind in ("mirror", "raid1") or seg.get("mirror_count"):
+                pairs = pairs[:1]
+                stripe_note = "mirrored, first leg read"
+            if len(pairs) <= 1:
+                if pairs:
+                    pv_name, pv_extent = pairs[0]
+                    pv = pvs.get(pv_name)
+                    if pv is not None:
+                        self._map.append((total, total + length, pv,
+                                          pv_extent * extent_size))
+                total += length
+                continue
+            # striped: round-robin in stripe_size chunks across the legs
+            stripe_size = seg.get("stripe_size", 128) * SECTOR
+            self._map.append(("stripe", total, total + length, pairs, pvs,
+                              stripe_size, extent_size))
+            stripe_note = "striped over %d" % len(pairs)
+            total += length
+        self.detail = stripe_note
+        Image.__init__(self, self.label, total, "lvm logical volume")
+        self.chunk = 1 << 16
+        self.cache_entries = 8
+        # a logical volume has no offset on any one disk - it is a map, not a
+        # window - and the report says so rather than printing a misleading 0
+        self.offset = ""
+
+    @property
+    def name(self):
+        return self.label
+
+    def describe(self):
+        bits = [self.label, "lvm-lv", self.fstype or "no filesystem recognised"]
+        if self.detail:
+            bits.append(self.detail)
+        return " | ".join(bits)
+
+    def _pv_read(self, pv, offset, length):
+        return pv.volume.read(pv.data_offset + offset, length)
+
+    def _read_raw(self, offset, length):
+        if self.size:
+            length = min(length, max(0, self.size - offset))
+        if length <= 0:
+            return b""
+        out = bytearray()
+        end = offset + length
+        for entry in self._map:
+            if entry[0] == "stripe":
+                _tag, start, stop, pairs, pvs, stripe_size, ext = entry
+                if stop <= offset or start >= end:
+                    continue
+                here = offset + len(out)
+                want = min(stop, end) - here
+                out += self._read_striped(here - start, want, pairs, pvs,
+                                          stripe_size, ext)
+                continue
+            start, stop, pv, pv_off = entry
+            if stop <= offset or start >= end:
+                continue
+            here = offset + len(out)
+            want = min(stop, end) - here
+            out += self._pv_read(pv, pv_off + (here - start), want)
+        if len(out) < length:
+            out += b"\x00" * (length - len(out))
+        return bytes(out)
+
+    def _read_striped(self, rel, length, pairs, pvs, stripe_size, ext):
+        out = bytearray()
+        legs = len(pairs)
+        pos = rel
+        while len(out) < length:
+            index = pos // stripe_size
+            leg = index % legs
+            round_ = index // legs
+            within = pos % stripe_size
+            take = min(stripe_size - within, length - len(out))
+            pv_name, pv_extent = pairs[leg]
+            pv = pvs.get(pv_name)
+            if pv is None:
+                out += b"\x00" * take
+            else:
+                at = pv_extent * ext + round_ * stripe_size + within
+                out += self._pv_read(pv, at, take)
+            pos += take
+        return bytes(out)
+
+
+def build_lvm_volumes(pvs_found):
+    """Every logical volume the physical volumes on this disk describe.
+
+    A volume group can span disks. When only some of its physical volumes are
+    here, the logical volumes that live entirely on the ones present are still
+    readable, and the rest are reported as incomplete rather than half-read -
+    an LV missing an extent is a filesystem with a hole in it, and a hole in a
+    filesystem is a parse that fails in a way that looks like absence.
+    """
+    volumes = []
+    incomplete = []
+    groups = {}                     # vg name -> (metadata, {pv name: PV})
+    for pv in pvs_found:
+        try:
+            meta = parse_lvm_metadata(pv.metadata)
+        except Exception:
+            continue
+        for vg_name, vg in meta.items():
+            if not isinstance(vg, dict) or "logical_volumes" not in vg:
+                continue
+            entry = groups.setdefault(vg_name, [vg, {}])
+            for pv_name, pv_meta in (vg.get("physical_volumes") or {}).items():
+                if not isinstance(pv_meta, dict):
+                    continue
+                if pv_meta.get("id", "").replace("-", "") == pv.uuid.replace("-", ""):
+                    pv.data_offset = pv_meta.get("pe_start", 2048) * SECTOR
+                    entry[1][pv_name] = pv
+
+    for vg_name, (vg, pvs) in groups.items():
+        extent_size = vg.get("extent_size", 8192) * SECTOR
+        for lv_name, lv in (vg.get("logical_volumes") or {}).items():
+            if not isinstance(lv, dict):
+                continue
+            segments = [lv[k] for k in sorted(lv, key=_segment_key)
+                        if k.startswith("segment") and isinstance(lv[k], dict)]
+            if not segments:
+                continue
+            needed = set()
+            for seg in segments:
+                stripes = seg.get("stripes") or []
+                needed.update(stripes[i] for i in range(0, len(stripes) - 1, 2))
+            missing = sorted(n for n in needed if n not in pvs)
+            if missing:
+                incomplete.append("%s/%s needs %s, which %s not on this disk"
+                                  % (vg_name, lv_name, ", ".join(missing),
+                                     "are" if len(missing) > 1 else "is"))
+                continue
+            volumes.append(LvmVolume(vg_name, lv_name, extent_size, segments, pvs))
+    return volumes, incomplete
+
+
+def _segment_key(name):
+    m = re.match(r"segment(\d+)$", name)
+    return (0, int(m.group(1))) if m else (1, name)
+
+
+# ---------------------------------------------------------------------------
+# filesystem identification
+# ---------------------------------------------------------------------------
+
+def identify_fs(vol):
+    """Name the filesystem on a volume from its superblock magic alone.
+
+    Identification is separate from reading on purpose: a filesystem this tool
+    cannot walk still has to appear in the report by name, so that an NTFS
+    volume on a dual-boot host reads as "not parsed" instead of vanishing.
+    """
+    head = vol.read(0, 65536 + 4096)
+    if len(head) >= 1080 and head[1080:1082] == b"\x53\xef":
+        return _ext_flavour(head)
+    if head[:4] == b"XFSB":
+        return "xfs"
+    if len(head) >= 0x10000 + 0x48 and head[0x10000 + 0x40:0x10000 + 0x48] == b"_BHRfS_M":
+        return "btrfs"
+    if head[:6] == LUKS_MAGIC:
+        return "luks"
+    if head[:8] == LVM_LABEL or head[SECTOR:SECTOR + 8] == LVM_LABEL:
+        return "lvm2-pv"
+    if len(head) >= 4096 and head[4086:4096] == b"SWAPSPACE2":
+        return "swap"
+    if head[3:11] == b"NTFS    ":
+        return "ntfs"
+    if head[54:59] == b"FAT12" or head[54:59] == b"FAT16" or head[82:87] == b"FAT32":
+        return "fat"
+    if head[:4] == b"\x28\xb5\x2f\xfd":
+        return ""
+    if len(head) >= 0x2000 and head[0x400:0x404] == b"F2FS":
+        return "f2fs"
+    if head[:2] == b"\x18\xf9" or head[:4] == b"hsqs" or head[:4] == b"sqsh":
+        return "squashfs"
+    if len(head) >= 0x10000 and head[0x8000:0x8006] == b"\x01CD001":
+        return "iso9660"
+    return ""
+
+
+def _ext_flavour(head):
+    """ext2, ext3 or ext4, from the feature flags rather than the name."""
+    incompat = _vol_u32(head, 1024 + 96)
+    compat = _vol_u32(head, 1024 + 92)
+    if incompat & 0x40 or incompat & 0x80:          # extents, 64bit
+        return "ext4"
+    if compat & 0x4 or incompat & 0x4:              # has_journal
+        return "ext3"
+    return "ext2"
+
+
+# ---------------------------------------------------------------------------
+# the scan
+# ---------------------------------------------------------------------------
+
+def scan(image):
+    """Every volume on this disk, including the ones inside other volumes.
+
+    Returns (volumes, notes). `notes` carries what the scan could see but not
+    open - an encrypted partition, a volume group missing a disk - so that
+    nothing found is ever indistinguishable from nothing there.
+    """
+    notes = []
+    partitions = read_gpt(image) or read_mbr(image)
+    scheme = "gpt" if partitions and partitions[0].scheme == "gpt" else \
+             ("mbr" if partitions else "none")
+    if not partitions:
+        whole = Volume(image, 0, image.size, "whole", 0, "whole disk")
+        partitions = [whole]
+
+    out = []
+    pvs = []
+    for vol in partitions:
+        vol.fstype = identify_fs(vol)
+        if vol.fstype == "luks":
+            vol.detail = luks_detail(vol)
+            notes.append("%s is encrypted (%s) - decrypt with cryptsetup and "
+                         "point linsight at the mapped device"
+                         % (vol.name, vol.detail or "LUKS"))
+            out.append(vol)
+            continue
+        if vol.fstype == "lvm2-pv":
+            pv = read_lvm_label(vol)
+            if pv is None:
+                notes.append("%s carries an LVM2 label whose metadata could "
+                             "not be read" % vol.name)
+            else:
+                pvs.append(pv)
+            out.append(vol)
+            continue
+        out.append(vol)
+
+    if pvs:
+        lvs, incomplete = build_lvm_volumes(pvs)
+        notes.extend(incomplete)
+        for lv in lvs:
+            lv.fstype = identify_fs(lv)
+            if lv.fstype == "luks":
+                lv.detail = ((lv.detail + "; ") if lv.detail else "") + \
+                            (luks_detail(lv) or "LUKS")
+                notes.append("%s is encrypted (%s)" % (lv.label, lv.detail))
+        out.extend(lvs)
+        if not lvs and not incomplete:
+            notes.append("an LVM2 physical volume was found but it describes "
+                         "no logical volumes")
+    return out, notes, scheme
+
+
+#: filesystems this tool can walk, best first when choosing a root
+READABLE_FS = ("ext4", "ext3", "ext2", "xfs", "btrfs")
+
+# -------------------------------------------------------------------------
+# what every filesystem reader has to answer
+# -------------------------------------------------------------------------
+
+"""What every filesystem reader has to answer, and nothing more.
+
+Three readers live above this - ext, XFS, btrfs - and the layer above them
+must not be able to tell which one it is talking to. That is not tidiness: the
+whole value of reading a disk is that /etc/passwd is /etc/passwd whichever
+filesystem the installer happened to pick, and every analyzer, every table and
+every Sigma rule in this tool already works on paths.
+
+So a reader answers exactly two questions. What is in this tree - `walk`,
+which yields a FsNode per name. And what is in this file - `read`, or `open`
+for the ones too big to hold. Everything else a filesystem knows is metadata
+hung on the node, where an empty field means "this filesystem does not record
+that" rather than "this file does not have it".
+"""
+
+
+
+
+#: The file-type field of a mode word, and the one-character kind each value
+#: means. Every reader needs these and they are the same on every filesystem,
+#: so they live here rather than being restated three times.
+S_IFMT = 0o170000
+KIND_BY_MODE = {0o100000: "f", 0o040000: "d", 0o120000: "l", 0o060000: "b",
+                0o020000: "c", 0o010000: "p", 0o140000: "s"}
+
+
+def utc(seconds, nanos=0):
+    """A filesystem timestamp as an aware datetime, or None.
+
+    0 is not a time. Every filesystem here writes 0 into a field it never
+    filled in, and 1970-01-01 in a timeline is a lie that sorts to the top.
+    """
+    if not seconds:
+        return None
+    try:
+        return datetime.fromtimestamp(seconds + (nanos / 1e9 if nanos else 0),
+                                      timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+class FsNode(object):
+    """One name in a filesystem, with whatever that filesystem knows about it.
+
+    `path` is absolute within the filesystem and always uses '/', on any host.
+    `kind` is one character - f d l b c p s - so that the caller can filter
+    without importing a stat module or knowing the reader's own constants.
+    """
+
+    __slots__ = ("path", "name", "inode", "kind", "size", "mode", "uid", "gid",
+                 "nlink", "atime", "mtime", "ctime", "crtime", "dtime",
+                 "target", "deleted", "fs", "_ref", "_map_cache")
+
+    def __init__(self, path="", inode=0, kind="f", size=0, mode=0, uid=0,
+                 gid=0, nlink=0, atime=None, mtime=None, ctime=None,
+                 crtime=None, dtime=None, target="", deleted=False, fs=None,
+                 ref=None):
+        self.path = path
+        self.name = path.rsplit("/", 1)[-1]
+        self.inode = inode
+        self.kind = kind
+        self.size = size
+        self.mode = mode
+        self.uid = uid
+        self.gid = gid
+        self.nlink = nlink
+        self.atime = atime
+        self.mtime = mtime
+        self.ctime = ctime
+        self.crtime = crtime
+        self.dtime = dtime
+        self.target = target
+        self.deleted = deleted
+        self.fs = fs
+        self._ref = ref            # whatever the reader needs to find the data
+        self._map_cache = None     # the reader's block map, once computed
+
+    @property
+    def is_file(self):
+        return self.kind == "f"
+
+    @property
+    def is_dir(self):
+        return self.kind == "d"
+
+    @property
+    def is_link(self):
+        return self.kind == "l"
+
+    def mode_string(self):
+        """'-rwxr-xr-x', the way a bodyfile wants it."""
+        if not self.mode:
+            return ""
+        try:
+            return statmod.filemode(self.mode)
+        except (ValueError, TypeError):
+            return ""
+
+    def read(self, limit=None):
+        return self.fs.read(self, limit) if self.fs else b""
+
+    def open(self):
+        return self.fs.open(self) if self.fs else io.BytesIO(b"")
+
+    def __repr__(self):
+        return "<FsNode %s %s %d>" % (self.kind, self.path, self.size)
+
+
+class Filesystem(object):
+    """The interface the disk backend is written against."""
+
+    #: 'ext4', 'xfs', 'btrfs' - what goes in the report
+    kind = ""
+
+    def __init__(self, volume):
+        self.volume = volume
+        self.label = ""
+        self.uuid = ""
+        self.block_size = 0
+        self.size = 0
+        self.created = None
+        self.last_mount = None
+        self.last_write = None
+        self.notes = []            # anything the examiner should know
+        self.errors = 0            # structures that would not parse
+
+    # -- what is in the tree ------------------------------------------------
+    def walk(self, max_nodes=0, on_error=None):
+        """Yield a FsNode for every name in the filesystem, depth first."""
+        raise NotImplementedError
+
+    def root_node(self):
+        """The FsNode for '/', without walking anything."""
+        raise NotImplementedError
+
+    def dir_entries(self, node):
+        """[(name, ref, kind hint)] for a directory node.
+
+        `ref` is whatever this reader needs to turn a name back into a node -
+        an inode number, a key in a tree - and is only ever handed back to
+        `node_at`. Nothing above the reader looks inside it.
+        """
+        raise NotImplementedError
+
+    def node_at(self, ref, path, hint=""):
+        """The FsNode a `dir_entries` ref points at."""
+        raise NotImplementedError
+
+    def deleted(self, max_nodes=0):
+        """Yield a FsNode per recoverable deleted entry. May yield nothing."""
+        return iter(())
+
+    # -- what is in a file --------------------------------------------------
+    def read(self, node, limit=None):
+        raise NotImplementedError
+
+    def open(self, node):
+        """A read-only binary file object over `node`.
+
+        The default holds the whole file in memory, which is right for the
+        overwhelming majority of artifacts and wrong for a 40 GB log. A reader
+        that can seek its own extents overrides this with something that does.
+        """
+        return io.BytesIO(self.read(node))
+
+    def describe(self):
+        bits = [self.kind]
+        if self.label:
+            bits.append("'%s'" % self.label)
+        if self.block_size:
+            bits.append("%d-byte blocks" % self.block_size)
+        if self.uuid:
+            bits.append(self.uuid)
+        return ", ".join(bits)
+
+
+class ExtentFile(io.RawIOBase):
+    """A seekable stream over a file whose reader can map ranges lazily.
+
+    `fetch(offset, length)` is the reader's own random access into the file's
+    content. Everything a text wrapper does on top of this - readline over a
+    600 MB journal - then costs one mapped read per buffer instead of one
+    materialised copy of the whole file.
+    """
+
+    def __init__(self, fetch, size):
+        io.RawIOBase.__init__(self)
+        self._fetch = fetch
+        self._size = size
+        self._pos = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            self._pos = offset
+        elif whence == io.SEEK_CUR:
+            self._pos += offset
+        else:
+            self._pos = self._size + offset
+        self._pos = max(0, self._pos)
+        return self._pos
+
+    def tell(self):
+        return self._pos
+
+    def readinto(self, buf):
+        want = min(len(buf), max(0, self._size - self._pos))
+        if not want:
+            return 0
+        data = self._fetch(self._pos, want)
+        n = len(data)
+        buf[:n] = data
+        self._pos += n
+        return n
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = max(0, self._size - self._pos)
+        data = self._fetch(self._pos, size)
+        self._pos += len(data)
+        return data
+
+    def readall(self):
+        return self.read(-1)
+
+# -------------------------------------------------------------------------
+# the ext2 / ext3 / ext4 reader
+# -------------------------------------------------------------------------
+
+"""The ext2 / ext3 / ext4 reader.
+
+Debian and Ubuntu put root on ext4, so this is the filesystem most Linux
+images arrive as, and it repays being read rather than mounted. Three things
+come out of here that a mount does not give you:
+
+  crtime      ext4 records file creation and the kernel does not expose it. A
+              binary whose crtime is inside the incident window and whose
+              mtime reads 2019 is a timestomp - stated, not suspected.
+  deleted     an inode with a deletion time and no links still carries its
+              size, its owner and, until the blocks are reused, its content.
+  no mount    reading the structures directly needs no loop device, no root,
+              and no kernel that trusts the image - which matters, because
+              mounting evidence is how evidence gets modified.
+
+Both block-mapping schemes are implemented: the extent tree ext4 uses, and the
+indirect-block chain ext2 and ext3 use. A reader that implements only extents
+returns nothing at all for every file on an older image, and returns it
+silently, which is exactly the failure this tool exists to not have.
+"""
+
+
+
+
+EXT_MAGIC = 0xEF53
+EXT_SB_OFFSET = 1024
+ROOT_INO = 2
+
+INCOMPAT_FILETYPE = 0x0002
+INCOMPAT_META_BG = 0x0010
+INCOMPAT_EXTENTS = 0x0040
+INCOMPAT_64BIT = 0x0080
+INCOMPAT_INLINE_DATA = 0x8000
+INCOMPAT_ENCRYPT = 0x10000
+INCOMPAT_CASEFOLD = 0x20000
+
+COMPAT_HAS_JOURNAL = 0x0004
+RO_COMPAT_METADATA_CSUM = 0x0400
+RO_COMPAT_BIGALLOC = 0x0200
+
+FL_EXTENTS = 0x00080000
+FL_INLINE_DATA = 0x10000000
+FL_ENCRYPTED = 0x00000800
+
+KIND_BY_FILETYPE = {1: "f", 2: "d", 3: "c", 4: "b", 5: "p", 6: "s", 7: "l"}
+
+EXTENT_MAGIC = 0xF30A
+
+#: Directories never walked into. /proc and /sys are kernel interfaces that
+#: exist as empty mountpoints on a dead disk; a full recursion into a
+#: container's overlay store, on the other hand, is real content - so only the
+#: ones that are empty on disk by definition are skipped, and nothing is
+#: skipped for being merely large.
+SKIP_DIRS = ()
+
+
+class ExtError(Exception):
+    pass
+
+
+class ExtFilesystem(Filesystem):
+    """An ext2/3/4 filesystem on a volume."""
+
+    def __init__(self, volume):
+        Filesystem.__init__(self, volume)
+        sb = volume.read(EXT_SB_OFFSET, 1024)
+        if len(sb) < 1024 or struct.unpack_from("<H", sb, 0x38)[0] != EXT_MAGIC:
+            raise ExtError("no ext superblock")
+        self._sb = sb
+
+        self.inodes_count = _ext_u32(sb, 0x00)
+        blocks_lo = _ext_u32(sb, 0x04)
+        self.log_block_size = _ext_u32(sb, 0x18)
+        self.block_size = 1024 << self.log_block_size
+        self.first_data_block = _ext_u32(sb, 0x14)
+        self.blocks_per_group = _ext_u32(sb, 0x20)
+        self.inodes_per_group = _ext_u32(sb, 0x28)
+        self.rev_level = _ext_u32(sb, 0x4C)
+        self.inode_size = _ext_u16(sb, 0x58) if self.rev_level else 128
+        self.compat = _ext_u32(sb, 0x5C)
+        self.incompat = _ext_u32(sb, 0x60)
+        self.ro_compat = _ext_u32(sb, 0x64)
+        self.uuid = _ext_uuid(sb[0x68:0x78])
+        self.label = sb[0x78:0x88].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        self.last_mounted = sb[0x88:0xC8].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        self.desc_size = _ext_u16(sb, 0xFE) if self.incompat & INCOMPAT_64BIT else 32
+        if self.desc_size < 32:
+            self.desc_size = 32
+        blocks_hi = _ext_u32(sb, 0x150) if self.incompat & INCOMPAT_64BIT else 0
+        self.blocks_count = blocks_lo | (blocks_hi << 32)
+        self.size = self.blocks_count * self.block_size
+        self.first_ino = _ext_u32(sb, 0x54) if self.rev_level else 11
+
+        self.last_mount = utc(_ext_u32(sb, 0x2C))
+        self.last_write = utc(_ext_u32(sb, 0x30))
+        self.last_check = utc(_ext_u32(sb, 0x40))
+        self.created = utc(_ext_u32(sb, 0x108))
+        self.mount_count = _ext_u16(sb, 0x34)
+        self.state = _ext_u16(sb, 0x3A)
+
+        if self.incompat & INCOMPAT_EXTENTS or self.incompat & INCOMPAT_64BIT:
+            self.kind = "ext4"
+        elif self.compat & COMPAT_HAS_JOURNAL:
+            self.kind = "ext3"
+        else:
+            self.kind = "ext2"
+
+        if self.state & 0x1 == 0:
+            self.notes.append(
+                "the filesystem was not cleanly unmounted - the journal holds "
+                "changes not yet in the tree, so metadata may lag the last "
+                "writes made to this host")
+        if self.incompat & INCOMPAT_ENCRYPT:
+            self.notes.append(
+                "some directories on this filesystem use ext4 encryption; "
+                "their names and contents cannot be recovered without the key")
+        unknown = self.incompat & ~(
+            INCOMPAT_FILETYPE | INCOMPAT_META_BG | INCOMPAT_EXTENTS |
+            INCOMPAT_64BIT | INCOMPAT_INLINE_DATA | INCOMPAT_ENCRYPT |
+            INCOMPAT_CASEFOLD | 0x1 | 0x8 | 0x100 | 0x200 | 0x400 | 0x1000 |
+            0x2000 | 0x4000)
+        if unknown:
+            self.notes.append("unrecognised ext incompat features 0x%x - some "
+                              "structures may not be read" % unknown)
+        if self.ro_compat & RO_COMPAT_BIGALLOC:
+            self.notes.append("bigalloc is enabled; block addressing is by "
+                              "cluster and file content may read short")
+
+        self.group_count = max(1, (self.blocks_count - self.first_data_block +
+                                   self.blocks_per_group - 1) //
+                               self.blocks_per_group)
+        self._groups = self._read_group_descriptors()
+        self._block_cache = {}
+        self._inode_cache = {}
+
+    # -- primitives ---------------------------------------------------------
+    def block(self, number, count=1):
+        if number <= 0:
+            return b"\x00" * (self.block_size * count)
+        return self.volume.read(number * self.block_size,
+                                self.block_size * count)
+
+    def _read_group_descriptors(self):
+        gd_block = self.first_data_block + 1
+        raw = self.block(gd_block,
+                         max(1, (self.group_count * self.desc_size +
+                                 self.block_size - 1) // self.block_size))
+        groups = []
+        for i in range(self.group_count):
+            at = i * self.desc_size
+            if at + 32 > len(raw):
+                break
+            table_lo = _ext_u32(raw, at + 0x08)
+            table_hi = _ext_u32(raw, at + 0x28) if self.desc_size >= 64 else 0
+            flags = _ext_u16(raw, at + 0x12)
+            groups.append((table_lo | (table_hi << 32), flags))
+        return groups
+
+    # -- inodes -------------------------------------------------------------
+    def inode(self, number):
+        """Raw inode bytes for inode `number` (1-based), or b''."""
+        if number < 1 or number > self.inodes_count:
+            return b""
+        cached = self._inode_cache.get(number)
+        if cached is not None:
+            return cached
+        group = (number - 1) // self.inodes_per_group
+        index = (number - 1) % self.inodes_per_group
+        if group >= len(self._groups):
+            return b""
+        table = self._groups[group][0]
+        if not table:
+            return b""
+        at = table * self.block_size + index * self.inode_size
+        raw = self.volume.read(at, self.inode_size)
+        if len(self._inode_cache) < 65536:
+            self._inode_cache[number] = raw
+        return raw
+
+    def node_from_inode(self, number, path="", kind_hint=""):
+        raw = self.inode(number)
+        if len(raw) < 128:
+            return None
+        mode = _ext_u16(raw, 0x00)
+        kind = KIND_BY_MODE.get(mode & S_IFMT, kind_hint or "f")
+        size = _ext_u32(raw, 0x04)
+        if kind == "f":
+            size |= _ext_u32(raw, 0x6C) << 32
+        uid = _ext_u16(raw, 0x02) | (_ext_u16(raw, 0x78) << 16)
+        gid = _ext_u16(raw, 0x18) | (_ext_u16(raw, 0x7A) << 16)
+        nlink = _ext_u16(raw, 0x1A)
+        extra = _ext_u16(raw, 0x80) if len(raw) >= 0x82 else 0
+        node = FsNode(
+            path=path, inode=number, kind=kind, size=size, mode=mode,
+            uid=uid, gid=gid, nlink=nlink,
+            atime=self._time(raw, 0x08, 0x8C, extra),
+            ctime=self._time(raw, 0x0C, 0x84, extra),
+            mtime=self._time(raw, 0x10, 0x88, extra),
+            crtime=self._time(raw, 0x90, 0x94, extra, need=0x1C),
+            dtime=utc(_ext_u32(raw, 0x14)),
+            fs=self, ref=raw)
+        if kind == "l":
+            node.target = self._symlink_target(node, raw)
+        return node
+
+    def _time(self, raw, base, extra_at, extra_isize, need=0x18):
+        """A timestamp, with the ext4 extra-precision bits when they exist.
+
+        The extra field is only present when i_extra_isize says the inode is
+        big enough to hold it. Reading it unconditionally on a 128-byte inode
+        reads the next inode's mode as a nanosecond count, which produces
+        timestamps decades out and a timeline that cannot be trusted.
+        """
+        seconds = _ext_u32(raw, base)
+        if not seconds:
+            return None
+        nanos = 0
+        if extra_isize >= need and len(raw) >= extra_at + 4:
+            extra = _ext_u32(raw, extra_at)
+            seconds |= (extra & 0x3) << 32
+            nanos = extra >> 2
+        return utc(seconds, nanos)
+
+    def _symlink_target(self, node, raw):
+        if node.size < 60 and not _ext_u32(raw, 0x1C):
+            return raw[0x28:0x28 + node.size].decode("utf-8", "replace")
+        try:
+            return self.read(node).decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    # -- block mapping ------------------------------------------------------
+    def _map(self, node):
+        """[(logical block, physical block, count)], in logical order."""
+        raw = node._ref
+        flags = _ext_u32(raw, 0x20)
+        if flags & FL_INLINE_DATA:
+            return []
+        if flags & FL_EXTENTS:
+            out = []
+            self._walk_extents(raw[0x28:0x28 + 60], out, 0)
+            out.sort()
+            return out
+        return self._indirect_map(raw)
+
+    def _walk_extents(self, block, out, depth):
+        if depth > 8 or len(block) < 12:
+            self.errors += 1
+            return
+        magic, entries, _max, tree_depth = struct.unpack_from("<HHHH", block, 0)
+        if magic != EXTENT_MAGIC:
+            self.errors += 1
+            return
+        for i in range(entries):
+            at = 12 + i * 12
+            if at + 12 > len(block):
+                break
+            if tree_depth == 0:
+                logical = _ext_u32(block, at)
+                length = _ext_u16(block, at + 4)
+                start = _ext_u32(block, at + 8) | (_ext_u16(block, at + 6) << 32)
+                if length > 32768:            # uninitialised: allocated, unwritten
+                    length -= 32768
+                if length:
+                    out.append((logical, start, length))
+            else:
+                logical = _ext_u32(block, at)
+                leaf = _ext_u32(block, at + 4) | (_ext_u16(block, at + 8) << 32)
+                self._walk_extents(self.block(leaf), out, depth + 1)
+
+    def _indirect_map(self, raw):
+        """ext2/ext3 block pointers: 12 direct, then one, two and three deep."""
+        per = self.block_size // 4
+        out = []
+        blocks = struct.unpack_from("<15I", raw, 0x28)
+        for i in range(12):
+            if blocks[i]:
+                out.append((i, blocks[i], 1))
+        logical = 12
+        if blocks[12]:
+            logical = self._indirect(blocks[12], 1, logical, out, per)
+        else:
+            logical += per
+        if blocks[13]:
+            logical = self._indirect(blocks[13], 2, logical, out, per)
+        else:
+            logical += per * per
+        if blocks[14]:
+            self._indirect(blocks[14], 3, logical, out, per)
+        return out
+
+    def _indirect(self, block, depth, logical, out, per):
+        raw = self.block(block)
+        entries = struct.unpack_from("<%dI" % per, raw, 0)
+        for entry in entries:
+            if depth == 1:
+                if entry:
+                    out.append((logical, entry, 1))
+                logical += 1
+            else:
+                if entry:
+                    logical = self._indirect(entry, depth - 1, logical, out, per)
+                else:
+                    logical += per ** (depth - 1)
+        return logical
+
+    # -- reading ------------------------------------------------------------
+    def _inline_data(self, node):
+        """The 60 bytes of i_block, for a file small enough to live in it."""
+        return node._ref[0x28:0x28 + min(node.size, 60)]
+
+    def read(self, node, limit=None):
+        size = node.size if limit is None else min(node.size, limit)
+        if size <= 0:
+            return b""
+        if _ext_u32(node._ref, 0x20) & FL_INLINE_DATA:
+            return self._inline_data(node)[:size]
+        return self._read_range(node, 0, size)
+
+    def _read_range(self, node, offset, length):
+        """`length` bytes at `offset` within the file, holes read as zeroes."""
+        length = min(length, max(0, node.size - offset))
+        if length <= 0:
+            return b""
+        mapping = self._mapping_of(node)
+        out = bytearray()
+        pos = offset
+        end = offset + length
+        bs = self.block_size
+        while pos < end:
+            lblock = pos // bs
+            within = pos % bs
+            phys, run = _ext_lookup(mapping, lblock)
+            take = min(end - pos, bs * run - within)
+            if phys is None:
+                out += b"\x00" * take
+            else:
+                out += self.volume.read(phys * bs + within, take)
+            pos += take
+        return bytes(out)
+
+    def _mapping_of(self, node):
+        cached = getattr(node, "_map_cache", None)
+        if cached is None:
+            cached = self._map(node)
+            try:
+                node._map_cache = cached
+            except AttributeError:
+                pass                       # __slots__ - recompute next time
+        return cached
+
+    def open(self, node):
+        if _ext_u32(node._ref, 0x20) & FL_INLINE_DATA:
+            import io
+            return io.BytesIO(self._inline_data(node)[:node.size])
+        mapping = self._map(node)
+
+        def fetch(offset, length):
+            length = min(length, max(0, node.size - offset))
+            if length <= 0:
+                return b""
+            out = bytearray()
+            pos = offset
+            end = offset + length
+            bs = self.block_size
+            while pos < end:
+                phys, run = _ext_lookup(mapping, pos // bs)
+                within = pos % bs
+                take = min(end - pos, bs * run - within)
+                if phys is None:
+                    out += b"\x00" * take
+                else:
+                    out += self.volume.read(phys * bs + within, take)
+                pos += take
+            return bytes(out)
+
+        return ExtentFile(fetch, node.size)
+
+    # -- directories --------------------------------------------------------
+    def root_node(self):
+        return self.node_from_inode(ROOT_INO, "", "d")
+
+    def node_at(self, ref, path, hint=""):
+        return self.node_from_inode(ref, path, hint)
+
+    def dir_entries(self, node):
+        return self._dir_entries(node)
+
+    def _dir_entries(self, node):
+        """(name, inode, kind) for every entry in a directory.
+
+        One linear pass over every data block of the directory covers htree
+        directories too: an htree interior node is written as a single dirent
+        with inode 0 spanning the block, so it is skipped by the same rule
+        that skips the deleted entries and the checksum tail.
+        """
+        raw = node._ref
+        if _ext_u32(raw, 0x20) & FL_INLINE_DATA:
+            return self._inline_dir(node)
+        out = []
+        has_filetype = bool(self.incompat & INCOMPAT_FILETYPE)
+        blocks = self._map(node)
+        seen = 0
+        for logical, phys, count in blocks:
+            for i in range(count):
+                if seen * self.block_size >= node.size and node.size:
+                    break
+                out.extend(self._parse_dir_block(self.block(phys + i),
+                                                 has_filetype))
+                seen += 1
+        return out
+
+    def _parse_dir_block(self, data, has_filetype):
+        out = []
+        at = 0
+        end = len(data)
+        while at + 8 <= end:
+            ino = _ext_u32(data, at)
+            rec_len = _ext_u16(data, at + 4)
+            if rec_len < 8 or at + rec_len > end:
+                break
+            if has_filetype:
+                name_len = data[at + 6]
+                ftype = data[at + 7]
+            else:
+                name_len = _ext_u16(data, at + 6)
+                ftype = 0
+            if ino and name_len and at + 8 + name_len <= end:
+                name = data[at + 8:at + 8 + name_len]
+                if name not in (b".", b".."):
+                    out.append((name.decode("utf-8", "surrogateescape"), ino,
+                                KIND_BY_FILETYPE.get(ftype, "")))
+            at += rec_len
+        return out
+
+    def _inline_dir(self, node):
+        """An ext4 inline directory: parent inode, then ordinary dirents."""
+        raw = node._ref[0x28:0x28 + 60]
+        out = []
+        at = 4
+        has_filetype = bool(self.incompat & INCOMPAT_FILETYPE)
+        while at + 8 <= len(raw):
+            ino = _ext_u32(raw, at)
+            rec_len = _ext_u16(raw, at + 4)
+            if rec_len < 8 or at + rec_len > len(raw):
+                break
+            name_len = raw[at + 6] if has_filetype else _ext_u16(raw, at + 6)
+            ftype = raw[at + 7] if has_filetype else 0
+            if ino and name_len and at + 8 + name_len <= len(raw):
+                name = raw[at + 8:at + 8 + name_len]
+                if name not in (b".", b".."):
+                    out.append((name.decode("utf-8", "surrogateescape"), ino,
+                                KIND_BY_FILETYPE.get(ftype, "")))
+            at += rec_len
+        return out
+
+    # -- the walk -----------------------------------------------------------
+    def walk(self, max_nodes=0, on_error=None):
+        """Every name in the filesystem, depth first from the root inode.
+
+        Inodes already visited are not descended into again. A directory hard
+        link is not supposed to exist, but a corrupt or hostile filesystem can
+        carry one, and a walker that trusts the tree to be a tree recurses
+        until it runs out of memory on evidence that was crafted to make it.
+        """
+        root = self.root_node()
+        if root is None:
+            raise ExtError("root inode is unreadable")
+        stack = [(root, "")]
+        seen_dirs = {ROOT_INO}
+        count = 0
+        while stack:
+            node, prefix = stack.pop()
+            try:
+                entries = self._dir_entries(node)
+            except Exception as exc:
+                self.errors += 1
+                if on_error:
+                    on_error(prefix or "/", exc)
+                continue
+            for name, ino, hint in sorted(entries, reverse=True):
+                path = prefix + "/" + name
+                child = self.node_from_inode(ino, path, hint)
+                if child is None:
+                    self.errors += 1
+                    continue
+                yield child
+                count += 1
+                if max_nodes and count >= max_nodes:
+                    return
+                if child.is_dir and ino not in seen_dirs:
+                    seen_dirs.add(ino)
+                    stack.append((child, path))
+
+    # -- deleted ------------------------------------------------------------
+    def deleted(self, max_nodes=0):
+        """Inodes with a deletion time and no remaining links.
+
+        The name is gone - it lived in the directory entry, which was
+        overwritten - so what comes back is an inode number, a size, an owner
+        and a set of times. That is still enough to answer "was something
+        removed from /tmp during the window", which is a question a mounted
+        filesystem cannot answer at all.
+        """
+        count = 0
+        table_bytes = self.inodes_per_group * self.inode_size
+        for group, (table, flags) in enumerate(self._groups):
+            if not table:
+                continue
+            # ext4 marks a group whose inode table was never written, and
+            # reading it back is megabytes of zeroes per group - on a mostly
+            # empty terabyte disk that is most of the scan
+            if flags & 0x1:                        # EXT4_BG_INODE_UNINIT
+                continue
+            base = group * self.inodes_per_group + 1
+            # a whole group's inode table at a time, in slices: one read per
+            # inode turns this into millions of seeks on a real disk, and this
+            # scan is already the slowest part of loading one
+            at = 0
+            while at < table_bytes:
+                span = min(4 << 20, table_bytes - at)
+                chunk = self.volume.read(table * self.block_size + at, span)
+                for off in range(0, len(chunk) - self.inode_size + 1,
+                                 self.inode_size):
+                    number = base + (at + off) // self.inode_size
+                    if number < self.first_ino or number > self.inodes_count:
+                        continue
+                    raw = chunk[off:off + self.inode_size]
+                    if _ext_u32(raw, 0x14) == 0:   # dtime: never deleted
+                        continue
+                    if _ext_u16(raw, 0x1A):        # still linked
+                        continue
+                    if not _ext_u16(raw, 0x00):    # never allocated
+                        continue
+                    node = self.node_from_inode(
+                        number, "/<deleted>/inode-%d" % number)
+                    if node is None:
+                        continue
+                    node.deleted = True
+                    yield node
+                    count += 1
+                    if max_nodes and count >= max_nodes:
+                        return
+                at += span
+
+    def describe(self):
+        bits = ["%s '%s'" % (self.kind, self.label) if self.label else self.kind,
+                "%d-byte blocks" % self.block_size,
+                "%s inodes" % format(self.inodes_count, ",")]
+        if self.uuid:
+            bits.append(self.uuid)
+        return ", ".join(bits)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _ext_u16(b, o=0):
+    return struct.unpack_from("<H", b, o)[0]
+
+
+def _ext_u32(b, o=0):
+    return struct.unpack_from("<I", b, o)[0]
+
+
+def _ext_uuid(raw):
+    if len(raw) != 16 or raw == b"\x00" * 16:
+        return ""
+    h = raw.hex()
+    return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+
+
+def _ext_lookup(mapping, lblock):
+    """(physical block, run length) for a logical block; (None, 1) for a hole.
+
+    `mapping` is sorted by logical block, so this is a bisect rather than a
+    scan - a 4 GB file on 4 KiB blocks has a million logical blocks and a
+    linear lookup per block turns a read into a quadratic one.
+    """
+    lo, hi = 0, len(mapping)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if mapping[mid][0] <= lblock:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo:
+        logical, phys, count = mapping[lo - 1]
+        if logical <= lblock < logical + count:
+            return phys + (lblock - logical), count - (lblock - logical)
+    return None, 1
+
+
+def probe_ext(volume):
+    """An ExtFilesystem on this volume, or None."""
+    try:
+        return ExtFilesystem(volume)
+    except (ExtError, struct.error, ValueError):
+        return None
+
+# -------------------------------------------------------------------------
+# the XFS reader
+# -------------------------------------------------------------------------
+
+"""The XFS reader.
+
+RHEL, CentOS, Rocky and Alma have defaulted to XFS since RHEL 7, so on
+enterprise Linux this is the filesystem, not the alternative. A disk reader
+that handles only ext reads an Ubuntu laptop and reports an empty disk for
+every server image in the case - which is why this is here rather than on a
+list of things to add later.
+
+XFS differs from ext in the two ways that matter to a reader. Everything is
+big-endian. And an inode does not have one layout: its data fork is either
+inline (a short directory, a short symlink), a packed list of 128-bit extent
+records, or a B+tree whose root sits in the fork and whose blocks live out on
+the disk. All three are implemented, because which one a file uses depends on
+how big it is, and the big files are the logs.
+
+Directories are the other half. A directory is inline while it is small, then
+becomes a set of data blocks addressed inside the file's own logical space -
+with the leaf and free index living above 32 GB so they never collide with the
+data. The reader walks only the data blocks, which is what makes one loop work
+for the block, leaf and node directory forms alike.
+"""
+
+
+
+
+XFS_SB_MAGIC = b"XFSB"
+XFS_DINODE_MAGIC = b"IN"
+
+# data fork formats
+FMT_DEV = 0
+FMT_LOCAL = 1
+FMT_EXTENTS = 2
+FMT_BTREE = 3
+
+# directory block magics: v4 then v5
+DIR_BLOCK = (b"XD2B", b"XDB3")        # single-block directory
+DIR_DATA = (b"XD2D", b"XDD3")         # data block of a bigger directory
+BMBT_MAGIC = (b"BMAP", b"BMA3")
+SYMLINK_MAGIC = b"XSLM"
+
+# v5 (crc) headers are longer than v4 ones by exactly the block header
+DIR3_DATA_HDR = 64
+DIR2_DATA_HDR = 16
+BMBT3_HDR = 72
+BMBT_HDR = 24
+SYMLINK_HDR = 56
+
+#: Directory content lives below 32 GB of the file's logical space; the leaf
+#: index sits at 32 GB and the free index at 64 GB. Walking only what is below
+#: the first boundary is what lets one loop read every directory form.
+DIR_LEAF_OFFSET = 32 * 1024 * 1024 * 1024
+
+KIND_BY_FTYPE = {1: "f", 2: "d", 3: "c", 4: "b", 5: "p", 6: "s", 7: "l"}
+
+#: XFS bigtime counts nanoseconds from 1901-12-13 20:45:52 UTC, which is
+#: 2^31 seconds before the Unix epoch.
+BIGTIME_OFFSET = 1 << 31
+
+FEAT_INCOMPAT_FTYPE = 0x1
+#: XFS_SB_FEAT_INCOMPAT_NREXT64. With it, an inode's data-fork extent count is
+#: a 64-bit field at 0x18 and 0x4c holds the *attribute* fork's count instead.
+#: mkfs.xfs turns this on by default from 6.x, so a reader that always looks
+#: at 0x4c finds zero extents on a freshly made image and returns every file
+#: as zeroes - which is what it looks like when this is missed.
+FEAT_INCOMPAT_NREXT64 = 0x20
+FLAGS2_BIGTIME = 0x8
+
+ROOT_ONLINK_V4 = 0
+
+
+class XfsError(Exception):
+    pass
+
+
+class XfsFilesystem(Filesystem):
+    """An XFS filesystem on a volume."""
+
+    kind = "xfs"
+
+    def __init__(self, volume):
+        Filesystem.__init__(self, volume)
+        sb = volume.read(0, 512)
+        if len(sb) < 512 or sb[:4] != XFS_SB_MAGIC:
+            raise XfsError("no XFS superblock")
+        self.block_size = _xfs_u32(sb, 0x04)
+        if not (512 <= self.block_size <= 65536):
+            raise XfsError("implausible XFS block size %d" % self.block_size)
+        self.dblocks = _xfs_u64(sb, 0x08)
+        self.uuid = _xfs_uuid(sb[0x20:0x30])
+        self.root_ino = _xfs_u64(sb, 0x38)
+        self.ag_blocks = _xfs_u32(sb, 0x54)
+        self.ag_count = _xfs_u32(sb, 0x58)
+        self.version = _xfs_u16(sb, 0x64)
+        self.sector_size = _xfs_u16(sb, 0x66)
+        self.inode_size = _xfs_u16(sb, 0x68)
+        self.inopblock = _xfs_u16(sb, 0x6A)
+        self.label = sb[0x6C:0x78].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        self.blocklog = sb[0x78]
+        self.inodelog = sb[0x7A]
+        self.inopblog = sb[0x7B]
+        self.agblklog = sb[0x7C]
+        self.icount = _xfs_u64(sb, 0x80)
+        self.dirblklog = sb[0xC0]
+        self.dir_block_size = self.block_size << self.dirblklog
+        self.size = self.dblocks * self.block_size
+
+        version_num = self.version & 0xF
+        self.v5 = version_num == 5
+        self.features_incompat = _xfs_u32(sb, 0xD8) if self.v5 else 0
+        self.nrext64 = bool(self.features_incompat & FEAT_INCOMPAT_NREXT64)
+        self.has_ftype = bool(self.features_incompat & FEAT_INCOMPAT_FTYPE) \
+            or bool(self.v5)
+        if not self.v5:
+            # v4 records ftype in the directory only when the feature bit says
+            # so, and reading a name one byte long when it is not there
+            # truncates every filename on the filesystem by one character
+            features2 = _xfs_u32(sb, 0xC8)
+            self.has_ftype = bool(features2 & 0x200)
+
+        self.kind = "xfs"
+        # XFS has no superblock timestamp; the root inode's mtime is the best
+        # statement of when this filesystem was last written to
+        self._inode_cache = {}
+        root = self.root_node()
+        if root is None:
+            raise XfsError("XFS root inode %d is unreadable" % self.root_ino)
+        self.last_write = root.mtime
+        self.created = root.crtime
+        if self.ag_count == 0 or self.ag_blocks == 0:
+            raise XfsError("XFS superblock describes no allocation groups")
+        if not self.v5:
+            self.notes.append(
+                "this is a v4 XFS (no metadata checksums); file creation "
+                "times are not recorded by v4 and will be empty")
+
+    # -- inodes -------------------------------------------------------------
+    def inode_offset(self, ino):
+        """Byte offset of inode `ino` on the volume.
+
+        The inode number is not an index: it packs the allocation group, the
+        block within it and the slot within the block into one integer, and
+        the widths come from the superblock. Treating it as an index reads
+        somewhere plausible and entirely wrong.
+        """
+        agno = ino >> (self.agblklog + self.inopblog)
+        agbno = (ino >> self.inopblog) & ((1 << self.agblklog) - 1)
+        slot = ino & ((1 << self.inopblog) - 1)
+        if agno >= self.ag_count:
+            return -1
+        return ((agno * self.ag_blocks + agbno) * self.block_size
+                + slot * self.inode_size)
+
+    def inode(self, ino):
+        cached = self._inode_cache.get(ino)
+        if cached is not None:
+            return cached
+        at = self.inode_offset(ino)
+        if at < 0:
+            return b""
+        raw = self.volume.read(at, self.inode_size)
+        if raw[:2] != XFS_DINODE_MAGIC:
+            return b""
+        if len(self._inode_cache) < 65536:
+            self._inode_cache[ino] = raw
+        return raw
+
+    def _fork_offset(self, raw):
+        """Where the data fork starts inside the inode."""
+        return 176 if raw[4] >= 3 else 100
+
+    def nextents(self, raw):
+        """How many extent records the data fork holds.
+
+        Which field that is depends on a feature flag, not on the inode
+        version: with NREXT64 the count is 64 bits wide at 0x18, and the field
+        at 0x4c that used to hold it holds the attribute fork's count. Reading
+        the old place on a new filesystem gives 0 and every file reads empty.
+        """
+        if self.nrext64 and raw[4] >= 3:
+            return _xfs_u64(raw, 0x18)
+        return _xfs_u32(raw, 0x4C)
+
+    def _fork_size(self, raw):
+        """How much room the data fork has, before the attribute fork."""
+        start = self._fork_offset(raw)
+        forkoff = raw[0x52]
+        if forkoff:
+            return forkoff * 8
+        return self.inode_size - start
+
+    def _time(self, raw, offset, bigtime):
+        if bigtime:
+            value = _xfs_u64(raw, offset)
+            if not value:
+                return None
+            return utc(value // 1000000000 - BIGTIME_OFFSET,
+                       value % 1000000000)
+        return utc(_xfs_u32(raw, offset), _xfs_u32(raw, offset + 4))
+
+    def node_at(self, ino, path, hint=""):
+        raw = self.inode(ino)
+        if len(raw) < 100:
+            return None
+        mode = _xfs_u16(raw, 0x02)
+        version = raw[4]
+        kind = KIND_BY_MODE.get(mode & S_IFMT, hint or "f")
+        flags2 = _xfs_u64(raw, 0x78) if version >= 3 and len(raw) >= 0x80 else 0
+        bigtime = bool(flags2 & FLAGS2_BIGTIME)
+        node = FsNode(
+            path=path, inode=ino, kind=kind, size=_xfs_u64(raw, 0x38), mode=mode,
+            uid=_xfs_u32(raw, 0x08), gid=_xfs_u32(raw, 0x0C), nlink=_xfs_u32(raw, 0x10),
+            atime=self._time(raw, 0x20, bigtime),
+            mtime=self._time(raw, 0x28, bigtime),
+            ctime=self._time(raw, 0x30, bigtime),
+            crtime=self._time(raw, 0x90, bigtime)
+            if version >= 3 and len(raw) >= 0x98 else None,
+            fs=self, ref=raw)
+        if version < 3 and _xfs_u16(raw, 0x06) and not node.nlink:
+            node.nlink = _xfs_u16(raw, 0x06)      # v1 inodes keep links in di_onlink
+        if kind == "l":
+            node.target = self._symlink_target(node)
+        return node
+
+    def root_node(self):
+        return self.node_at(self.root_ino, "", "d")
+
+    # -- the data fork ------------------------------------------------------
+    def _extents(self, node):
+        """[(logical block, physical block, count)] for a file's data fork."""
+        cached = node._map_cache
+        if cached is not None:
+            return cached
+        raw = node._ref
+        fmt = raw[0x05]
+        start = self._fork_offset(raw)
+        out = []
+        if fmt == FMT_EXTENTS:
+            count = self.nextents(raw)
+            room = self._fork_size(raw) // 16
+            for i in range(min(count, room)):
+                rec = raw[start + i * 16:start + i * 16 + 16]
+                if len(rec) < 16:
+                    break
+                out.append(_xfs_extent(rec))
+        elif fmt == FMT_BTREE:
+            self._btree_extents(raw[start:start + self._fork_size(raw)], out, 0,
+                                root=True)
+        out = [e for e in out if e is not None]
+        out.sort()
+        node._map_cache = out
+        return out
+
+    def _btree_extents(self, block, out, depth, root=False):
+        """Walk a bmap B+tree, collecting the extent records in its leaves."""
+        if depth > 16 or len(block) < 4:
+            self.errors += 1
+            return
+        if root:
+            level = _xfs_u16(block, 0)
+            numrecs = _xfs_u16(block, 2)
+            # the root's pointers sit at the far end of the fork, after a key
+            # array sized for the room available rather than for numrecs
+            maxrecs = (len(block) - 4) // 16
+            ptr_at = 4 + maxrecs * 8
+            pointers = [_xfs_u64(block, ptr_at + i * 8)
+                        for i in range(min(numrecs, maxrecs))]
+        else:
+            magic = block[:4]
+            if magic not in BMBT_MAGIC:
+                self.errors += 1
+                return
+            hdr = BMBT3_HDR if magic == b"BMA3" else BMBT_HDR
+            level = _xfs_u16(block, 4)
+            numrecs = _xfs_u16(block, 6)
+            if level == 0:
+                for i in range(numrecs):
+                    at = hdr + i * 16
+                    if at + 16 > len(block):
+                        break
+                    out.append(_xfs_extent(block[at:at + 16]))
+                return
+            maxrecs = (len(block) - hdr) // 16
+            ptr_at = hdr + maxrecs * 8
+            pointers = [_xfs_u64(block, ptr_at + i * 8)
+                        for i in range(min(numrecs, maxrecs))]
+        for fsb in pointers:
+            if not fsb:
+                continue
+            self._btree_extents(self.fsblock(fsb), out, depth + 1)
+
+    def fsb_to_offset(self, fsb):
+        """A filesystem block number is (ag, block) packed, like an inode."""
+        agno = fsb >> self.agblklog
+        agbno = fsb & ((1 << self.agblklog) - 1)
+        return (agno * self.ag_blocks + agbno) * self.block_size
+
+    def fsblock(self, fsb, count=1):
+        return self.volume.read(self.fsb_to_offset(fsb),
+                                self.block_size * count)
+
+    # -- reading ------------------------------------------------------------
+    def _local_data(self, node):
+        raw = node._ref
+        start = self._fork_offset(raw)
+        return raw[start:start + min(node.size, self._fork_size(raw))]
+
+    def read(self, node, limit=None):
+        size = node.size if limit is None else min(node.size, limit)
+        if size <= 0:
+            return b""
+        if node._ref[0x05] == FMT_LOCAL:
+            return self._local_data(node)[:size]
+        return self._fetch(node, 0, size)
+
+    def _fetch(self, node, offset, length):
+        length = min(length, max(0, node.size - offset))
+        if length <= 0:
+            return b""
+        extents = self._extents(node)
+        bs = self.block_size
+        out = bytearray()
+        pos = offset
+        end = offset + length
+        while pos < end:
+            lblock = pos // bs
+            within = pos % bs
+            phys, run = _xfs_lookup(extents, lblock)
+            take = min(end - pos, bs * run - within)
+            if phys is None:
+                out += b"\x00" * take
+            else:
+                out += self.volume.read(self.fsb_to_offset(phys) + within, take)
+            pos += take
+        return bytes(out)
+
+    def open(self, node):
+        if node._ref[0x05] == FMT_LOCAL:
+            import io
+            return io.BytesIO(self._local_data(node)[:node.size])
+        return ExtentFile(lambda o, n: self._fetch(node, o, n), node.size)
+
+    def _symlink_target(self, node):
+        raw = node._ref
+        if raw[0x05] == FMT_LOCAL:
+            return self._local_data(node).decode("utf-8", "replace")
+        extents = self._extents(node)
+        if not extents:
+            return ""
+        block = self.fsblock(extents[0][1])
+        if block[:4] == SYMLINK_MAGIC:
+            block = block[SYMLINK_HDR:]
+        return block[:node.size].decode("utf-8", "replace")
+
+    # -- directories --------------------------------------------------------
+    def dir_entries(self, node):
+        raw = node._ref
+        fmt = raw[0x05]
+        if fmt == FMT_LOCAL:
+            return self._shortform_dir(node)
+        return self._block_dir(node)
+
+    def _shortform_dir(self, node):
+        """A directory small enough to live inside its own inode."""
+        raw = node._ref
+        start = self._fork_offset(raw)
+        data = raw[start:start + self._fork_size(raw)]
+        if len(data) < 2:
+            return []
+        count = data[0]
+        i8 = data[1]
+        # i8count is the number of entries needing a 64-bit inode number; when
+        # it is non-zero every number in this directory is 8 bytes wide
+        wide = i8 > 0
+        at = 2 + (8 if wide else 4)          # past the parent inode
+        if i8 and not count:
+            count = i8
+        out = []
+        for _ in range(count):
+            if at + 3 > len(data):
+                break
+            namelen = data[at]
+            at += 1
+            at += 2                          # the offset field, not needed here
+            name = data[at:at + namelen]
+            at += namelen
+            ftype = 0
+            if self.has_ftype:
+                if at >= len(data):
+                    break
+                ftype = data[at]
+                at += 1
+            width = 8 if wide else 4
+            if at + width > len(data):
+                break
+            ino = _xfs_u64(data, at) if wide else _xfs_u32(data, at)
+            at += width
+            if name:
+                out.append((name.decode("utf-8", "surrogateescape"), ino,
+                            KIND_BY_FTYPE.get(ftype, "")))
+        return out
+
+    def _block_dir(self, node):
+        """A directory whose entries live in data blocks of its own extents.
+
+        Only the blocks below the 32 GB leaf boundary hold entries; the leaf
+        and free indexes above it are addressed in the same logical space and
+        would parse as nonsense. One loop then covers the block, leaf and node
+        directory forms, because they differ in the index, not the data.
+        """
+        out = []
+        limit = DIR_LEAF_OFFSET // self.block_size
+        per_dir_block = max(1, self.dir_block_size // self.block_size)
+        for logical, phys, count in self._extents(node):
+            if logical >= limit:
+                break
+            i = 0
+            while i < count:
+                if logical + i >= limit:
+                    break
+                take = min(per_dir_block, count - i)
+                block = self.fsblock(phys + i, take)
+                magic = block[:4]
+                if magic in DIR_DATA or magic in DIR_BLOCK:
+                    hdr = DIR3_DATA_HDR if magic in (b"XDD3", b"XDB3") \
+                        else DIR2_DATA_HDR
+                    end = len(block)
+                    if magic in DIR_BLOCK:
+                        # a single-block directory keeps its leaf index and a
+                        # tail at the end of the same block; entries stop
+                        # where the leaf entries begin
+                        tail_count = _xfs_u32(block, len(block) - 8)
+                        if 0 <= tail_count < len(block) // 8:
+                            end = len(block) - 8 - tail_count * 8
+                    out.extend(self._parse_dir_block(block, hdr, end))
+                i += take
+        return out
+
+    def _parse_dir_block(self, block, hdr, end):
+        out = []
+        at = hdr
+        while at + 12 <= end:
+            if _xfs_u16(block, at) == 0xFFFF:       # an unused run, with its length
+                length = _xfs_u16(block, at + 2)
+                if length < 4:
+                    break
+                at += length
+                continue
+            ino = _xfs_u64(block, at)
+            namelen = block[at + 8]
+            if namelen == 0 or at + 9 + namelen > end:
+                break
+            name = block[at + 9:at + 9 + namelen]
+            ftype = 0
+            after = at + 9 + namelen
+            if self.has_ftype:
+                if after >= end:
+                    break
+                ftype = block[after]
+                after += 1
+            after += 2                          # the tag
+            after = (after + 7) & ~7            # entries are 8-byte aligned
+            if name not in (b".", b".."):
+                out.append((name.decode("utf-8", "surrogateescape"), ino,
+                            KIND_BY_FTYPE.get(ftype, "")))
+            if after <= at:
+                break
+            at = after
+        return out
+
+    # -- the walk -----------------------------------------------------------
+    def walk(self, max_nodes=0, on_error=None):
+        root = self.root_node()
+        if root is None:
+            raise XfsError("XFS root inode is unreadable")
+        stack = [(root, "")]
+        seen = {self.root_ino}
+        count = 0
+        while stack:
+            node, prefix = stack.pop()
+            try:
+                entries = self.dir_entries(node)
+            except Exception as exc:
+                self.errors += 1
+                if on_error:
+                    on_error(prefix or "/", exc)
+                continue
+            for name, ino, hint in sorted(entries, reverse=True):
+                path = prefix + "/" + name
+                child = self.node_at(ino, path, hint)
+                if child is None:
+                    self.errors += 1
+                    continue
+                yield child
+                count += 1
+                if max_nodes and count >= max_nodes:
+                    return
+                if child.is_dir and ino not in seen:
+                    seen.add(ino)
+                    stack.append((child, path))
+
+    def describe(self):
+        bits = ["xfs v%d" % (5 if self.v5 else 4)]
+        if self.nrext64:
+            bits.append("nrext64")
+        if self.label:
+            bits.append("'%s'" % self.label)
+        bits.append("%d-byte blocks" % self.block_size)
+        bits.append("%d AG" % self.ag_count)
+        if self.uuid:
+            bits.append(self.uuid)
+        return ", ".join(bits)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _xfs_u16(b, o=0):
+    return struct.unpack_from(">H", b, o)[0]
+
+
+def _xfs_u32(b, o=0):
+    return struct.unpack_from(">I", b, o)[0]
+
+
+def _xfs_u64(b, o=0):
+    return struct.unpack_from(">Q", b, o)[0]
+
+
+def _xfs_uuid(raw):
+    if len(raw) != 16 or raw == b"\x00" * 16:
+        return ""
+    h = raw.hex()
+    return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+
+
+def _xfs_extent(rec):
+    """A 128-bit packed XFS extent record.
+
+    Nothing in it is byte-aligned: 1 flag bit, 54 bits of logical offset, 52
+    of physical block and 21 of length, packed into two big-endian 64-bit
+    halves. Reading it as four fields of convenient widths gives extents that
+    are plausible and wrong.
+    """
+    hi, lo = struct.unpack_from(">QQ", rec, 0)
+    startoff = (hi >> 9) & ((1 << 54) - 1)
+    startblock = ((hi & 0x1FF) << 43) | (lo >> 21)
+    count = lo & ((1 << 21) - 1)
+    if not count:
+        return None
+    return (startoff, startblock, count)
+
+
+def _xfs_lookup(extents, lblock):
+    lo, hi = 0, len(extents)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if extents[mid][0] <= lblock:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo:
+        logical, phys, count = extents[lo - 1]
+        if logical <= lblock < logical + count:
+            return phys + (lblock - logical), count - (lblock - logical)
+    return None, 1
+
+
+def probe_xfs(volume):
+    """An XfsFilesystem on this volume, or None."""
+    try:
+        return XfsFilesystem(volume)
+    except (XfsError, struct.error, ValueError):
+        return None
+
+# -------------------------------------------------------------------------
+# the btrfs reader
+# -------------------------------------------------------------------------
+
+"""The btrfs reader.
+
+openSUSE and Fedora put root on btrfs, so a workstation image is a normal
+thing to be handed. It is the most involved of the three readers here, for a
+reason worth stating: btrfs has no fixed layout. Every structure lives at a
+logical address that only the chunk tree can turn into a physical one, so
+before a single inode can be read the chunk tree has to be bootstrapped out of
+an array in the superblock and then read through itself.
+
+After that it is one shape repeated. Everything is a B-tree of the same node
+format, keyed by (objectid, type, offset), and a filesystem is:
+
+    chunk tree     logical address -> physical offset
+    root tree      which tree holds what, and where each subvolume hangs
+    fs tree        one per subvolume: inodes, directory entries, extents
+
+Subvolumes matter here in a way they do not on ext or XFS. On openSUSE the
+root filesystem is a subvolume and /var, /home, /srv and the rest are separate
+ones, so a reader that walks only the top-level tree returns a handful of
+names and an empty /var - which reads as a host with no logs at all. Every
+subvolume the tree above it names is therefore walked, at the path it names.
+
+Lookups descend by key rather than scanning. That is not an optimisation
+detail: a walk of a million-file filesystem does a million inode lookups, and
+scanning the tree for each of them is the difference between a minute and a
+week.
+"""
+
+
+
+
+BTRFS_MAGIC = b"_BHRfS_M"
+SUPER_OFFSETS = (0x10000, 0x4000000, 0x4000000000)
+
+# key types
+INODE_ITEM = 1
+INODE_REF = 12
+XATTR_ITEM = 24
+DIR_ITEM = 84
+DIR_INDEX = 96
+EXTENT_DATA = 108
+ROOT_ITEM = 132
+ROOT_REF = 156
+CHUNK_ITEM = 228
+
+# well-known object ids
+ROOT_TREE = 1
+EXTENT_TREE = 2
+CHUNK_TREE = 3
+DEV_TREE = 4
+FS_TREE = 5
+FIRST_FREE = 256
+
+# EXTENT_DATA types
+EXTENT_INLINE = 0
+EXTENT_REGULAR = 1
+EXTENT_PREALLOC = 2
+
+COMPRESS_NONE = 0
+COMPRESS_ZLIB = 1
+COMPRESS_LZO = 2
+COMPRESS_ZSTD = 3
+COMP_NAMES = {COMPRESS_ZLIB: "zlib", COMPRESS_LZO: "lzo", COMPRESS_ZSTD: "zstd"}
+
+# block group flags: which of these mean the data is interleaved across
+# devices, and therefore cannot be read from one image
+BG_RAID0 = 1 << 3
+BG_RAID1 = 1 << 4
+BG_DUP = 1 << 5
+BG_RAID10 = 1 << 6
+BG_RAID5 = 1 << 7
+BG_RAID6 = 1 << 8
+BG_STRIPED = BG_RAID0 | BG_RAID10 | BG_RAID5 | BG_RAID6
+
+KIND_BY_DIRTYPE = {1: "f", 2: "d", 3: "c", 4: "b", 5: "p", 6: "s", 7: "l"}
+
+# btrfs_header: csum(32) fsid(16) bytenr(8) flags(8) chunk_uuid(16)
+#               generation(8) owner(8) nritems(4) level(1)
+NODE_HEADER = 101
+KEY_SIZE = 17
+ITEM_SIZE = 25        # key(17) data offset(4) data size(4)
+KEY_PTR = 33          # key(17) blockptr(8) generation(8)
+
+MAX_KEY = (0xFFFFFFFFFFFFFFFF, 0xFF, 0xFFFFFFFFFFFFFFFF)
+
+
+class BtrfsError(Exception):
+    pass
+
+
+class BtrfsFilesystem(Filesystem):
+    """A btrfs filesystem on a volume."""
+
+    kind = "btrfs"
+
+    def __init__(self, volume):
+        Filesystem.__init__(self, volume)
+        sb = self._read_super(volume)
+        self._sb = sb
+        self.uuid = _bt_uuid(sb[0x20:0x30])
+        self.generation = _bt_u64(sb, 0x48)
+        self.root_tree_addr = _bt_u64(sb, 0x50)
+        self.chunk_root_addr = _bt_u64(sb, 0x58)
+        self.total_bytes = _bt_u64(sb, 0x70)
+        self.sector_size = _bt_u32(sb, 0x90)
+        self.node_size = _bt_u32(sb, 0x94)
+        sys_chunk_size = _bt_u32(sb, 0xA0)
+        self.incompat = _bt_u64(sb, 0xBC)
+        self.label = sb[0x12B:0x12B + 256].split(b"\x00", 1)[0].decode(
+            "utf-8", "replace")
+        self.block_size = self.node_size
+        self.size = self.total_bytes
+        if not (512 <= self.node_size <= 262144):
+            raise BtrfsError("implausible btrfs node size %d" % self.node_size)
+
+        # Nothing at all can be read before the chunk tree: every other
+        # address on this filesystem is logical. The superblock carries just
+        # enough of it, in an array, to find the rest.
+        self._chunks = []
+        self._node_cache = {}
+        self._read_sys_chunks(sb[0x32B:0x32B + min(sys_chunk_size, 2048)])
+        if not self._chunks:
+            raise BtrfsError("the btrfs system chunk array is empty")
+        self._read_chunk_tree()
+
+        self.roots = {}                 # subvolume id -> tree root address
+        self._root_refs = {}            # subvolume id -> (parent, dirid, name)
+        self._read_root_tree()
+        if FS_TREE not in self.roots:
+            raise BtrfsError("no FS tree in the btrfs root tree")
+        self._inode_cache = {}
+        self.subvolumes = self._subvolume_paths()
+        if len(self.subvolumes) > 1:
+            self.notes.append(
+                "%d subvolume(s) besides the top level; each is walked at the "
+                "path the tree above it gives"% (len(self.subvolumes) - 1))
+        root = self.root_node()
+        if root is not None:
+            self.last_write = root.mtime
+            self.created = root.crtime
+
+    # -- superblock ---------------------------------------------------------
+    @staticmethod
+    def _read_super(volume):
+        """The newest valid superblock of the copies btrfs keeps.
+
+        There are up to three, and a filesystem interrupted mid-commit can
+        hold one older than another. Taking the first that parses can mean
+        reading trees that have since moved, so the highest generation wins.
+        """
+        best = None
+        for offset in SUPER_OFFSETS:
+            if volume.size and offset + 4096 > volume.size:
+                continue
+            raw = volume.read(offset, 4096)
+            if len(raw) < 4096 or raw[0x40:0x48] != BTRFS_MAGIC:
+                continue
+            generation = _bt_u64(raw, 0x48)
+            if best is None or generation > best[0]:
+                best = (generation, raw)
+        if best is None:
+            raise BtrfsError("no btrfs superblock")
+        return best[1]
+
+    # -- the chunk tree: logical -> physical --------------------------------
+    def _read_sys_chunks(self, blob):
+        at = 0
+        while at + KEY_SIZE + 48 <= len(blob):
+            _objectid, ktype, offset = _bt_key(blob, at)
+            at += KEY_SIZE
+            if ktype != CHUNK_ITEM:
+                break
+            used = self._add_chunk(offset, blob, at)
+            if used <= 0:
+                break
+            at += used
+
+    def _add_chunk(self, logical, blob, at):
+        """One chunk item: a logical run, and the stripes holding it."""
+        if at + 48 > len(blob):
+            return 0
+        length = _bt_u64(blob, at)
+        stripe_len = _bt_u64(blob, at + 16)
+        stype = _bt_u64(blob, at + 24)
+        num_stripes = _bt_u16(blob, at + 44)
+        if not num_stripes or num_stripes > 128:
+            return 0
+        if at + 48 + num_stripes * 32 > len(blob):
+            return 0
+        stripes = [(_bt_u64(blob, at + 48 + i * 32),
+                    _bt_u64(blob, at + 48 + i * 32 + 8))
+                   for i in range(num_stripes)]
+        if length:
+            self._chunks.append((logical, length, stripe_len, stype, stripes))
+            self._chunks.sort()
+        return 48 + num_stripes * 32
+
+    def _read_chunk_tree(self):
+        for key, blob in self._range(self.chunk_root_addr,
+                                     (0, CHUNK_ITEM, 0), MAX_KEY):
+            if key[1] == CHUNK_ITEM:
+                self._add_chunk(key[2], blob, 0)
+
+    def logical_to_physical(self, logical):
+        """(offset on this volume, bytes readable there) for a logical address.
+
+        RAID1 and DUP write the same bytes to every stripe, so the first
+        stripe is a complete copy and is read. RAID0, RAID10, RAID5 and RAID6
+        interleave, and reading the first stripe of one returns real bytes
+        from the wrong offsets - which is worse than an error, so it is one.
+        """
+        lo, hi = 0, len(self._chunks)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._chunks[mid][0] <= logical:
+                lo = mid + 1
+            else:
+                hi = mid
+        if not lo:
+            return None, 0
+        start, length, _stripe_len, stype, stripes = self._chunks[lo - 1]
+        if not (start <= logical < start + length):
+            return None, 0
+        if stype & BG_STRIPED and len(stripes) > 1:
+            _bt_note(self, "part of this filesystem is on a striped (RAID0/10/5/6) "
+                        "chunk spanning %d devices; it cannot be read from one "
+                        "image and is returned as zeroes" % len(stripes))
+            return None, 0
+        within = logical - start
+        return stripes[0][1] + within, length - within
+
+    def read_logical(self, logical, length):
+        out = bytearray()
+        while len(out) < length:
+            phys, room = self.logical_to_physical(logical + len(out))
+            if phys is None or room <= 0:
+                out += b"\x00" * (length - len(out))
+                break
+            take = min(length - len(out), room)
+            out += self.volume.read(phys, take)
+        return bytes(out)
+
+    # -- B-trees ------------------------------------------------------------
+    def _node(self, addr):
+        cached = self._node_cache.get(addr)
+        if cached is not None:
+            return cached
+        raw = self.read_logical(addr, self.node_size)
+        if len(self._node_cache) < 8192:
+            self._node_cache[addr] = raw
+        return raw
+
+    def _range(self, root_addr, lo_key, hi_key):
+        """Yield (key, data) for every item with lo_key <= key <= hi_key.
+
+        A descent, not a scan: at an interior node only the children whose key
+        span can overlap the wanted range are followed. Every lookup in this
+        reader goes through here, which is what keeps a walk linear in the
+        number of files rather than quadratic.
+        """
+        if not root_addr:
+            return
+        stack = [root_addr]
+        seen = set()
+        while stack:
+            addr = stack.pop()
+            if addr in seen:
+                continue
+            if len(seen) > (1 << 21):
+                self.errors += 1
+                return
+            seen.add(addr)
+            node = self._node(addr)
+            if len(node) < NODE_HEADER or len(node) < self.node_size:
+                self.errors += 1
+                continue
+            nritems = _bt_u32(node, 96)
+            level = node[100]
+            if level:
+                if nritems > (len(node) - NODE_HEADER) // KEY_PTR:
+                    self.errors += 1
+                    continue
+                keys = [_bt_key(node, NODE_HEADER + i * KEY_PTR)
+                        for i in range(nritems)]
+                # follow child i when [keys[i], keys[i+1]) can hold the range
+                for i in range(nritems - 1, -1, -1):
+                    if keys[i] > hi_key:
+                        continue
+                    if i + 1 < nritems and keys[i + 1] <= lo_key:
+                        continue
+                    stack.append(_bt_u64(node, NODE_HEADER + i * KEY_PTR + KEY_SIZE))
+                continue
+            if nritems > (len(node) - NODE_HEADER) // ITEM_SIZE:
+                self.errors += 1
+                continue
+            for i in range(nritems):
+                at = NODE_HEADER + i * ITEM_SIZE
+                key = _bt_key(node, at)
+                if key < lo_key:
+                    continue
+                if key > hi_key:
+                    break
+                data_off = _bt_u32(node, at + KEY_SIZE)
+                data_len = _bt_u32(node, at + KEY_SIZE + 4)
+                start = NODE_HEADER + data_off
+                if start + data_len > len(node):
+                    self.errors += 1
+                    continue
+                yield key, node[start:start + data_len]
+
+    def _items(self, root_addr, objectid, ktype):
+        """Every item of one type belonging to one object."""
+        return self._range(root_addr, (objectid, ktype, 0),
+                           (objectid, ktype, 0xFFFFFFFFFFFFFFFF))
+
+    # -- the root tree ------------------------------------------------------
+    def _read_root_tree(self):
+        for key, blob in self._range(self.root_tree_addr, (0, 0, 0), MAX_KEY):
+            objectid, ktype, offset = key
+            if ktype == ROOT_ITEM and len(blob) >= 184:
+                # a root item begins with an inode item; the tree's own block
+                # pointer is the field after it
+                self.roots.setdefault(objectid, _bt_u64(blob, 176))
+            elif ktype == ROOT_REF and len(blob) >= 18:
+                namelen = _bt_u16(blob, 16)
+                name = blob[18:18 + namelen].decode("utf-8", "surrogateescape")
+                self._root_refs[offset] = (objectid, _bt_u64(blob, 0), name)
+
+    def _subvolume_paths(self):
+        """subvolume id -> the path it is mounted at, for the reachable ones.
+
+        A subvolume is named by a directory entry in its parent, so the path
+        is the parent's path plus that name, resolved up to the FS tree. This
+        is what puts openSUSE's /var where the host had it instead of at the
+        top of the tree.
+        """
+        out = {FS_TREE: ""}
+        pending = [s for s in sorted(self.roots) if s >= FIRST_FREE]
+        for _round in range(64):
+            progressed = False
+            for subvol in list(pending):
+                ref = self._root_refs.get(subvol)
+                if ref is None:
+                    continue
+                parent, dirid, name = ref
+                if parent not in out:
+                    continue
+                base = out[parent]
+                inner = self._inode_path(self.roots.get(parent), dirid)
+                path = (base + inner).rstrip("/") + "/" + name
+                out[subvol] = path
+                pending.remove(subvol)
+                progressed = True
+            if not progressed:
+                break
+        return out
+
+    def _inode_path(self, root_addr, ino):
+        """The path of a directory inode within its own subvolume."""
+        if not root_addr or ino in (0, FIRST_FREE):
+            return ""
+        parts = []
+        cur = ino
+        for _ in range(64):
+            if cur == FIRST_FREE:
+                break
+            found = None
+            for key, blob in self._items(root_addr, cur, INODE_REF):
+                if len(blob) >= 10:
+                    namelen = _bt_u16(blob, 8)
+                    found = (key[2], blob[10:10 + namelen].decode(
+                        "utf-8", "surrogateescape"))
+                break
+            if not found:
+                return ""
+            parts.append(found[1])
+            cur = found[0]
+        return ("/" + "/".join(reversed(parts))) if parts else ""
+
+    # -- inodes -------------------------------------------------------------
+    def _inode_item(self, root, ino):
+        cached = self._inode_cache.get((root, ino))
+        if cached is not None:
+            return cached
+        for _key_tuple, blob in self._items(root, ino, INODE_ITEM):
+            if len(self._inode_cache) < 65536:
+                self._inode_cache[(root, ino)] = blob
+            return blob
+        return b""
+
+    def node_at(self, ref, path, hint=""):
+        """`ref` is (tree root address, inode number)."""
+        root, ino = ref
+        blob = self._inode_item(root, ino)
+        if len(blob) < 160:
+            return None
+        mode = _bt_u32(blob, 0x34)
+        kind = KIND_BY_MODE.get(mode & S_IFMT, hint or "f")
+        node = FsNode(
+            path=path, inode=ino, kind=kind, size=_bt_u64(blob, 0x10), mode=mode,
+            uid=_bt_u32(blob, 0x2C), gid=_bt_u32(blob, 0x30),
+            nlink=_bt_u32(blob, 0x28),
+            atime=_bt_time(blob, 0x70), ctime=_bt_time(blob, 0x7C),
+            mtime=_bt_time(blob, 0x88), crtime=_bt_time(blob, 0x94),
+            fs=self, ref=(root, ino))
+        if kind == "l":
+            node.target = self.read(node).decode("utf-8", "replace")
+        return node
+
+    def root_node(self):
+        return self.node_at((self.roots[FS_TREE], FIRST_FREE), "", "d")
+
+    # -- file content -------------------------------------------------------
+    def _extents(self, node):
+        cached = node._map_cache
+        if cached is not None:
+            return cached
+        root, ino = node._ref
+        out = []
+        for key, blob in self._items(root, ino, EXTENT_DATA):
+            if len(blob) < 21:
+                continue
+            offset = key[2]
+            ram_bytes = _bt_u64(blob, 8)
+            compression = blob[16]
+            etype = blob[20]
+            if etype == EXTENT_INLINE:
+                out.append((offset, None, blob[21:], compression, ram_bytes))
+            elif len(blob) >= 53:
+                out.append((offset,
+                            (_bt_u64(blob, 21), _bt_u64(blob, 29), _bt_u64(blob, 37),
+                             _bt_u64(blob, 45)),
+                            None, compression, ram_bytes))
+        out.sort(key=lambda e: e[0])
+        node._map_cache = out
+        return out
+
+    def read(self, node, limit=None):
+        size = node.size if limit is None else min(node.size, limit)
+        return self._fetch(node, 0, size) if size > 0 else b""
+
+    def _fetch(self, node, offset, length):
+        """`length` bytes at `offset`; a hole, or an unmapped extent, is zero."""
+        length = min(length, max(0, node.size - offset))
+        if length <= 0:
+            return b""
+        out = bytearray(length)
+        end = offset + length
+        for start, regular, inline, compression, ram in self._extents(node):
+            if regular is None:
+                data = _bt_decompress(inline, compression, ram, self)
+                span = len(data)
+                if start >= end or start + span <= offset:
+                    continue
+                lo = max(offset, start)
+                hi = min(end, start + span)
+                out[lo - offset:hi - offset] = data[lo - start:hi - start]
+                continue
+            disk_bytenr, disk_num, extent_offset, num_bytes = regular
+            if start >= end or start + num_bytes <= offset:
+                continue
+            if not disk_bytenr:                    # a hole
+                continue
+            lo = max(offset, start)
+            hi = min(end, start + num_bytes)
+            if compression:
+                raw = self.read_logical(disk_bytenr, disk_num)
+                whole = _bt_decompress(raw, compression, ram, self)
+                piece = whole[extent_offset + (lo - start):
+                              extent_offset + (hi - start)]
+            else:
+                piece = self.read_logical(
+                    disk_bytenr + extent_offset + (lo - start), hi - lo)
+            out[lo - offset:lo - offset + len(piece)] = piece
+        return bytes(out)
+
+    def open(self, node):
+        return ExtentFile(lambda o, n: self._fetch(node, o, n), node.size)
+
+    # -- directories --------------------------------------------------------
+    def dir_entries(self, node):
+        root, ino = node._ref
+        out = []
+        for _key_tuple, blob in self._items(root, ino, DIR_ITEM):
+            at = 0
+            # one DIR_ITEM key can carry several entries: names that hash to
+            # the same value share a key and are stored end to end
+            while at + 30 <= len(blob):
+                child_id, child_type, _child_off = _bt_key(blob, at)
+                data_len = _bt_u16(blob, at + 25)
+                name_len = _bt_u16(blob, at + 27)
+                dtype = blob[at + 29]
+                name_at = at + 30
+                if name_len == 0 or name_at + name_len > len(blob):
+                    break
+                name = blob[name_at:name_at + name_len].decode(
+                    "utf-8", "surrogateescape")
+                if child_type == ROOT_ITEM:
+                    sub = self.roots.get(child_id)
+                    if sub:
+                        out.append((name, (sub, FIRST_FREE), "d"))
+                elif child_type == INODE_ITEM and name not in (".", ".."):
+                    out.append((name, (root, child_id),
+                                KIND_BY_DIRTYPE.get(dtype, "")))
+                at = name_at + name_len + data_len
+        return out
+
+    # -- the walk -----------------------------------------------------------
+    def walk(self, max_nodes=0, on_error=None):
+        root = self.root_node()
+        if root is None:
+            raise BtrfsError("the btrfs FS tree root inode is unreadable")
+        stack = [(root, "")]
+        seen = {root._ref}
+        count = 0
+        while stack:
+            node, prefix = stack.pop()
+            try:
+                entries = self.dir_entries(node)
+            except Exception as exc:
+                self.errors += 1
+                if on_error:
+                    on_error(prefix or "/", exc)
+                continue
+            for name, ref, hint in sorted(entries, key=lambda e: e[0],
+                                          reverse=True):
+                path = prefix + "/" + name
+                child = self.node_at(ref, path, hint)
+                if child is None:
+                    self.errors += 1
+                    continue
+                yield child
+                count += 1
+                if max_nodes and count >= max_nodes:
+                    return
+                if child.is_dir and ref not in seen:
+                    seen.add(ref)
+                    stack.append((child, path))
+
+    def describe(self):
+        bits = ["btrfs"]
+        if self.label:
+            bits.append("'%s'" % self.label)
+        bits.append("%d-byte nodes" % self.node_size)
+        if len(self.subvolumes) > 1:
+            bits.append("%d subvolume(s)" % (len(self.subvolumes) - 1))
+        if self.uuid:
+            bits.append(self.uuid)
+        return ", ".join(bits)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _bt_u16(b, o=0):
+    return struct.unpack_from("<H", b, o)[0]
+
+
+def _bt_u32(b, o=0):
+    return struct.unpack_from("<I", b, o)[0]
+
+
+def _bt_u64(b, o=0):
+    return struct.unpack_from("<Q", b, o)[0]
+
+
+def _bt_key(b, o=0):
+    """A btrfs key: objectid (u64), type (u8), offset (u64)."""
+    return (_bt_u64(b, o), b[o + 8], _bt_u64(b, o + 9))
+
+
+def _bt_time(blob, at):
+    """A btrfs timespec: seconds (signed 64) then nanoseconds (u32)."""
+    if len(blob) < at + 12:
+        return None
+    return utc(struct.unpack_from("<q", blob, at)[0], _bt_u32(blob, at + 8))
+
+
+def _bt_uuid(raw):
+    if len(raw) != 16 or raw == b"\x00" * 16:
+        return ""
+    h = raw.hex()
+    return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+
+
+def _bt_note(fs, text):
+    if text not in fs.notes:
+        fs.notes.append(text)
+
+
+def _bt_decompress(raw, compression, expected, fs):
+    """Undo whatever the extent was compressed with.
+
+    A file that cannot be decompressed is not quietly returned as zeroes: a
+    note goes on the filesystem, so the report says "this needs an lzo
+    decompressor" rather than showing an empty /etc/passwd.
+    """
+    if compression == COMPRESS_NONE:
+        return raw
+    try:
+        if compression == COMPRESS_ZLIB:
+            return zlib.decompress(raw)
+        if compression == COMPRESS_ZSTD:
+            return _bt_zstd(raw)
+        if compression == COMPRESS_LZO:
+            return _lzo_extent(raw, expected)
+    except Exception as exc:
+        _bt_note(fs, "an extent compressed with %s could not be decompressed (%s)"
+                  % (COMP_NAMES.get(compression, compression), exc))
+        return b"\x00" * (expected or len(raw))
+    _bt_note(fs, "btrfs compression type %d is not implemented" % compression)
+    return b"\x00" * (expected or len(raw))
+
+
+def _bt_zstd(raw):
+    try:
+        from compression import zstd                # Python 3.14+
+        return zstd.decompress(raw)
+    except ImportError:
+        pass
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+    except ImportError:
+        raise RuntimeError("no zstd decompressor is available - Python 3.14 "
+                           "has one in the standard library, or install "
+                           "'zstandard'")
+
+
+def _lzo_extent(raw, expected):
+    """btrfs lzo framing: a total length, then one compressed page per segment."""
+    if len(raw) < 4:
+        raise ValueError("short lzo extent")
+    total = _bt_u32(raw, 0)
+    out = bytearray()
+    at = 4
+    limit = min(total or len(raw), len(raw))
+    while at + 4 <= limit:
+        seg_len = _bt_u32(raw, at)
+        at += 4
+        if seg_len == 0 or at + seg_len > len(raw):
+            break
+        out += lzo1x_decompress(raw[at:at + seg_len])
+        at += seg_len
+        # a segment header never straddles a page boundary within the extent
+        if (at % 4096) + 4 > 4096:
+            at = (at + 4095) & ~4095
+    return bytes(out[:expected]) if expected else bytes(out)
+
+
+def lzo1x_decompress(src):
+    """LZO1X block decompression - the variant btrfs and the kernel use.
+
+    Written out rather than depended on, because the evidence workstation that
+    needs it is the one that cannot install a package. The control flow
+    follows the reference decoder exactly, labels and all, including the two
+    bits of state carried out of a match into the literals that follow it -
+    which is the part a from-memory reimplementation gets wrong, and gets
+    wrong in the way that decodes the first few kilobytes correctly.
+    """
+    out = bytearray()
+    n = len(src)
+    if n < 3:
+        raise ValueError("lzo block too short")
+    ip = 0
+
+    def need(count):
+        if ip + count > n:
+            raise ValueError("lzo input overrun")
+
+    def copy_match(distance, length):
+        if distance <= 0 or distance > len(out):
+            raise ValueError("lzo back-reference before the start of output")
+        at = len(out) - distance
+        for i in range(length):
+            out.append(out[at + i])
+
+    def long_length(base):
+        """A zero length field means 'add 255 per zero byte, then one more'."""
+        nonlocal ip
+        length = base
+        while True:
+            need(1)
+            b = src[ip]
+            ip += 1
+            if b:
+                return length + b
+            length += 255
+
+    label = "top"
+    t = 0
+    while True:
+        if label == "top":
+            if src[ip] > 17:
+                t = src[ip] - 17
+                ip += 1
+                if t < 4:
+                    label = "match_next"
+                    continue
+                need(t)
+                out += src[ip:ip + t]
+                ip += t
+                label = "first_literal_run"
+                continue
+            label = "literal"
+
+        if label == "literal":
+            if ip >= n:
+                return bytes(out)
+            t = src[ip]
+            ip += 1
+            if t >= 16:
+                label = "match"
+                continue
+            t = long_length(15) if t == 0 else t
+            need(t + 3)
+            out += src[ip:ip + t + 3]
+            ip += t + 3
+            label = "first_literal_run"
+
+        if label == "first_literal_run":
+            if ip >= n:
+                return bytes(out)
+            t = src[ip]
+            ip += 1
+            if t >= 16:
+                label = "match"
+            else:
+                need(1)
+                # M2_MAX_OFFSET is 0x0800: the first match after a literal run
+                # reaches further back than the same encoding does later
+                copy_match(1 + 0x0800 + (t >> 2) + (src[ip] << 2), 3)
+                ip += 1
+                label = "match_done"
+
+        # the inner loop: match, then the state literals, then match again
+        while label in ("match", "match_done", "match_next"):
+            if label == "match":
+                if t >= 64:
+                    need(1)
+                    distance = 1 + ((t >> 2) & 7) + (src[ip] << 3)
+                    ip += 1
+                    copy_match(distance, (t >> 5) + 1)
+                elif t >= 32:
+                    length = (t & 31) or long_length(31)
+                    need(2)
+                    pair = src[ip] | (src[ip + 1] << 8)
+                    ip += 2
+                    copy_match(1 + (pair >> 2), length + 2)
+                elif t >= 16:
+                    high = (t & 8) << 11
+                    length = (t & 7) or long_length(7)
+                    need(2)
+                    pair = src[ip] | (src[ip + 1] << 8)
+                    ip += 2
+                    back = high + (pair >> 2)
+                    if back == 0:
+                        return bytes(out)          # the end-of-stream marker
+                    copy_match(back + 0x4000, length + 2)
+                else:
+                    need(1)
+                    distance = 1 + (t >> 2) + (src[ip] << 2)
+                    ip += 1
+                    copy_match(distance, 2)
+                label = "match_done"
+
+            if label == "match_done":
+                # the state is the low two bits of the byte two back, which is
+                # the instruction byte or the first half of the offset pair
+                t = src[ip - 2] & 3
+                if t == 0:
+                    label = "literal"
+                    break
+                label = "match_next"
+
+            if label == "match_next":
+                need(t)
+                out += src[ip:ip + t]
+                ip += t
+                if ip >= n:
+                    return bytes(out)
+                t = src[ip]
+                ip += 1
+                label = "match"
+
+    return bytes(out)
+
+
+def probe_btrfs(volume):
+    """A BtrfsFilesystem on this volume, or None."""
+    try:
+        return BtrfsFilesystem(volume)
+    except (BtrfsError, struct.error, ValueError, KeyError, IndexError):
+        return None
+
+# -------------------------------------------------------------------------
+# the disk backend: a filesystem on a disk, as a collection
+# -------------------------------------------------------------------------
+
+"""The disk backend: a filesystem on a disk, presented as a collection.
+
+Everything above the collection layer asks for artifacts by path - /etc/passwd,
+/var/log/auth.log*, /home/*/.bash_history. A disk image holds those paths. So
+supporting disks is not a second set of parsers and not a second tool: it is a
+fourth backend, whose members are the files on the imaged filesystem, mounted
+where they already live.
+
+That is the whole design, and it is what makes the feature worth having. The
+147 analyzers, the 88 tables, the Sigma and YARA engines, the timeline, the
+IOC extraction and the console all run over a disk image unchanged, because
+from where they sit a disk image and a UAC collection are the same thing.
+
+Two things a disk gives that a triage collection cannot:
+
+  the whole filesystem      A UAC profile collects what it was told to. A disk
+                            has everything, including the file the profile did
+                            not know to ask for.
+  a real bodyfile           Built here from the inodes rather than parsed from
+                            one the collector ran mktime to produce - so it
+                            carries crtime, and it carries deleted inodes.
+
+And one it cannot: nothing that only existed in RAM. There is no process list
+on a dead disk, no socket table, no loaded-module list. Those tables come out
+empty, and the report says why rather than leaving an empty table to be read
+as a host that had no processes.
+"""
+
+
+
+
+#: Which reader opens a volume the volume layer has already identified. The
+#: identification is done from the superblock magic, so this maps a name that
+#: is already certain - it never guesses, and a filesystem with no entry here
+#: is reported by name and left unread rather than fed to the wrong reader.
+FS_PROBES = {
+    "ext2": probe_ext, "ext3": probe_ext, "ext4": probe_ext,
+    "xfs": probe_xfs, "btrfs": probe_btrfs,
+}
+
+#: How many names to take off one disk before stopping. A server root
+#: filesystem is a few hundred thousand; a build host with node_modules can be
+#: several million, and every one of them is an object held for the run. The
+#: cap exists so that the failure is a stated truncation rather than a machine
+#: that swaps to death four minutes in.
+DEFAULT_MAX_FILES = 3000000
+
+
+class DiskError(Exception):
+    pass
+
+
+class _GeneratedFile(io.RawIOBase):
+    """A read-only stream over lines produced on demand.
+
+    The bodyfile of a full server filesystem is a few hundred megabytes of
+    text that exists only because this tool wants to read it back. Generating
+    it into memory to hand to a reader that consumes it a line at a time is
+    the kind of thing that turns a 4 GB machine into a swapping one, so it is
+    produced as it is read.
+    """
+
+    def __init__(self, make_lines):
+        io.RawIOBase.__init__(self)
+        self._iter = make_lines()
+        self._buf = b""
+        self._done = False
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        want = len(buf)
+        while len(self._buf) < want and not self._done:
+            try:
+                self._buf += next(self._iter)
+            except StopIteration:
+                self._done = True
+        take = min(want, len(self._buf))
+        buf[:take] = self._buf[:take]
+        self._buf = self._buf[take:]
+        return take
+
+
+class DiskCollection(Collection):
+    """A disk image, or a live disk, read as a collection.
+
+    Members are named the way a UAC collection names them - the copied
+    filesystem under [root], so [root]/etc/passwd - which is what lets every
+    parser above this class work without knowing a disk is involved.
+    """
+
+    def __init__(self, path, quiet=False, max_files=DEFAULT_MAX_FILES,
+                 want_volume=None, deleted_limit=200000):
+        self.path = os.path.abspath(path) if not _is_device_path(path) else path
+        self.kind = "disk"
+        self._tar = None
+        self._zip = None
+        self._sizes = {}
+        self._names = {}
+        self._raw = {}
+        self.prefix = ""
+        # 'uac' is where the parsers look for a copied filesystem, so it is the
+        # layout the members are named for. display_layout is what the report
+        # prints, because a disk image did not come out of UAC and saying so
+        # would misdescribe the evidence on the first line of every report.
+        self.layout = "uac"
+        self.display_layout = "disk image"
+        self.rootfs_dirs = ["[root]"]
+        self.velo = None
+        self.time_hint = None
+        self.time_hint_note = ""
+
+        self._nodes = {}              # member -> FsNode
+        self._virtual = {}            # member -> bytes
+        self.notes = []
+        self.volumes = []             # every volume found, for the report
+        self.mounts = []              # (mountpoint, volume, filesystem)
+        self.deleted_nodes = []
+        self.scheme = "none"
+        self.image = None
+
+        self.image = open_image(self.path)
+        self.volumes, notes, self.scheme = scan(self.image)
+        self.display_layout = "%s, %s partitioning" % (self.image.description,
+                                                       self.scheme)
+        self.notes.extend(notes)
+        if not quiet:
+            status("[*] %s: %s, %s partitioning, %d volume(s)"
+                   % (os.path.basename(self.path), self.image.description,
+                      self.scheme, len(self.volumes)))
+            for vol in self.volumes:
+                status("      %s" % vol.describe())
+            for note in notes:
+                status("[!] %s" % note)
+
+        self._mount(quiet, max_files, want_volume)
+        # checked before the bodyfile is registered, because registering it
+        # would put one member in _names and turn "nothing on this disk could
+        # be read" into a run that produces empty tables
+        if not self._names:
+            raise DiskError(
+                "no readable Linux filesystem on %s. Volumes found: %s"
+                % (os.path.basename(self.path),
+                   "; ".join(v.describe() for v in self.volumes) or "none"))
+        self._collect_deleted(deleted_limit, quiet)
+        self._add_bodyfile()
+
+    # -- mounting -----------------------------------------------------------
+    def _mount(self, quiet, max_files, want_volume):
+        candidates = [v for v in self.volumes
+                      if v.fstype in READABLE_FS and v.fstype in FS_PROBES]
+        if want_volume:
+            candidates = [v for v in candidates
+                          if want_volume in (v.name, v.label,
+                                             getattr(v, "lv_name", None))]
+            if not candidates:
+                raise DiskError("no volume called '%s' on this disk - the ones "
+                                "here are: %s"
+                                % (want_volume,
+                                   ", ".join(v.name for v in self.volumes)))
+        opened = []
+        for vol in candidates:
+            probe = FS_PROBES.get(vol.fstype)
+            fs = probe(vol) if probe else None
+            if fs is None:
+                self.notes.append("%s says it is %s but its superblock would "
+                                  "not parse" % (vol.name, vol.fstype))
+                continue
+            opened.append((vol, fs))
+            self.notes.extend("%s: %s" % (vol.name, n) for n in fs.notes)
+
+        if not opened:
+            return
+        root_vol, root_fs = self._pick_root(opened)
+        layout = self._fstab_layout(root_fs)
+        placed = [("/", root_vol, root_fs)]
+        for vol, fs in opened:
+            if fs is root_fs:
+                continue
+            point = self._mountpoint_for(vol, fs, layout)
+            if point:
+                placed.append((point, vol, fs))
+            else:
+                self.notes.append(
+                    "%s (%s%s) is a Linux filesystem that /etc/fstab does not "
+                    "place - it was not merged into the tree"
+                    % (vol.name, fs.kind, ", '%s'" % fs.label if fs.label else ""))
+        placed.sort(key=lambda p: p[0].count("/"))
+
+        budget = max_files
+        for point, vol, fs in placed:
+            if budget <= 0:
+                self.notes.append("stopped before mounting %s: the %s-name cap "
+                                  "was reached" % (point, format(max_files, ",")))
+                break
+            taken = self._walk_into(fs, point, budget, quiet)
+            budget -= taken
+            self.mounts.append((point, vol, fs))
+            if not quiet:
+                status("[*] %s  %s on %s: %s name(s)"
+                       % (point.ljust(6), fs.describe(), vol.name,
+                          format(taken, ",")))
+        if budget <= 0:
+            self.notes.append(
+                "the walk stopped at %s names; this disk holds more. Findings "
+                "and tables cover what was read, which is not the whole disk - "
+                "raise --disk-max-files to take all of it."
+                % format(max_files, ","))
+
+    def _pick_root(self, opened):
+        """Which of the readable filesystems is the operating system's root.
+
+        Asked of the filesystem rather than of the partition table, because a
+        partition's type says what it was meant for and its content says what
+        it is. A /boot partition and a root partition are both 'linux' in the
+        GPT and only one of them has /etc/passwd in it.
+        """
+        best = None
+        for vol, fs in opened:
+            score = 0
+            for probe_path in ("/etc/passwd", "/etc/shadow", "/etc/fstab",
+                               "/etc/os-release", "/var/log", "/usr/bin",
+                               "/root", "/etc/hostname"):
+                if _exists(fs, probe_path):
+                    score += 1
+            if best is None or score > best[0] or \
+                    (score == best[0] and fs.size > best[2].size):
+                best = (score, vol, fs)
+        if best[0] == 0:
+            # nothing looks like a root; take the largest and say so
+            self.notes.append(
+                "no filesystem on this disk holds /etc - the largest one was "
+                "read as the root, so paths may not be where the parsers "
+                "expect them")
+        return best[1], best[2]
+
+    def _fstab_layout(self, root_fs):
+        """{uuid or label or device -> mountpoint}, from the root's /etc/fstab.
+
+        This is how a second partition gets mounted where it belongs. Guessing
+        instead - '/boot because it is small and has vmlinuz in it' - puts
+        files at paths the host never had, and a path is what every rule in
+        this tool matches on.
+        """
+        out = {}
+        node = _find(root_fs, "/etc/fstab")
+        if node is None:
+            return out
+        try:
+            text = root_fs.read(node).decode("utf-8", "replace")
+        except Exception:
+            return out
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2 or not parts[1].startswith("/"):
+                continue
+            spec, point = parts[0], parts[1]
+            if point == "/":
+                continue
+            key = spec
+            if spec.upper().startswith("UUID="):
+                key = "uuid:" + spec[5:].strip('"').lower()
+            elif spec.upper().startswith("LABEL="):
+                key = "label:" + spec[6:].strip('"')
+            elif spec.startswith("/dev/"):
+                key = "dev:" + spec
+            out[key] = point
+        return out
+
+    def _mountpoint_for(self, vol, fs, layout):
+        if fs.uuid and ("uuid:" + fs.uuid.lower()) in layout:
+            return layout["uuid:" + fs.uuid.lower()]
+        if fs.label and ("label:" + fs.label) in layout:
+            return layout["label:" + fs.label]
+        if getattr(vol, "scheme", "") == "lvm":
+            vg, lv = vol.vg_name, vol.lv_name
+            for spec in ("dev:/dev/mapper/%s-%s" % (vg.replace("-", "--"),
+                                                    lv.replace("-", "--")),
+                         "dev:/dev/mapper/%s-%s" % (vg, lv),
+                         "dev:/dev/%s/%s" % (vg, lv)):
+                if spec in layout:
+                    return layout[spec]
+        return ""
+
+    def _walk_into(self, fs, mountpoint, budget, quiet):
+        """Add every name in `fs` to the collection, under `mountpoint`."""
+        prefix = "" if mountpoint == "/" else mountpoint.rstrip("/")
+        count = 0
+        newest = None
+        for node in fs.walk(max_nodes=budget):
+            path = prefix + node.path
+            node.path = path
+            member = "[root]" + path
+            key = member.lower()
+            self._names[key] = member
+            self._sizes[key] = node.size
+            self._nodes[member] = node
+            count += 1
+            if node.mtime and (newest is None or node.mtime > newest):
+                newest = node.mtime
+            if count >= budget:
+                break
+        # A disk carries no statement of when it was imaged, and a syslog line
+        # carries no year, so without an anchor every 'Mar 24 22:11' lands in
+        # 1900 and the timeline is worthless. The filesystem's own last write
+        # is a better anchor than the newest mtime - it is the last moment the
+        # host touched this filesystem, including the writes made by whatever
+        # was happening at the end.
+        anchor = fs.last_write or newest
+        if anchor and (self.time_hint is None or anchor > self.time_hint):
+            self.time_hint = anchor
+            self.time_hint_note = (
+                "last write to the %s filesystem on %s - a disk image carries "
+                "no collection time, so this is the anchor for every 'recent' "
+                "window below" % (fs.kind, mountpoint))
+        return count
+
+    # -- deleted ------------------------------------------------------------
+    def _collect_deleted(self, limit, quiet):
+        # 0 means --no-deleted, and has to short-circuit here: passing it down
+        # as max_nodes would read as "no limit" and run the whole sweep, which
+        # is the one thing the flag exists to avoid
+        if limit <= 0:
+            self.deleted_nodes = []
+            return
+        found = []
+        for point, _vol, fs in self.mounts:
+            try:
+                for node in fs.deleted(max_nodes=limit - len(found)):
+                    node.path = ("" if point == "/" else point.rstrip("/")) + \
+                                node.path
+                    found.append(node)
+                    if len(found) >= limit:
+                        break
+            except Exception as exc:
+                self.notes.append("scanning %s for deleted inodes failed: %s"
+                                  % (point, exc))
+            if len(found) >= limit:
+                break
+        self.deleted_nodes = found
+        if found and not quiet:
+            status("[*] %s deleted inode(s) still carry metadata"
+                   % format(len(found), ","))
+
+    # -- the synthetic bodyfile ---------------------------------------------
+    def _add_bodyfile(self):
+        """Register bodyfile/bodyfile.txt, generated from the inodes.
+
+        UAC runs a collector to produce this file; here the same information
+        is already in hand, so the member is registered and its content is
+        produced line by line when something reads it. The table layer, the
+        timeline and every analyzer that consults the bodyfile then work on a
+        disk image with no changes at all - and get a better one, because this
+        carries crtime and the deleted inodes.
+        """
+        member = "bodyfile/bodyfile.txt"
+        self._names[member.lower()] = member
+        # an estimate: the table layer only uses it for progress and reporting
+        self._sizes[member.lower()] = (len(self._nodes) +
+                                       len(self.deleted_nodes)) * 120
+        self._virtual[member] = None          # generated, see _open
+
+    def _bodyfile_lines(self):
+        """mactime format: md5|name|inode|mode|uid|gid|size|atime|mtime|ctime|crtime."""
+        for member in sorted(self._nodes):
+            node = self._nodes[member]
+            name = node.path
+            if node.target:
+                name = "%s -> %s" % (name, node.target)
+            yield ("0|%s|%d|%s|%d|%d|%d|%d|%d|%d|%d\n"
+                   % (name, node.inode, node.mode_string(), node.uid, node.gid,
+                      node.size, _epoch(node.atime), _epoch(node.mtime),
+                      _epoch(node.ctime), _epoch(node.crtime))
+                   ).encode("utf-8", "surrogateescape")
+        for node in self.deleted_nodes:
+            yield ("0|%s (deleted)|%d|%s|%d|%d|%d|%d|%d|%d|%d\n"
+                   % (node.path, node.inode, node.mode_string(), node.uid,
+                      node.gid, node.size, _epoch(node.atime),
+                      _epoch(node.mtime), _epoch(node.ctime),
+                      _epoch(node.crtime))
+                   ).encode("utf-8", "surrogateescape")
+
+    # -- reading ------------------------------------------------------------
+    def _open(self, real):
+        if real in self._virtual:
+            if real == "bodyfile/bodyfile.txt":
+                return _GeneratedFile(self._bodyfile_lines)
+            return io.BytesIO(self._virtual[real] or b"")
+        node = self._nodes.get(real)
+        if node is None:
+            raise IOError("no such member: %s" % real)
+        if node.kind != "f":
+            # a symlink's "content" is its target, which is what a parser
+            # reading /etc/localtime through a link should get
+            if node.kind == "l":
+                return io.BytesIO(node.target.encode("utf-8", "replace"))
+            return io.BytesIO(b"")
+        return node.fs.open(node)
+
+    def read_bytes(self, rel, limit=None):
+        real = self.resolve(rel)
+        if real is None:
+            return None
+        node = self._nodes.get(real)
+        if node is not None and node.kind == "f":
+            try:
+                return node.fs.read(node, limit)
+            except Exception:
+                return None
+        try:
+            with self._open(real) as fh:
+                return fh.read() if limit is None else fh.read(limit)
+        except Exception:
+            return None
+
+    def node(self, rel):
+        """The FsNode behind a collection-relative path, or None."""
+        return self._nodes.get(self.resolve(rel) or "")
+
+    # -- reporting ----------------------------------------------------------
+    def report(self):
+        """Rows for the DISK_LAYOUT table: one per volume, mounted or not."""
+        rows = []
+        mounted = {id(v): p for p, v, _f in self.mounts}
+        for vol in self.volumes:
+            fs = None
+            for _p, v, f in self.mounts:
+                if v is vol:
+                    fs = f
+                    break
+            rows.append({
+                "volume": vol.name,
+                "scheme": vol.scheme,
+                "label": vol.label or (fs.label if fs else ""),
+                "type": vol.type_name,
+                "filesystem": vol.fstype or "",
+                "uuid": fs.uuid if fs else "",
+                "offset": getattr(vol, "offset", ""),
+                "size": vol.size,
+                "mounted_at": mounted.get(id(vol), ""),
+                "detail": vol.detail or (fs.describe() if fs else ""),
+            })
+        return rows
+
+    def meta_rows(self):
+        """(key, value) pairs describing the disk, for METADATA."""
+        out = OrderedDict()
+        out["Disk image"] = self.path
+        out["Disk container"] = self.image.description if self.image else ""
+        if self.image and len(self.image.parts) > 1:
+            out["Disk segments"] = "%d files" % len(self.image.parts)
+        out["Disk size"] = "%d bytes" % (self.image.size if self.image else 0)
+        out["Partitioning"] = self.scheme
+        out["Volumes"] = "%d found, %d mounted" % (len(self.volumes),
+                                                   len(self.mounts))
+        for point, vol, fs in self.mounts:
+            out["Mounted %s" % point] = "%s on %s%s" % (
+                fs.describe(), vol.name,
+                " (uuid %s)" % fs.uuid if fs.uuid else "")
+        if self.deleted_nodes:
+            out["Deleted inodes"] = "%d recovered from inode tables" % \
+                len(self.deleted_nodes)
+        for i, note in enumerate(self.notes, 1):
+            out["Disk note %d" % i] = note
+        return out
+
+    def close(self):
+        if self.image is not None:
+            self.image.close()
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _epoch(when):
+    if not when:
+        return 0
+    try:
+        return int(when.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return 0
+
+
+def _find(fs, path):
+    """Resolve one absolute path without walking the whole filesystem.
+
+    Asked before the walk, to decide which filesystem is the root one and to
+    read its /etc/fstab. The walk is the expensive part and the answer here is
+    a handful of directory reads, so the question has to be answerable without
+    paying for it.
+    """
+    node = fs.root_node()
+    if node is None:
+        return None
+    walked = ""
+    parts = [p for p in path.split("/") if p]
+    for i, part in enumerate(parts):
+        found = None
+        for name, ref, hint in fs.dir_entries(node):
+            if name == part:
+                found = (ref, hint)
+                break
+        if found is None:
+            return None
+        walked += "/" + part
+        node = fs.node_at(found[0], walked, found[1])
+        if node is None:
+            return None
+        if i < len(parts) - 1 and not node.is_dir:
+            return None
+    return node
+
+
+def _exists(fs, path):
+    try:
+        return _find(fs, path) is not None
+    except Exception:
+        return False
+
+
+def _is_device_path(path):
+    return path.replace("/", "\\").upper().startswith("\\\\.\\")
+
+
+def looks_like_disk_arg(path):
+    """Whether this command-line argument should go to the disk backend."""
+    try:
+        return looks_like_disk(path)
+    except Exception:
+        return False
+
+# -------------------------------------------------------------------------
 # detection rules: a YARA subset and a Sigma subset
 # -------------------------------------------------------------------------
 
@@ -3800,6 +8449,57 @@ class Triage:
         if ts is not None:
             self.events.append(Event(ts, category, description, severity, source))
 
+    def _disk_findings(self):
+        """Say, in the findings, what the disk scan could and could not open.
+
+        A LUKS partition, a volume group missing one of its disks, a
+        filesystem nothing here parses: each of those is a part of the
+        evidence that was not examined, and an examination that does not say
+        so reads as one that found nothing there. Severity is deliberately
+        INFO for the layout and MEDIUM for the gaps - a gap is not a finding
+        about the host, but it is something the analyst has to act on.
+        """
+        col = self.col
+        mounts = getattr(col, "mounts", None) or []
+        volumes = getattr(col, "volumes", None) or []
+        if mounts:
+            self.add("INFO", "Collection", "Disk image read directly",
+                     "The filesystem was read from the image rather than from "
+                     "a collection: every path below is a path on the host, "
+                     "and the bodyfile was built from the inodes, so it "
+                     "carries creation times and deleted entries that a "
+                     "collected one does not.",
+                     evidence=["%s  %s on %s" % (point, fs.describe(), vol.name)
+                               for point, vol, fs in mounts],
+                     source=os.path.basename(getattr(col, "path", "") or "disk"),
+                     count=len(mounts))
+        unread = [v for v in volumes
+                  if not any(v is mv for _p, mv, _f in mounts)
+                  and getattr(v, "fstype", "") not in ("", "lvm2-pv")]
+        locked = [v for v in unread if getattr(v, "fstype", "") == "luks"]
+        if locked:
+            self.add("MEDIUM", "Collection", "Encrypted volume not examined",
+                     "A LUKS container on this disk was identified and could "
+                     "not be opened. Whatever is on it has not been looked at "
+                     "by any check in this report. Unlock it with cryptsetup "
+                     "and run linsight against the mapped device.",
+                     evidence=[v.describe() for v in locked],
+                     source="disk", count=len(locked))
+        other = [v for v in unread if v not in locked]
+        if other:
+            self.add("MEDIUM", "Collection", "Volume present but not parsed",
+                     "These volumes hold a filesystem this tool does not "
+                     "read. They were not examined, which is not the same as "
+                     "their being empty.",
+                     evidence=[v.describe() for v in other],
+                     source="disk", count=len(other))
+        for note in getattr(col, "notes", None) or []:
+            if "cap was reached" in note or "stopped at" in note:
+                self.add("HIGH", "Collection", "The disk walk was truncated",
+                         "Not every file on this disk was read, so an absence "
+                         "below is not evidence of absence.",
+                         evidence=[note], source="disk")
+
     def _events_from_findings(self):
         """Put every dated finding on the timeline.
 
@@ -4204,10 +8904,13 @@ class Triage:
             hint = getattr(self.col, "time_hint", None)
             if hint:
                 self.collection_time = hint
+                # a disk image says which anchor it used and why; --file has
+                # no such statement to make, so it keeps the wording it had
+                note = getattr(self.col, "time_hint_note", "") or (
+                    "newest mtime of the files given with --file - no "
+                    "collection metadata to date this run")
                 self.meta["Collection finished"] = (
-                    hint.strftime("%Y-%m-%d %H:%M:%S UTC")
-                    + " (newest mtime of the files given with --file - no "
-                      "collection metadata to date this run)")
+                    hint.strftime("%Y-%m-%d %H:%M:%S UTC") + " (%s)" % note)
 
         if "Host UTC offset" not in self.meta:
             # said out loud, the same way the Velociraptor path does: uac.log is
@@ -4215,6 +8918,16 @@ class Triage:
             # host-local stamp below is being read as UTC
             self.meta["Host UTC offset"] = ("unknown - uac.log carried none, "
                                             "host-local log stamps read as UTC")
+
+        # a disk image describes itself: the container, the partitioning, the
+        # volumes found and the ones that could not be opened. These are facts
+        # about the evidence and belong in METADATA next to the collection's
+        # own, not only in the log of a run nobody kept
+        meta_rows = getattr(self.col, "meta_rows", None)
+        if callable(meta_rows):
+            for key, value in meta_rows().items():
+                self.meta[key] = value
+            self._disk_findings()
 
         routed = getattr(self.col, "routed", None)
         if routed:
@@ -7309,6 +12022,16 @@ class Table:
             "rows_included": len(rows),
             "rows": [[_s(v) for v in r] for r in rows],
         }
+
+
+def _fs_ts(when):
+    """A filesystem timestamp as the string every other table prints, or ''."""
+    if not when:
+        return ""
+    try:
+        return when.strftime("%Y-%m-%d %H:%M:%S")
+    except (AttributeError, ValueError):
+        return ""
 
 
 def _s(v):
@@ -14591,9 +19314,64 @@ class TableBuilder:
             t.add(host or rel, size, human_size(size),
                   self._unparsed_reason(host or rel), trunc(preview, 400))
 
+    # -- disk images ---------------------------------------------------------
+    def t_disk_layout(self):
+        """What was on the disk, including what could not be read.
+
+        This table only has rows when the collection is a disk. It exists so
+        that a partition holding a filesystem this tool does not parse, or one
+        behind LUKS, is a line in the output rather than an absence - the
+        difference between "there was nothing there" and "nothing here could
+        read it" is the whole answer in some cases.
+        """
+        rows = getattr(self.col, "report", None)
+        if not callable(rows):
+            return
+        t = self.table("DISK_LAYOUT", "Disk volumes",
+                       ["volume", "scheme", "label", "type", "filesystem",
+                        "uuid", "offset", "size", "size_human", "mounted_at",
+                        "detail"],
+                       "Collection",
+                       "Every volume the partition, LVM and LUKS scan found on "
+                       "the imaged disk, mounted or not. A volume with no "
+                       "mount point was seen and not read, and the detail "
+                       "column says why.")
+        for row in rows():
+            t.add(row["volume"], row["scheme"], row["label"], row["type"],
+                  row["filesystem"], row["uuid"], row["offset"], row["size"],
+                  human_size(row["size"]), row["mounted_at"], row["detail"])
+
+    def t_deleted_files(self):
+        """Inodes that were deleted and still carry their metadata.
+
+        The name is gone with the directory entry, so what is left is an inode
+        number, a size, an owner and a set of times. That still answers "was
+        something removed from this host during the window", which nothing
+        else in this tool and no mounted filesystem can answer at all.
+        """
+        nodes = getattr(self.col, "deleted_nodes", None)
+        if not nodes:
+            return
+        t = self.table("DELETED_FILES", "Deleted inodes",
+                       ["inode", "path", "mode", "uid", "owner", "gid",
+                        "group", "size", "size_human", "atime_utc",
+                        "mtime_utc", "ctime_utc", "crtime_utc", "dtime_utc"],
+                       "Filesystem",
+                       "Inodes with a deletion time and no remaining links, "
+                       "recovered from the inode tables. The filename is not "
+                       "recoverable - it lived in the directory entry that was "
+                       "overwritten - so these are dated and sized, not named.")
+        for node in nodes:
+            t.add(node.inode, node.path, node.mode_string(), node.uid,
+                  self.uid_name(str(node.uid)), node.gid,
+                  self.gid_name(str(node.gid)), node.size,
+                  human_size(node.size), _fs_ts(node.atime),
+                  _fs_ts(node.mtime), _fs_ts(node.ctime), _fs_ts(node.crtime),
+                  _fs_ts(node.dtime))
+
     # -- driver -------------------------------------------------------------
     EXTRACTORS = [
-        "t_metadata", "t_collection_log",
+        "t_metadata", "t_disk_layout", "t_collection_log",
         "t_processes", "t_ps_raw", "t_proc_pid", "t_proc_maps", "t_proc_environ",
         "t_proc_fds", "t_process_master", "t_process_tree",
         "t_process_tree_raw", "t_process_hashes",
@@ -14613,7 +19391,8 @@ class TableBuilder:
         "t_suid", "t_getcap", "t_mac_policy",
         "t_writable", "t_hidden_files", "t_unknown_owner",
         "t_socket_files",
-        "t_dev_files", "t_bodyfile", "t_file_hashes",
+        "t_dev_files", "t_bodyfile", "t_deleted_files",
+        "t_file_hashes",
         "t_user_artifacts",
         "t_packages", "t_package_logs", "t_chkrootkit",
         # /var/log: the binary stores first, then the text logs
@@ -14693,6 +19472,7 @@ class TableBuilder:
         "t_editor_history", "t_ld_preload",
         "t_suid", "t_getcap", "t_mac_policy", "t_writable", "t_hidden_files",
         "t_unknown_owner", "t_socket_files", "t_dev_files", "t_bodyfile",
+        "t_deleted_files", "t_disk_layout",
         "t_file_hashes", "t_user_artifacts", "t_package_logs",
         "t_journal", "t_audit_log", "t_login_records", "t_wtmpdb", "t_lastlog",
         "t_web_logs", "t_web_config", "t_samba_logs", "t_firewall_log",
@@ -17050,16 +21830,82 @@ def write_html(tri, path, opts):
 
 # ---------------------------------------------------------------------------
 
+
+def list_volumes(path):
+    """Print what is on a disk, and stop.
+
+    The cheap question to ask first of an unfamiliar image: which container is
+    it, how is it partitioned, what is inside the LVM, what is encrypted, and
+    which volume is the one a walk would read. It costs a pass over the
+    metadata rather than a walk of the filesystem, so it answers in a second
+    on a disk that would take twenty minutes to examine.
+    """
+    try:
+        image = open_image(path)
+    except ImageError as exc:
+        print("[!] %s" % exc, file=sys.stderr)
+        return 2
+    try:
+        volumes, notes, scheme = scan(image)
+        print("%s" % image.path)
+        print("  container    %s" % image.description)
+        print("  size         %s (%d bytes)"
+              % (human_size(image.size), image.size))
+        if len(image.parts) > 1:
+            print("  segments     %d files, %s .. %s"
+                  % (len(image.parts), os.path.basename(image.parts[0]),
+                     os.path.basename(image.parts[-1])))
+        print("  partitioning %s" % scheme)
+        print("")
+        head = ("volume", "scheme", "type", "filesystem", "size", "offset",
+                "label")
+        rows = [head]
+        for vol in volumes:
+            rows.append((vol.name, vol.scheme, vol.type_name or "-",
+                         vol.fstype or "-", human_size(vol.size),
+                         str(getattr(vol, "offset", "-")),
+                         vol.label or "-"))
+        widths = [max(len(r[i]) for r in rows) for i in range(len(head))]
+        for i, row in enumerate(rows):
+            print("  " + "  ".join(c.ljust(widths[j])
+                                   for j, c in enumerate(row)).rstrip())
+            if i == 0:
+                print("  " + "  ".join("-" * w for w in widths))
+        for vol in volumes:
+            if vol.detail:
+                print("\n  %s: %s" % (vol.name, vol.detail))
+        for note in notes:
+            print("\n  [!] %s" % note)
+        readable = [v for v in volumes if v.fstype in READABLE_FS]
+        print("")
+        if readable:
+            print("  %d volume(s) can be read: %s"
+                  % (len(readable), ", ".join(v.name for v in readable)))
+            print("  run without --list-volumes to examine, or --disk-volume "
+                  "NAME to pick one")
+        else:
+            print("  no volume on this disk holds a filesystem this tool "
+                  "reads (ext2/3/4, xfs, btrfs)")
+        return 0
+    finally:
+        image.close()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Parse a UAC or Velociraptor Linux collection and highlight "
-                    "critical / interesting events.",
+        description="Parse a UAC or Velociraptor Linux collection, or a disk "
+                    "image, and highlight critical / interesting events.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  python linsight.py ./uac-host-linux-20260324\n"
                "  python linsight.py collection.tar.gz --html report.html --json out.json\n"
                "  python linsight.py ./coll --min-severity HIGH --timeline timeline.csv\n"
                "  python linsight.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3\n"
+               "  python linsight.py ./disk.dd            # a raw disk image\n"
+               "  python linsight.py evidence.E01         # the whole E01 set\n"
+               "  python linsight.py vm.qcow2 --html report.html\n"
+               "  python linsight.py ./disk.dd --list-volumes  # what is on it\n"
+               "  sudo python linsight.py /dev/sda        # the live disk\n"
                "  python linsight.py --file /var/log/auth.log\n"
                "  python linsight.py --file ./loose-logs/ --file ps.txt\n"
                "  python linsight.py --file capture.txt:/var/log/auth.log\n"
@@ -17080,11 +21926,47 @@ def main(argv=None):
                          "stands. Append ':/host/path' to say what a file is "
                          "when the name does not: "
                          "--file capture.txt:/var/log/auth.log")
-    ap.add_argument("collection", nargs="?",
-                    help="collection directory, .tar, .tar.gz or .zip - UAC "
-                         "output or a Velociraptor offline collector zip; the "
-                         "layout is detected, not declared. Optional only when "
-                         "--update-sigma is refreshing rules on its own")
+    ap.add_argument("collection", nargs="?", metavar="COLLECTION|DISK",
+                    help="a collection directory, .tar, .tar.gz or .zip (UAC "
+                         "output or a Velociraptor offline collector zip), or "
+                         "a disk: a raw/dd image, an E01 set, a qcow2, vmdk, "
+                         "vhdx or vhd, or a device such as /dev/sda. Which of "
+                         "the two it is, and for a collection which tool "
+                         "produced it, is detected rather than declared. "
+                         "Optional only when --update-sigma is refreshing "
+                         "rules on its own")
+    dg = ap.add_argument_group(
+        "disks",
+        "Point the same parsers at a disk instead of a collection. The image "
+        "is read directly - no loop device, no mount, no root, nothing "
+        "written to the evidence. Partition tables, LVM volume groups and "
+        "LUKS containers are walked through; the root filesystem is the one "
+        "that holds /etc, and whatever /etc/fstab places is mounted where the "
+        "host had it. A volume that cannot be opened is reported by name, "
+        "because an encrypted partition and an absence of evidence must not "
+        "look alike in the output.")
+    dg.add_argument("--disk", metavar="PATH",
+                    help="read PATH as a disk even when it would not be "
+                         "recognised as one - a headerless image, a damaged "
+                         "partition table, a device node")
+    dg.add_argument("--list-volumes", action="store_true",
+                    help="print what is on the disk - container, partitions, "
+                         "logical volumes, filesystems - and stop. The first "
+                         "thing to run against an unfamiliar image: it costs "
+                         "one pass over the metadata, not a filesystem walk.")
+    dg.add_argument("--disk-volume", metavar="NAME",
+                    help="read this volume (part1, p2, vg/lv) instead of the "
+                         "one that holds /etc")
+    dg.add_argument("--disk-max-files", type=int, default=DEFAULT_MAX_FILES,
+                    metavar="N",
+                    help="stop the filesystem walk after N names (default "
+                         "%s). A truncated walk becomes a HIGH finding, "
+                         "because an absence in a partial read is not evidence "
+                         "of absence." % format(DEFAULT_MAX_FILES, ","))
+    dg.add_argument("--no-deleted", action="store_true",
+                    help="skip the deleted-inode scan. It reads every inode "
+                         "table on the filesystem, which on a multi-terabyte "
+                         "disk is the slowest part of the load.")
     ap.add_argument("--min-severity", default="INFO", choices=SEVERITIES,
                     help="lowest severity to print on the console (default INFO)")
     ap.add_argument("--window", type=int, default=72, metavar="H",
@@ -17277,14 +22159,44 @@ def main(argv=None):
     if opts.files and opts.collection:
         ap.error("--file parses loose files instead of a collection; pass one "
                  "or the other, not both")
+    if opts.disk and (opts.files or opts.collection):
+        ap.error("--disk names the disk to read; do not also pass a "
+                 "collection or --file")
 
-    if not opts.collection and not opts.files:
+    # A disk is recognised rather than declared: a .dd, an .E01, a qcow2 or a
+    # device given as the ordinary argument goes to the disk backend, and
+    # --disk only exists for the image that carries no recognisable header at
+    # all. Requiring a flag would mean an analyst who forgets it gets "no
+    # readable files found", which reads as a fault in the evidence.
+    disk_path = opts.disk
+    if not disk_path and opts.collection and looks_like_disk(opts.collection):
+        disk_path = opts.collection
+
+    if not disk_path and not opts.collection and not opts.files:
         if opts.update_sigma:
             return 0                    # a rule refresh on its own
-        ap.error("a collection or --file is required (or --update-sigma on its "
-                 "own to refresh the rule cache)")
+        ap.error("a collection, a disk or --file is required (or "
+                 "--update-sigma on its own to refresh the rule cache)")
 
-    if opts.files:
+    if opts.list_volumes:
+        if not disk_path:
+            ap.error("--list-volumes needs a disk; pass an image, a device, "
+                     "or --disk PATH")
+        return list_volumes(disk_path)
+
+    if disk_path:
+        try:
+            col = DiskCollection(
+                disk_path, quiet=opts.quiet,
+                max_files=max(1, opts.disk_max_files),
+                want_volume=opts.disk_volume,
+                deleted_limit=0 if opts.no_deleted else 200000)
+        except (DiskError, ImageError) as exc:
+            ap.error(str(exc))
+        status("[*] read %s file(s) off %s, %d filesystem(s) mounted"
+               % (format(len(col._names) - 1, ","),
+                  os.path.basename(col.path), len(col.mounts)))
+    elif opts.files:
         specs = []
         for raw in opts.files:
             path, dest = parse_file_spec(raw)

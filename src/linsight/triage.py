@@ -77,6 +77,57 @@ class Triage:
         if ts is not None:
             self.events.append(Event(ts, category, description, severity, source))
 
+    def _disk_findings(self):
+        """Say, in the findings, what the disk scan could and could not open.
+
+        A LUKS partition, a volume group missing one of its disks, a
+        filesystem nothing here parses: each of those is a part of the
+        evidence that was not examined, and an examination that does not say
+        so reads as one that found nothing there. Severity is deliberately
+        INFO for the layout and MEDIUM for the gaps - a gap is not a finding
+        about the host, but it is something the analyst has to act on.
+        """
+        col = self.col
+        mounts = getattr(col, "mounts", None) or []
+        volumes = getattr(col, "volumes", None) or []
+        if mounts:
+            self.add("INFO", "Collection", "Disk image read directly",
+                     "The filesystem was read from the image rather than from "
+                     "a collection: every path below is a path on the host, "
+                     "and the bodyfile was built from the inodes, so it "
+                     "carries creation times and deleted entries that a "
+                     "collected one does not.",
+                     evidence=["%s  %s on %s" % (point, fs.describe(), vol.name)
+                               for point, vol, fs in mounts],
+                     source=os.path.basename(getattr(col, "path", "") or "disk"),
+                     count=len(mounts))
+        unread = [v for v in volumes
+                  if not any(v is mv for _p, mv, _f in mounts)
+                  and getattr(v, "fstype", "") not in ("", "lvm2-pv")]
+        locked = [v for v in unread if getattr(v, "fstype", "") == "luks"]
+        if locked:
+            self.add("MEDIUM", "Collection", "Encrypted volume not examined",
+                     "A LUKS container on this disk was identified and could "
+                     "not be opened. Whatever is on it has not been looked at "
+                     "by any check in this report. Unlock it with cryptsetup "
+                     "and run linsight against the mapped device.",
+                     evidence=[v.describe() for v in locked],
+                     source="disk", count=len(locked))
+        other = [v for v in unread if v not in locked]
+        if other:
+            self.add("MEDIUM", "Collection", "Volume present but not parsed",
+                     "These volumes hold a filesystem this tool does not "
+                     "read. They were not examined, which is not the same as "
+                     "their being empty.",
+                     evidence=[v.describe() for v in other],
+                     source="disk", count=len(other))
+        for note in getattr(col, "notes", None) or []:
+            if "cap was reached" in note or "stopped at" in note:
+                self.add("HIGH", "Collection", "The disk walk was truncated",
+                         "Not every file on this disk was read, so an absence "
+                         "below is not evidence of absence.",
+                         evidence=[note], source="disk")
+
     def _events_from_findings(self):
         """Put every dated finding on the timeline.
 
@@ -481,10 +532,13 @@ class Triage:
             hint = getattr(self.col, "time_hint", None)
             if hint:
                 self.collection_time = hint
+                # a disk image says which anchor it used and why; --file has
+                # no such statement to make, so it keeps the wording it had
+                note = getattr(self.col, "time_hint_note", "") or (
+                    "newest mtime of the files given with --file - no "
+                    "collection metadata to date this run")
                 self.meta["Collection finished"] = (
-                    hint.strftime("%Y-%m-%d %H:%M:%S UTC")
-                    + " (newest mtime of the files given with --file - no "
-                      "collection metadata to date this run)")
+                    hint.strftime("%Y-%m-%d %H:%M:%S UTC") + " (%s)" % note)
 
         if "Host UTC offset" not in self.meta:
             # said out loud, the same way the Velociraptor path does: uac.log is
@@ -492,6 +546,16 @@ class Triage:
             # host-local stamp below is being read as UTC
             self.meta["Host UTC offset"] = ("unknown - uac.log carried none, "
                                             "host-local log stamps read as UTC")
+
+        # a disk image describes itself: the container, the partitioning, the
+        # volumes found and the ones that could not be opened. These are facts
+        # about the evidence and belong in METADATA next to the collection's
+        # own, not only in the log of a run nobody kept
+        meta_rows = getattr(self.col, "meta_rows", None)
+        if callable(meta_rows):
+            for key, value in meta_rows().items():
+                self.meta[key] = value
+            self._disk_findings()
 
         routed = getattr(self.col, "routed", None)
         if routed:
