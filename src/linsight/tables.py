@@ -20,7 +20,10 @@ from .model import SEVERITIES
 from .term import Progress, status, trunc
 from .common import (
     BASELINE_SUID, FAILED_LOGIN_RULES, HACKTOOL_CAT, HACKTOOL_CTX_CAT,
-    HACKTOOL_CTX_RE, HACKTOOL_RE, HACKTOOL_SEVERITY, HACKTOOL_VARIANT_CAP,
+    HACKTOOL_CTX_RE, HACKTOOL_PATH_CAT, HACKTOOL_PATH_RE, HACKTOOL_RE,
+    HACKTOOL_SEVERITY, HACKTOOL_VARIANT_CAP,
+    SENSITIVE_FILE_BENIGN, SENSITIVE_FILE_EXPECTED,
+    SENSITIVE_FILE_RE, PRIVATE_KEY_DIR, PUBLIC_CERT_DIR,
     HACKTOOL_VARIANT_OTHER, NDJSON_TIME_COLUMNS, PRIVILEGED_GROUPS,
     PRIV_HINT_RE, TMPFS_DIRS, _printable, _ts_text, _tz_delta, epoch,
     hexip_to_str, human_size, ioc_mitre, ioc_type, match_failed_login,
@@ -474,14 +477,31 @@ class TableBuilder:
         """Every file in the collection - the 'did anything get missed' table."""
         t = self.table("FILE_INVENTORY", "Every file in the collection",
                        ["path", "host_path", "top_level", "category", "size_bytes",
-                        "size_human", "parsed_into"],
+                        "size_human", "mtime_utc", "atime_utc", "ctime_utc",
+                        "crtime_utc", "time_source", "parsed_into"],
                        "Collection",
-                       "One row per collected file, with the table that parsed "
-                       "it. Under a narrowed --scope, parsed_into says so for "
-                       "the half that was not read - an empty cell always means "
-                       "'offered to every extractor and taken by none'.")
+                       "One row per collected file, with its times and the "
+                       "table that parsed it. Under a narrowed --scope, "
+                       "parsed_into says so for the half that was not read - "
+                       "an empty cell always means 'offered to every extractor "
+                       "and taken by none'. time_source says where the times "
+                       "came from, because that decides what they mean: "
+                       "'bodyfile' and 'filesystem' are the host's own, read "
+                       "from the inode; 'archive' is the mtime the collector "
+                       "preserved into the tar or zip, which is the host's "
+                       "when it was collected with the flags to keep it; "
+                       "'collected file' is the extracted copy's own mtime and "
+                       "is the weakest of the three.")
         plen = len(self.col.prefix)
         rootfs = tuple(rd + "/" for rd in self.col.rootfs_dirs)
+        # The bodyfile is the authoritative record of the host's own times
+        # where the collection has one - it was read off the inodes. Anything
+        # else is what the container happened to preserve, so it is the
+        # fallback and is labelled as such rather than presented as equal.
+        meta = self._bodyfile_meta()
+        fallback = getattr(self.col, "time_source", "archive")
+        if self.col.kind == "dir":
+            fallback = "collected file"
         for low, real in sorted(self.col._names.items(), key=lambda kv: kv[1]):
             if not low.startswith(self.col.prefix):
                 continue
@@ -498,7 +518,22 @@ class TableBuilder:
                 ps = self.path_scope(rel, host or rel)
                 if ps and ps != self.scope:
                     into = "not read under --scope %s" % self.scope
-            t.add(rel, host, top, cat, size, human_size(size), into)
+            times = self.col.member_time(rel)
+            bf = meta.get(host) if host else None
+            if times[1] or times[2] or times[3]:
+                # the backend read the inode itself, so it has all four and
+                # the bodyfile - which on these backends is built from the
+                # same inodes - can only be a subset of it
+                mtime, atime, ctime, crtime = times
+                origin = self.col.time_source
+            elif bf and bf.get("mtime"):
+                mtime, atime, ctime, crtime = bf["mtime"], "", "", ""
+                origin = "bodyfile"
+            else:
+                mtime, atime, ctime, crtime = times
+                origin = fallback if mtime else ""
+            t.add(rel, host, top, cat, size, human_size(size),
+                  mtime, atime, ctime, crtime, origin, into)
 
     # -- 2. processes -------------------------------------------------------
     def t_processes(self):
@@ -6350,6 +6385,13 @@ class TableBuilder:
         ("CAPABILITIES", ("path",), "path"),
         ("FILE_HASHES", ("path",), "path"),
         ("BODYFILE", ("path",), "path"),
+        # Every collected filename, which is the only one of these that always
+        # exists. BODYFILE needs a collector that produced one and SUID_SGID
+        # needs a survey that ran, so on a collection with neither - and on
+        # loose files - a tool sitting on disk under its own name was named
+        # nowhere the sweep looked. FILE_INVENTORY has one row per file on
+        # every backend there is.
+        ("COLLECTED_FILES", ("path",), "path"),
         ("OPEN_FILES", ("name",), "path"),
         ("HIDDEN_PATHS", ("path",), "path"),
         # a scanner's User-Agent names the tool that ran; a requested path is
@@ -6374,6 +6416,35 @@ class TableBuilder:
     DISTRO_PATHS = ("/usr/share/", "/usr/src/", "/usr/lib/", "/usr/include/",
                     "/lib/", "/lib64/", "/usr/share/man/", "/usr/share/doc/",
                     "/var/lib/dpkg/", "/var/lib/rpm/", "/snap/", "/etc/alternatives/")
+
+    def _collected_files(self):
+        """Every collected filename, as a table the sweeps can read.
+
+        Not a real table and never exported - FILE_INVENTORY is that, and it
+        is built last because it reports on what every other extractor took.
+        The sweeps run before it, so without this the one artifact that exists
+        on every backend - the list of file names - was the one thing they
+        never looked at, and a tool sitting on disk under its own name went
+        unreported unless a bodyfile or a suid survey happened to name it too.
+        """
+        cached = getattr(self, "_collected_files_table", None)
+        if cached is not None:
+            return cached
+        t = Table("COLLECTED_FILES", "Collected file names", ["path", "mtime_utc"],
+                  "Collection", "", None)
+        plen = len(self.col.prefix)
+        for low, real in self.col._names.items():
+            if not low.startswith(self.col.prefix):
+                continue
+            rel = real[plen:]
+            host = self.col.host_path(rel)
+            try:
+                mtime = self.col.member_time(rel)[0]
+            except Exception:
+                mtime = ""
+            t.add(host or rel, mtime)
+        self._collected_files_table = t
+        return t
 
     def t_hacktools(self):
         """Named offensive tooling, hunted across every artifact that names one.
@@ -6402,6 +6473,7 @@ class TableBuilder:
                        "raised per tool. They count every reference, not the "
                        "twelve per table kept as samples.")
         by_name = {tb.name: tb for tb in self.tables}
+        by_name["COLLECTED_FILES"] = self._collected_files()
         extra = self._extra_keywords()
         # --no-hunt turns off the built-in list but never the terms the user
         # explicitly asked for: passing both should hunt exactly those
@@ -6421,7 +6493,14 @@ class TableBuilder:
             if not idxs:
                 continue
             ts_i = self.row_time_index(cols)
-            tiers = [(HACKTOOL_RE, HACKTOOL_CAT, False)] if builtin else []
+            # A path or a command line can hold a filename, where a tool name
+            # arrives glued to a version or a suffix; free log text cannot, and
+            # there the strict boundaries are what keep an ordinary sentence
+            # from matching.
+            if kind in ("command", "path"):
+                tiers = [(HACKTOOL_PATH_RE, HACKTOOL_PATH_CAT, False)] if builtin else []
+            else:
+                tiers = [(HACKTOOL_RE, HACKTOOL_CAT, False)] if builtin else []
             if builtin and kind in ("command", "path"):
                 tiers.append((HACKTOOL_CTX_RE, HACKTOOL_CTX_CAT, True))
             for row in tb.iter_rows():
@@ -7556,6 +7635,94 @@ class TableBuilder:
                   _fs_ts(node.mtime), _fs_ts(node.ctime), _fs_ts(node.crtime),
                   _fs_ts(node.dtime))
 
+    def t_sensitive_files(self):
+        """Credential material and secrets, found by what the file is called.
+
+        Nothing here is opened. That is the point: the question "what secrets
+        were sitting on this host, and where" is one an analyst asks early,
+        and on a collection that took names and metadata but not contents it
+        cannot be asked any other way. A name is weaker evidence than a
+        content match and it is available for every file there is.
+
+        Distribution paths are excluded rather than down-ranked. Python ships
+        secrets.py, OpenSSL ships test keys, and every package manager has an
+        example credentials file - including them turns the one private key in
+        /home into row four hundred of a table nobody reads.
+        """
+        t = self.table("SENSITIVE_FILES", "Credential material by filename",
+                       ["severity", "host_path", "basename", "directory",
+                        "what", "why", "size_bytes", "size_human",
+                        "mtime_utc", "owner", "mode", "source"],
+                       "Detection",
+                       "Files whose name says they hold key material, "
+                       "passwords or credentials. Matched on the name alone - "
+                       "nothing is opened - so this answers 'what secrets were "
+                       "on this host' even for a collection that took metadata "
+                       "and not contents. Distribution and packaging paths are "
+                       "excluded: they carry test keys and example credentials "
+                       "by the hundred, and none of them is a finding.")
+        meta = self._bodyfile_meta()
+        plen = len(self.col.prefix)
+        rootfs = tuple(rd + "/" for rd in self.col.rootfs_dirs)
+        seen = set()
+        groups = {}
+        for low, real in sorted(self.col._names.items(), key=lambda kv: kv[1]):
+            if not low.startswith(self.col.prefix):
+                continue
+            rel = real[plen:]
+            if not rel.lstrip("/").lower().startswith(rootfs):
+                continue                  # command output is not a host file
+            host = self.col.host_path(rel)
+            if not host or host in seen:
+                continue
+            if SENSITIVE_FILE_BENIGN.search(host):
+                continue
+            if SENSITIVE_FILE_EXPECTED.match(host):
+                continue
+            if PUBLIC_CERT_DIR.search(host) and not PRIVATE_KEY_DIR.search(host):
+                continue
+            # a directory named for keys holds the files that are the finding;
+            # reporting both says the same thing twice
+            if self.col.member_kind(rel) == "d":
+                continue
+            best = None
+            for rx, what, sev, why in SENSITIVE_FILE_RE:
+                if not rx.search(host):
+                    continue
+                if best is None or SEVERITIES.index(sev) < SEVERITIES.index(best[1]):
+                    best = (what, sev, why)
+            if best is None:
+                continue
+            seen.add(host)
+            what, sev, why = best
+            bf = meta.get(host, {})
+            mtime = bf.get("mtime") or self.col.member_time(rel)[0]
+            size = self.col._sizes.get(low, 0)
+            t.add(sev, host, os.path.basename(host), os.path.dirname(host),
+                  what, why, size, human_size(size), mtime,
+                  self.uid_name(bf.get("uid", "")) or bf.get("uid", ""),
+                  bf.get("mode", ""), rel)
+            self.use(rel, "SENSITIVE_FILES")
+            groups.setdefault((sev, what, why), []).append((host, mtime))
+
+        # One finding per kind rather than per file: forty SSH keys under
+        # /home is one fact about the host, and forty findings about it push
+        # everything else off the page.
+        for (sev, what, why), rows in sorted(
+                groups.items(), key=lambda kv: SEVERITIES.index(kv[0][0])):
+            rows.sort()
+            self.tri.add(sev, "Filesystem",
+                         "Credential material on disk: %s" % what,
+                         "%s. Matched on the filename alone - the contents "
+                         "were not read - so treat each as a lead to confirm "
+                         "rather than as a confirmed secret."
+                         % (why[0].upper() + why[1:]),
+                         evidence=["%s%s" % (h, "   %s" % m if m else "")
+                                   for h, m in rows[:40]],
+                         source="SENSITIVE_FILES", count=len(rows),
+                         times=[m for _h, m in rows if m],
+                         mitre="T1552 Unsecured Credentials")
+
     # -- driver -------------------------------------------------------------
     EXTRACTORS = [
         "t_metadata", "t_disk_layout", "t_collection_log",
@@ -7601,6 +7768,7 @@ class TableBuilder:
         # views, which are snapshots of that list rather than artifacts in
         # their own right. Ordering them the other way silently dropped every
         # rule hit out of FINDINGS and the console report.
+        "t_sensitive_files",
         "t_hacktools", "t_yara", "t_sigma", "t_pivot", "t_rule_errors",
         "t_findings", "t_timeline",
         # why an artifact above is absent, before the list of what is left
@@ -7659,7 +7827,7 @@ class TableBuilder:
         "t_editor_history", "t_ld_preload",
         "t_suid", "t_getcap", "t_mac_policy", "t_writable", "t_hidden_files",
         "t_unknown_owner", "t_socket_files", "t_dev_files", "t_bodyfile",
-        "t_deleted_files", "t_disk_layout",
+        "t_deleted_files", "t_disk_layout", "t_sensitive_files",
         "t_file_hashes", "t_user_artifacts", "t_package_logs",
         "t_journal", "t_audit_log", "t_login_records", "t_wtmpdb", "t_lastlog",
         "t_web_logs", "t_web_config", "t_samba_logs", "t_firewall_log",

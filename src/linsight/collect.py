@@ -148,6 +148,20 @@ HOST_ANCHORS = ("etc", "var", "usr", "root", "home", "run", "opt", "srv",
 TEXT_FALLBACK = "/var/log/{name}"
 
 
+def _zip_time(zi):
+    """A zip member's mtime as an epoch, or 0.
+
+    Zip stores local time with no zone and two-second resolution, so this is
+    the host's clock rather than UTC. It is still the collector's own record
+    of when the file was last written, which is worth more than nothing - and
+    the table that prints it says where it came from.
+    """
+    try:
+        return datetime(*zi.date_time).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return 0
+
+
 def route_artifact(name, rel=None, is_text=True):
     """Loose file -> (destination, how it was decided).
 
@@ -181,6 +195,7 @@ class Collection:
         self._tar = None
         self._zip = None
         self._sizes = {}
+        self._mtimes = {}         # lowercase relative name -> epoch, where known
         self._names = {}          # lowercase relative name -> the same name, cased
         self._raw = {}            # lowercase relative name -> archive member name
         self.prefix = ""          # archive dir that holds the layout's marker
@@ -215,18 +230,56 @@ class Collection:
             n = n[2:]
         return n.lstrip("/")
 
-    def _add_member(self, rel, raw, size):
+    def _add_member(self, rel, raw, size, mtime=None):
         """Record one file under its normalised name.
 
         _names carries the normalised name so that everything a glob or a walk
         hands back can be fed straight to read_bytes(); _raw carries whatever
         the archive actually calls it, which only _open() needs.
+
+        `mtime` is what the container says about the file's modification time,
+        as an epoch. On a tar or a zip of a copied filesystem that is the
+        host's own mtime, preserved by the collector - which makes it evidence
+        rather than bookkeeping, and is why it is kept for every member rather
+        than looked up later for the few that get parsed.
         """
         key = rel.lower()
         self._names[key] = rel
         self._sizes[key] = size
+        if mtime:
+            self._mtimes[key] = mtime
         if raw != rel:
             self._raw[key] = raw
+
+    def member_kind(self, rel):
+        """'f', 'd', 'l' or '' - what this member is, where the backend knows.
+
+        A directory listing backend has only files in it, so the base answer
+        is 'f'. The backends that read a filesystem know better and say so.
+        """
+        return "f"
+
+    #: What a member time means for this backend, said out loud because it
+    #: differs and the difference matters. Overridden by the backends that
+    #: read the source filesystem's own metadata.
+    time_source = "archive"
+
+    def member_time(self, rel):
+        """(mtime, atime, ctime, crtime) for a member, as UTC strings.
+
+        Only mtime is knowable from an archive or a directory listing. The
+        backends that read a filesystem themselves - a disk, an AD1 - override
+        this and answer all four.
+        """
+        key = (self.prefix + rel.lstrip("/")).lower()
+        stamp = self._mtimes.get(key)
+        if not stamp:
+            return ("", "", "", "")
+        try:
+            return (datetime.fromtimestamp(stamp, timezone.utc)
+                    .strftime("%Y-%m-%d %H:%M:%S"), "", "", "")
+        except (OverflowError, OSError, ValueError):
+            return ("", "", "", "")
 
     def _load(self):
         if os.path.isdir(self.path):
@@ -240,7 +293,11 @@ class Collection:
                         size = os.path.getsize(full)
                     except OSError:
                         size = 0
-                    self._add_member(rel, rel, size)
+                    try:
+                        mtime = os.path.getmtime(full)
+                    except OSError:
+                        mtime = 0
+                    self._add_member(rel, rel, size, mtime)
         elif zipfile.is_zipfile(self.path):
             self.kind = "zip"
             self._zip = zipfile.ZipFile(self.path)
@@ -253,7 +310,8 @@ class Collection:
                 rel = self._norm_member(zi.filename)
                 if not rel:
                     continue
-                self._add_member(rel, zi.filename, zi.file_size)
+                self._add_member(rel, zi.filename, zi.file_size,
+                                 _zip_time(zi))
             self._check_sealed(encrypted)
         else:
             self._check_foreign()
@@ -285,7 +343,7 @@ class Collection:
                 rel = self._norm_member(ti.name)
                 if not rel:
                     continue
-                self._add_member(rel, ti.name, ti.size)
+                self._add_member(rel, ti.name, ti.size, ti.mtime)
         if not self._names:
             raise SystemExit("[!] no readable files found in %s" % self.path)
 
@@ -623,9 +681,11 @@ class FilesCollection(Collection):
     def __init__(self, specs, quiet=False):
         self.path = "loose files"
         self.kind = "files"
+        self.time_source = "collected file"
         self._tar = None
         self._zip = None
         self._sizes = {}
+        self._mtimes = {}
         self._names = {}
         self._raw = {}             # unused here - members are already normalised
         self._disk = {}            # synthetic member name -> real path on disk
@@ -686,6 +746,12 @@ class FilesCollection(Collection):
             member = self._member(dest)
             self._names[member.lower()] = member
             self._sizes[member.lower()] = size
+            # the loose file's own mtime, which is the host's when the file
+            # was copied off with its metadata and the copy's when it was not
+            try:
+                self._mtimes[member.lower()] = os.path.getmtime(real)
+            except OSError:
+                pass
             self._disk[member] = real
             self.routed.append((real, member, how))
             if self.time_hint is None or mtime > self.time_hint:
