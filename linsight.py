@@ -14521,6 +14521,7 @@ class TableBuilder:
         self.timings = []             # (label, seconds, rows) when --timing
         self.progress = Progress(1, "", False)
         self._gid_names = None        # lazily built gid -> group name
+        self._home_map = None         # lazily built home dir -> username
         self._exe_hash_map = None     # lazily built path -> {md5, sha1, sha256}
         self._proc_merged = None      # t_process_master's join, reused by the tree
 
@@ -17241,21 +17242,23 @@ class TableBuilder:
                     member_of[mem.strip()].append(f[0])
         # ssh material and per-user shell history, keyed by home directory owner
         akeys, privkeys, hist = defaultdict(int), defaultdict(list), defaultdict(int)
-        for pat in ("/root/.ssh/authorized_keys*", "/home/*/.ssh/authorized_keys*"):
-            for rel in self.col.rootfs_glob(pat):
-                owner = self._home_owner(self.col.host_path(rel))
-                akeys[owner] += sum(
-                    1 for l in self.col.lines(rel)
-                    if l.strip() and not l.strip().startswith("#"))
-        for pat in ("/root/.ssh/id_*", "/home/*/.ssh/id_*"):
-            for rel in self.col.rootfs_glob(pat):
-                host = self.col.host_path(rel)
-                if not host.endswith(".pub"):
-                    privkeys[self._home_owner(host)].append(os.path.basename(host))
-        for pat in ("/root/.*history*", "/home/*/.*history*"):
-            for rel in self.col.rootfs_glob(pat):
-                hist[self._home_owner(self.col.host_path(rel))] += sum(
-                    1 for l in self.col.lines(rel) if l.strip())
+        # The home globs overlap by construction - /home/* and the /home/alice
+        # that /etc/passwd declares match the same file - so every one of
+        # these counts each file once. Without that, an account whose home is
+        # under /home has its history and its keys counted twice, which is a
+        # wrong number in a column an analyst reads as a fact.
+        for rel in self._home_files(".ssh/authorized_keys*"):
+            owner = self.home_owner(self.col.host_path(rel))
+            akeys[owner] += sum(
+                1 for l in self.col.lines(rel)
+                if l.strip() and not l.strip().startswith("#"))
+        for rel in self._home_files(".ssh/id_*"):
+            host = self.col.host_path(rel)
+            if not host.endswith(".pub"):
+                privkeys[self.home_owner(host)].append(os.path.basename(host))
+        for rel in self._home_files(".*history*"):
+            hist[self.home_owner(self.col.host_path(rel))] += sum(
+                1 for l in self.col.lines(rel) if l.strip())
         # sudo rules naming the account directly
         sudo_for = defaultdict(list)
         sfiles = [r for r in [self.col.rootfs("/etc/sudoers")] if r] + \
@@ -17314,6 +17317,81 @@ class TableBuilder:
     def _home_owner(host_path):
         m = re.match(r"/home/([^/]+)/", host_path)
         return m.group(1) if m else ("root" if host_path.startswith("/root/") else "")
+
+    #: Homes that name nowhere. Distributions point service accounts at these
+    #: precisely so that nothing is stored for them, and globbing under them
+    #: searches the whole filesystem or nothing at all.
+    NON_HOMES = ("", "/", "/nonexistent", "/dev/null", "/bin/false",
+                 "/usr/sbin/nologin", "/none", "/no/home")
+
+    def homes(self):
+        """{home directory -> username}, as /etc/passwd declares them.
+
+        A home is wherever passwd says it is, and on a server that is
+        routinely not /home. www-data lives in /var/www, postgres in
+        /var/lib/postgresql, an application account in /opt/<app> or
+        /srv/<service> - and a compromised service account is exactly the one
+        whose shell history matters, because it is the account a web shell
+        runs as. Globbing /home/*/ finds none of them.
+
+        /root and /home/* stay in the search regardless of what passwd says.
+        A home directory with no account behind it is not an absence of
+        evidence: it is what an account deleted after the fact leaves, and the
+        history in it is the reason to care.
+        """
+        if getattr(self, "_home_map", None) is not None:
+            return self._home_map
+        out = {}
+        rel = self.col.rootfs("/etc/passwd")
+        for ln in (self.col.lines(rel) if rel else []):
+            f = ln.split(":")
+            if len(f) < 6 or ln.startswith("#"):
+                continue
+            name, home = f[0].strip(), f[5].strip().rstrip("/")
+            if not name or home in self.NON_HOMES or not home.startswith("/"):
+                continue
+            out.setdefault(home, name)
+        self._home_map = out
+        return out
+
+    def home_owner(self, host_path):
+        """Which account's home a path sits in, by the longest home that fits.
+
+        Longest wins because homes nest: /var and /var/www can both be homes,
+        and a file under /var/www belongs to the account that lives there
+        rather than to the one above it.
+        """
+        best, who = "", ""
+        for home, name in self.homes().items():
+            if (host_path == home or host_path.startswith(home + "/"))                     and len(home) > len(best):
+                best, who = home, name
+        if who:
+            return who
+        return self._home_owner(host_path)
+
+    def _home_files(self, *suffixes):
+        """Every distinct file matching these names under any home."""
+        out, seen = [], set()
+        for pat in self.home_globs(*suffixes):
+            for rel in self.col.rootfs_glob(pat):
+                key = rel.lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(rel)
+        return out
+
+    def home_globs(self, *suffixes):
+        """Every place to look for a per-user artifact, given its name(s).
+
+        The classic two are always searched, so a home directory left behind
+        by a deleted account is still read; everything /etc/passwd declares is
+        searched as well.
+        """
+        roots = ["/root", "/home/*"]
+        for home in sorted(self.homes()):
+            if home not in roots:
+                roots.append(home)
+        return [r + "/" + s.lstrip("/") for r in roots for s in suffixes]
 
     def _login_summaries(self):
         """username -> (last login utc, from where), and -> failed-login count."""
@@ -18172,13 +18250,12 @@ class TableBuilder:
                         "command"], "Execution",
                        "Every history file, in file order. bash/zsh timestamp "
                        "markers are decoded rather than listed as commands.")
-        pats = ["/root/.*history*", "/home/*/.*history*", "/root/.*_history",
-                "/home/*/.*_history", "/root/.mysql_history",
-                "/home/*/.mysql_history", "/root/.histfile", "/home/*/.histfile",
-                "/root/.local/share/fish/fish_history",
-                "/home/*/.local/share/fish/fish_history",
-                "/root/.config/fish/fish_history",
-                "/home/*/.config/fish/fish_history"]
+        # Every home /etc/passwd declares, not just /home/* - see homes().
+        pats = self.home_globs(
+            ".*history*", ".*_history", ".mysql_history", ".histfile",
+            ".local/share/fish/fish_history", ".config/fish/fish_history",
+            ".bash_history", ".sh_history", ".zsh_history", ".ash_history",
+            ".local/share/nu/history.txt")
         zsh_rx = re.compile(r"^:\s*(\d+):\d+;(.*)$")
         seen = set()
         for pat in pats:
@@ -18192,8 +18269,7 @@ class TableBuilder:
                          "bash" if "bash" in base else "sh" if base in
                          (".sh_history", ".histfile") else
                          base.lstrip(".").replace("_history", ""))
-                m = re.match(r"/home/([^/]+)/", host)
-                user = m.group(1) if m else ("root" if host.startswith("/root/") else "")
+                user = self.home_owner(host)
                 pending = ""
                 for i, ln in enumerate(self.lines(rel, "SHELL_HISTORY"), 1):
                     s = ln.rstrip()
