@@ -536,7 +536,7 @@ HACKTOOL_AMBIGUOUS = {
 }
 
 
-def _tool_regex(groups):
+def _tool_regex(groups, loose=False):
     """One alternation for the whole tier, so a cell costs a single pass.
 
     This is what the function always claimed to do and did not: it compiled one
@@ -564,11 +564,27 @@ def _tool_regex(groups):
     # not preceded/followed by a word character, so 'john' does not fire on
     # 'johnson' and 'cdk' does not fire on 'cdkit'; a leading '/' or '-' is
     # fine because that is how these appear in paths and argv
+    if loose:
+        # The same rule, relaxed for the one place it was wrong: a filename.
+        # '_' is a word character, so the strict form cannot see the tool in
+        # 'mimikatz_name.zip' - and a downloaded tool is named exactly like
+        # that, or 'linpeas_linux_amd64', or 'nmap-7.94.tar.gz'. Only a letter
+        # may not follow, which still stops 'johnson' and 'cdkit', while an
+        # underscore, a hyphen, a dot or a version number may.
+        return re.compile(r"(?<![A-Za-z0-9])(%s)(?![A-Za-z])" % alt), cats
     return re.compile(r"(?<![\w.])(%s)(?![\w-])" % alt), cats
 
 
 HACKTOOL_RE, HACKTOOL_CAT = _tool_regex(HACKTOOL_UNAMBIGUOUS)
 HACKTOOL_CTX_RE, HACKTOOL_CTX_CAT = _tool_regex(HACKTOOL_AMBIGUOUS)
+# The unambiguous names again, with filename punctuation allowed around them.
+# Used where the cell is a path or a command line - somewhere a filename can
+# legitimately be - and never on free log text, where the strict form is what
+# keeps an ordinary sentence from firing. The ambiguous tier never gets this:
+# 'nmap' and 'john' are words, and loosening their boundaries in a path is how
+# a wordlist directory becomes a page of findings.
+HACKTOOL_PATH_RE, HACKTOOL_PATH_CAT = _tool_regex(HACKTOOL_UNAMBIGUOUS,
+                                                  loose=True)
 # how bad a name is, before the context it was found in is considered
 HACKTOOL_SEVERITY = {
     "credential access": "CRITICAL", "active directory attack": "HIGH",
@@ -577,6 +593,114 @@ HACKTOOL_SEVERITY = {
     "cryptomining": "CRITICAL", "container escape": "HIGH",
     "exfiltration staging": "HIGH",
 }
+
+#: A word boundary for filenames. '_' counts as a word character to , which
+#: is why 'db_secrets.txt' does not match secrets - so a separator, a
+#: digit or a path element may touch the word, and only a letter may not.
+NAME_EDGE = r"(?<![A-Za-z])(?:%s)(?![A-Za-z])"
+
+# Filenames that say what a file is for, when what it is for is a secret.
+#
+# This is a name check, not a content check: nothing here is opened. What it
+# answers is the question an analyst asks early and cannot otherwise ask at
+# all - what credential material was sitting on this host, and where - and it
+# answers it for a collection that never had the file's contents in it.
+#
+# (pattern, what it is, how bad, why)
+SENSITIVE_FILE_PATTERNS = (
+    # -- private keys, which are the whole prize -------------------------
+    (r"(^|/)id_(rsa|dsa|ecdsa|ed25519|xmss)$", "ssh private key", "HIGH",
+     "an unencrypted SSH private key grants whatever it was trusted for"),
+    (r"\.(pem|key|pfx|p12|jks|keystore|ppk)$", "private key / keystore", "HIGH",
+     "key material, usable wherever the certificate was trusted"),
+    (r"(^|/)(server|client|ca|root|priv|private)[._-]?key", "private key",
+     "HIGH", "key material named for what it signs"),
+    # -- password stores -------------------------------------------------
+    (r"\.(kdbx|kdb|psafe3|agilekeychain|opvault|1pif)$", "password database",
+     "HIGH", "a password manager's vault"),
+    (r"(^|/)wallet\.dat$", "cryptocurrency wallet", "HIGH",
+     "a wallet file is bearer access to its funds"),
+    # -- credentials in configuration ------------------------------------
+    (r"(^|/)\.?(netrc|pgpass|my\.cnf|pypirc|npmrc)$",
+     "credentials in a config file", "MEDIUM",
+     "these formats hold plaintext passwords by design"),
+    (r"(^|/)\.git-credentials$", "stored git credentials", "HIGH",
+     "git writes these in plaintext"),
+    (r"(^|/)credentials$|(^|/)\.aws/", "cloud credentials", "HIGH",
+     "long-lived cloud keys"),
+    (r"(^|/)(kubeconfig|\.kube/config)$", "kubernetes credentials", "HIGH",
+     "cluster-admin in a file"),
+    (r"(^|/)\.docker/config\.json$", "docker registry credentials", "MEDIUM",
+     "registry tokens, often base64 rather than encrypted"),
+    (r"(^|/)\.env$|(^|/)\.env\.", "environment file", "MEDIUM",
+     "application secrets are conventionally kept here"),
+    (r"(^|/)\.?(ovpn|openvpn)|\.ovpn$", "vpn profile", "MEDIUM",
+     "may embed the key that gets onto the network"),
+    # -- named for what they hold ----------------------------------------
+    #
+    # These use NAME_EDGE rather than  on both sides. '_' is a word
+    # character, so secret cannot see the word in 'db_secrets.txt' - and
+    # a file someone named for its contents is called exactly that. The edge
+    # below lets a separator or a digit sit next to the word and still
+    # excludes a letter, so 'secretariat' and 'tokenizer' stay out.
+    (NAME_EDGE % "secrets?", "named 'secret'", "MEDIUM",
+     "named for its contents"),
+    (NAME_EDGE % "passwords?", "named 'password'", "MEDIUM",
+     "named for its contents"),
+    (NAME_EDGE % "passwd(?!$)", "named 'passwd'", "MEDIUM",
+     "a passwd file somewhere other than /etc"),
+    (NAME_EDGE % "creds?|credentials?", "named 'credentials'", "MEDIUM",
+     "named for its contents"),
+    (NAME_EDGE % ("api[._-]?keys?|access[._-]?keys?|secret[._-]?keys?|"
+                  "private[._-]?keys?|auth[._-]?tokens?|bearer[._-]?tokens?"),
+     "named for a key or token", "MEDIUM", "named for its contents"),
+    (NAME_EDGE % "tokens?", "named 'token'", "LOW", "named for its contents"),
+    # -- copies of the account database ----------------------------------
+    (r"(^|/)(shadow|passwd|gshadow)[.~-]", "copy of an account database",
+     "HIGH", "a copy of /etc/shadow outside /etc is staged loot"),
+    (r"(^|/)(shadow|passwd)\.(bak|old|orig|save|copy|txt|[0-9]+)$",
+     "copy of an account database", "HIGH",
+     "a copy of /etc/shadow outside /etc is staged loot"),
+    # -- database and memory dumps ---------------------------------------
+    (r"\.(sql|sqldump|dmp|dump)$", "database or memory dump", "MEDIUM",
+     "a dump is the data, already extracted"),
+    (r"(^|/)(lsass|ntds)", "credential store dump", "HIGH",
+     "the Windows credential stores, staged on a Linux host"),
+)
+SENSITIVE_FILE_RE = tuple(
+    (re.compile(p, re.I), what, sev, why)
+    for p, what, sev, why in SENSITIVE_FILE_PATTERNS)
+
+# Where a name like this is the distribution's own word rather than a finding.
+# Python ships secrets.py, OpenSSL ships test keys, and every package manager
+# has a 'credentials' example - matching those produces a page of noise that
+# buries the one key in /home that mattered.
+SENSITIVE_FILE_BENIGN = re.compile(
+    r"^/(usr/(share|src|lib|include|local/lib)|lib|lib64|opt/[^/]+/lib|"
+    r"snap|var/lib/(dpkg|rpm|apt|pacman)|etc/alternatives|"
+    r"var/cache/(apt|yum|dnf|pacman)|"
+    # the bootloader ships password.mod and legacy_password_test.mod, which
+    # are code for handling passwords rather than anybody's password
+    r"boot/(grub2?|efi|loader)|"
+    # configuration *about* authentication, which every host has and none of
+    # which is a credential: PAM stacks, AppArmor profiles, XDG autostart
+    r"etc/(pam\.d|pam\.conf\.d|apparmor\.d|xdg|security)|"
+    r"etc/(fwupd|pki/fwupd[^/]*))/|"
+    r"(^|/)(test|tests|testdata|fixtures?|examples?|samples?|docs?|"
+    r"node_modules|site-packages|dist-packages|vendor|\.git)/", re.I)
+
+#: The account databases' own rotation backups. shadow-utils writes these on
+#: every change and every host has them, so they are the baseline rather than
+#: staged loot - a copy of /etc/shadow anywhere else still is.
+SENSITIVE_FILE_EXPECTED = re.compile(
+    r"^/etc/(passwd|shadow|group|gshadow|subuid|subgid)-$", re.I)
+
+#: Directories that hold public certificates by definition. A .pem here is the
+#: public half, which is not a secret - unless the path also says 'private',
+#: which is where a CA keeps the half that is.
+PUBLIC_CERT_DIR = re.compile(
+    r"/(certs|certs_by_serial|ca-certificates|ca-trust|issued|reqs)/", re.I)
+PRIVATE_KEY_DIR = re.compile(r"/private/", re.I)
 
 # known Linux rootkit / offensive tool module and file names
 ROOTKIT_NAMES = [
@@ -1537,6 +1661,20 @@ HOST_ANCHORS = ("etc", "var", "usr", "root", "home", "run", "opt", "srv",
 TEXT_FALLBACK = "/var/log/{name}"
 
 
+def _zip_time(zi):
+    """A zip member's mtime as an epoch, or 0.
+
+    Zip stores local time with no zone and two-second resolution, so this is
+    the host's clock rather than UTC. It is still the collector's own record
+    of when the file was last written, which is worth more than nothing - and
+    the table that prints it says where it came from.
+    """
+    try:
+        return datetime(*zi.date_time).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return 0
+
+
 def route_artifact(name, rel=None, is_text=True):
     """Loose file -> (destination, how it was decided).
 
@@ -1570,6 +1708,7 @@ class Collection:
         self._tar = None
         self._zip = None
         self._sizes = {}
+        self._mtimes = {}         # lowercase relative name -> epoch, where known
         self._names = {}          # lowercase relative name -> the same name, cased
         self._raw = {}            # lowercase relative name -> archive member name
         self.prefix = ""          # archive dir that holds the layout's marker
@@ -1604,18 +1743,56 @@ class Collection:
             n = n[2:]
         return n.lstrip("/")
 
-    def _add_member(self, rel, raw, size):
+    def _add_member(self, rel, raw, size, mtime=None):
         """Record one file under its normalised name.
 
         _names carries the normalised name so that everything a glob or a walk
         hands back can be fed straight to read_bytes(); _raw carries whatever
         the archive actually calls it, which only _open() needs.
+
+        `mtime` is what the container says about the file's modification time,
+        as an epoch. On a tar or a zip of a copied filesystem that is the
+        host's own mtime, preserved by the collector - which makes it evidence
+        rather than bookkeeping, and is why it is kept for every member rather
+        than looked up later for the few that get parsed.
         """
         key = rel.lower()
         self._names[key] = rel
         self._sizes[key] = size
+        if mtime:
+            self._mtimes[key] = mtime
         if raw != rel:
             self._raw[key] = raw
+
+    def member_kind(self, rel):
+        """'f', 'd', 'l' or '' - what this member is, where the backend knows.
+
+        A directory listing backend has only files in it, so the base answer
+        is 'f'. The backends that read a filesystem know better and say so.
+        """
+        return "f"
+
+    #: What a member time means for this backend, said out loud because it
+    #: differs and the difference matters. Overridden by the backends that
+    #: read the source filesystem's own metadata.
+    time_source = "archive"
+
+    def member_time(self, rel):
+        """(mtime, atime, ctime, crtime) for a member, as UTC strings.
+
+        Only mtime is knowable from an archive or a directory listing. The
+        backends that read a filesystem themselves - a disk, an AD1 - override
+        this and answer all four.
+        """
+        key = (self.prefix + rel.lstrip("/")).lower()
+        stamp = self._mtimes.get(key)
+        if not stamp:
+            return ("", "", "", "")
+        try:
+            return (datetime.fromtimestamp(stamp, timezone.utc)
+                    .strftime("%Y-%m-%d %H:%M:%S"), "", "", "")
+        except (OverflowError, OSError, ValueError):
+            return ("", "", "", "")
 
     def _load(self):
         if os.path.isdir(self.path):
@@ -1629,7 +1806,11 @@ class Collection:
                         size = os.path.getsize(full)
                     except OSError:
                         size = 0
-                    self._add_member(rel, rel, size)
+                    try:
+                        mtime = os.path.getmtime(full)
+                    except OSError:
+                        mtime = 0
+                    self._add_member(rel, rel, size, mtime)
         elif zipfile.is_zipfile(self.path):
             self.kind = "zip"
             self._zip = zipfile.ZipFile(self.path)
@@ -1642,7 +1823,8 @@ class Collection:
                 rel = self._norm_member(zi.filename)
                 if not rel:
                     continue
-                self._add_member(rel, zi.filename, zi.file_size)
+                self._add_member(rel, zi.filename, zi.file_size,
+                                 _zip_time(zi))
             self._check_sealed(encrypted)
         else:
             self._check_foreign()
@@ -1674,7 +1856,7 @@ class Collection:
                 rel = self._norm_member(ti.name)
                 if not rel:
                     continue
-                self._add_member(rel, ti.name, ti.size)
+                self._add_member(rel, ti.name, ti.size, ti.mtime)
         if not self._names:
             raise SystemExit("[!] no readable files found in %s" % self.path)
 
@@ -2012,9 +2194,11 @@ class FilesCollection(Collection):
     def __init__(self, specs, quiet=False):
         self.path = "loose files"
         self.kind = "files"
+        self.time_source = "collected file"
         self._tar = None
         self._zip = None
         self._sizes = {}
+        self._mtimes = {}
         self._names = {}
         self._raw = {}             # unused here - members are already normalised
         self._disk = {}            # synthetic member name -> real path on disk
@@ -2075,6 +2259,12 @@ class FilesCollection(Collection):
             member = self._member(dest)
             self._names[member.lower()] = member
             self._sizes[member.lower()] = size
+            # the loose file's own mtime, which is the host's when the file
+            # was copied off with its metadata and the copy's when it was not
+            try:
+                self._mtimes[member.lower()] = os.path.getmtime(real)
+            except OSError:
+                pass
             self._disk[member] = real
             self.routed.append((real, member, how))
             if self.time_hint is None or mtime > self.time_hint:
@@ -7157,6 +7347,7 @@ class DiskCollection(Collection):
         self._tar = None
         self._zip = None
         self._sizes = {}
+        self._mtimes = {}
         self._names = {}
         self._raw = {}
         self.prefix = ""
@@ -7477,6 +7668,20 @@ class DiskCollection(Collection):
         except Exception:
             return None
 
+    time_source = "filesystem"
+
+    def member_kind(self, rel):
+        node = self._nodes.get(self.resolve(rel) or "")
+        return node.kind if node is not None else ""
+
+    def member_time(self, rel):
+        """All four times, read from the inode rather than from a container."""
+        node = self._nodes.get(self.resolve(rel) or "")
+        if node is None:
+            return ("", "", "", "")
+        return (_stamp(node.mtime), _stamp(node.atime), _stamp(node.ctime),
+                _stamp(node.crtime))
+
     def node(self, rel):
         """The FsNode behind a collection-relative path, or None."""
         return self._nodes.get(self.resolve(rel) or "")
@@ -7584,6 +7789,16 @@ def looks_like_disk_arg(path):
         return looks_like_disk(path)
     except Exception:
         return False
+
+
+def _stamp(when):
+    """A filesystem time as the string every table prints, or ''."""
+    if not when:
+        return ""
+    try:
+        return when.strftime("%Y-%m-%d %H:%M:%S")
+    except (AttributeError, ValueError):
+        return ""
 
 # -------------------------------------------------------------------------
 # AccessData logical images (AD1), as a collection
@@ -8094,6 +8309,7 @@ class Ad1Collection(Collection):
         self._tar = None
         self._zip = None
         self._sizes = {}
+        self._mtimes = {}
         self._names = {}
         self._raw = {}
         self.prefix = ""
@@ -8314,6 +8530,20 @@ class Ad1Collection(Collection):
         except Exception:
             return None
 
+    time_source = "the AD1's recorded metadata"
+
+    def member_kind(self, rel):
+        e = self._entries.get(self.resolve(rel) or "")
+        return e.kind if e is not None else ""
+
+    def member_time(self, rel):
+        """All four times, as FTK recorded them from the source filesystem."""
+        e = self._entries.get(self.resolve(rel) or "")
+        if e is None:
+            return ("", "", "", "")
+        return (_stamp_ad1(e.mtime), _stamp_ad1(e.atime), _stamp_ad1(e.ctime),
+                _stamp_ad1(e.crtime))
+
     def entry(self, rel):
         """The Ad1Entry behind a collection-relative path, or None."""
         return self._entries.get(self.resolve(rel) or "")
@@ -8345,6 +8575,15 @@ def _md5(data):
 
 def _sha1(data):
     return hashlib.sha1(data).hexdigest()
+
+
+def _stamp_ad1(when):
+    if not when:
+        return ""
+    try:
+        return when.strftime("%Y-%m-%d %H:%M:%S")
+    except (AttributeError, ValueError):
+        return ""
 
 # -------------------------------------------------------------------------
 # detection rules: a YARA subset and a Sigma subset
@@ -13792,14 +14031,31 @@ class TableBuilder:
         """Every file in the collection - the 'did anything get missed' table."""
         t = self.table("FILE_INVENTORY", "Every file in the collection",
                        ["path", "host_path", "top_level", "category", "size_bytes",
-                        "size_human", "parsed_into"],
+                        "size_human", "mtime_utc", "atime_utc", "ctime_utc",
+                        "crtime_utc", "time_source", "parsed_into"],
                        "Collection",
-                       "One row per collected file, with the table that parsed "
-                       "it. Under a narrowed --scope, parsed_into says so for "
-                       "the half that was not read - an empty cell always means "
-                       "'offered to every extractor and taken by none'.")
+                       "One row per collected file, with its times and the "
+                       "table that parsed it. Under a narrowed --scope, "
+                       "parsed_into says so for the half that was not read - "
+                       "an empty cell always means 'offered to every extractor "
+                       "and taken by none'. time_source says where the times "
+                       "came from, because that decides what they mean: "
+                       "'bodyfile' and 'filesystem' are the host's own, read "
+                       "from the inode; 'archive' is the mtime the collector "
+                       "preserved into the tar or zip, which is the host's "
+                       "when it was collected with the flags to keep it; "
+                       "'collected file' is the extracted copy's own mtime and "
+                       "is the weakest of the three.")
         plen = len(self.col.prefix)
         rootfs = tuple(rd + "/" for rd in self.col.rootfs_dirs)
+        # The bodyfile is the authoritative record of the host's own times
+        # where the collection has one - it was read off the inodes. Anything
+        # else is what the container happened to preserve, so it is the
+        # fallback and is labelled as such rather than presented as equal.
+        meta = self._bodyfile_meta()
+        fallback = getattr(self.col, "time_source", "archive")
+        if self.col.kind == "dir":
+            fallback = "collected file"
         for low, real in sorted(self.col._names.items(), key=lambda kv: kv[1]):
             if not low.startswith(self.col.prefix):
                 continue
@@ -13816,7 +14072,22 @@ class TableBuilder:
                 ps = self.path_scope(rel, host or rel)
                 if ps and ps != self.scope:
                     into = "not read under --scope %s" % self.scope
-            t.add(rel, host, top, cat, size, human_size(size), into)
+            times = self.col.member_time(rel)
+            bf = meta.get(host) if host else None
+            if times[1] or times[2] or times[3]:
+                # the backend read the inode itself, so it has all four and
+                # the bodyfile - which on these backends is built from the
+                # same inodes - can only be a subset of it
+                mtime, atime, ctime, crtime = times
+                origin = self.col.time_source
+            elif bf and bf.get("mtime"):
+                mtime, atime, ctime, crtime = bf["mtime"], "", "", ""
+                origin = "bodyfile"
+            else:
+                mtime, atime, ctime, crtime = times
+                origin = fallback if mtime else ""
+            t.add(rel, host, top, cat, size, human_size(size),
+                  mtime, atime, ctime, crtime, origin, into)
 
     # -- 2. processes -------------------------------------------------------
     def t_processes(self):
@@ -19668,6 +19939,13 @@ class TableBuilder:
         ("CAPABILITIES", ("path",), "path"),
         ("FILE_HASHES", ("path",), "path"),
         ("BODYFILE", ("path",), "path"),
+        # Every collected filename, which is the only one of these that always
+        # exists. BODYFILE needs a collector that produced one and SUID_SGID
+        # needs a survey that ran, so on a collection with neither - and on
+        # loose files - a tool sitting on disk under its own name was named
+        # nowhere the sweep looked. FILE_INVENTORY has one row per file on
+        # every backend there is.
+        ("COLLECTED_FILES", ("path",), "path"),
         ("OPEN_FILES", ("name",), "path"),
         ("HIDDEN_PATHS", ("path",), "path"),
         # a scanner's User-Agent names the tool that ran; a requested path is
@@ -19692,6 +19970,35 @@ class TableBuilder:
     DISTRO_PATHS = ("/usr/share/", "/usr/src/", "/usr/lib/", "/usr/include/",
                     "/lib/", "/lib64/", "/usr/share/man/", "/usr/share/doc/",
                     "/var/lib/dpkg/", "/var/lib/rpm/", "/snap/", "/etc/alternatives/")
+
+    def _collected_files(self):
+        """Every collected filename, as a table the sweeps can read.
+
+        Not a real table and never exported - FILE_INVENTORY is that, and it
+        is built last because it reports on what every other extractor took.
+        The sweeps run before it, so without this the one artifact that exists
+        on every backend - the list of file names - was the one thing they
+        never looked at, and a tool sitting on disk under its own name went
+        unreported unless a bodyfile or a suid survey happened to name it too.
+        """
+        cached = getattr(self, "_collected_files_table", None)
+        if cached is not None:
+            return cached
+        t = Table("COLLECTED_FILES", "Collected file names", ["path", "mtime_utc"],
+                  "Collection", "", None)
+        plen = len(self.col.prefix)
+        for low, real in self.col._names.items():
+            if not low.startswith(self.col.prefix):
+                continue
+            rel = real[plen:]
+            host = self.col.host_path(rel)
+            try:
+                mtime = self.col.member_time(rel)[0]
+            except Exception:
+                mtime = ""
+            t.add(host or rel, mtime)
+        self._collected_files_table = t
+        return t
 
     def t_hacktools(self):
         """Named offensive tooling, hunted across every artifact that names one.
@@ -19720,6 +20027,7 @@ class TableBuilder:
                        "raised per tool. They count every reference, not the "
                        "twelve per table kept as samples.")
         by_name = {tb.name: tb for tb in self.tables}
+        by_name["COLLECTED_FILES"] = self._collected_files()
         extra = self._extra_keywords()
         # --no-hunt turns off the built-in list but never the terms the user
         # explicitly asked for: passing both should hunt exactly those
@@ -19739,7 +20047,14 @@ class TableBuilder:
             if not idxs:
                 continue
             ts_i = self.row_time_index(cols)
-            tiers = [(HACKTOOL_RE, HACKTOOL_CAT, False)] if builtin else []
+            # A path or a command line can hold a filename, where a tool name
+            # arrives glued to a version or a suffix; free log text cannot, and
+            # there the strict boundaries are what keep an ordinary sentence
+            # from matching.
+            if kind in ("command", "path"):
+                tiers = [(HACKTOOL_PATH_RE, HACKTOOL_PATH_CAT, False)] if builtin else []
+            else:
+                tiers = [(HACKTOOL_RE, HACKTOOL_CAT, False)] if builtin else []
             if builtin and kind in ("command", "path"):
                 tiers.append((HACKTOOL_CTX_RE, HACKTOOL_CTX_CAT, True))
             for row in tb.iter_rows():
@@ -20874,6 +21189,94 @@ class TableBuilder:
                   _fs_ts(node.mtime), _fs_ts(node.ctime), _fs_ts(node.crtime),
                   _fs_ts(node.dtime))
 
+    def t_sensitive_files(self):
+        """Credential material and secrets, found by what the file is called.
+
+        Nothing here is opened. That is the point: the question "what secrets
+        were sitting on this host, and where" is one an analyst asks early,
+        and on a collection that took names and metadata but not contents it
+        cannot be asked any other way. A name is weaker evidence than a
+        content match and it is available for every file there is.
+
+        Distribution paths are excluded rather than down-ranked. Python ships
+        secrets.py, OpenSSL ships test keys, and every package manager has an
+        example credentials file - including them turns the one private key in
+        /home into row four hundred of a table nobody reads.
+        """
+        t = self.table("SENSITIVE_FILES", "Credential material by filename",
+                       ["severity", "host_path", "basename", "directory",
+                        "what", "why", "size_bytes", "size_human",
+                        "mtime_utc", "owner", "mode", "source"],
+                       "Detection",
+                       "Files whose name says they hold key material, "
+                       "passwords or credentials. Matched on the name alone - "
+                       "nothing is opened - so this answers 'what secrets were "
+                       "on this host' even for a collection that took metadata "
+                       "and not contents. Distribution and packaging paths are "
+                       "excluded: they carry test keys and example credentials "
+                       "by the hundred, and none of them is a finding.")
+        meta = self._bodyfile_meta()
+        plen = len(self.col.prefix)
+        rootfs = tuple(rd + "/" for rd in self.col.rootfs_dirs)
+        seen = set()
+        groups = {}
+        for low, real in sorted(self.col._names.items(), key=lambda kv: kv[1]):
+            if not low.startswith(self.col.prefix):
+                continue
+            rel = real[plen:]
+            if not rel.lstrip("/").lower().startswith(rootfs):
+                continue                  # command output is not a host file
+            host = self.col.host_path(rel)
+            if not host or host in seen:
+                continue
+            if SENSITIVE_FILE_BENIGN.search(host):
+                continue
+            if SENSITIVE_FILE_EXPECTED.match(host):
+                continue
+            if PUBLIC_CERT_DIR.search(host) and not PRIVATE_KEY_DIR.search(host):
+                continue
+            # a directory named for keys holds the files that are the finding;
+            # reporting both says the same thing twice
+            if self.col.member_kind(rel) == "d":
+                continue
+            best = None
+            for rx, what, sev, why in SENSITIVE_FILE_RE:
+                if not rx.search(host):
+                    continue
+                if best is None or SEVERITIES.index(sev) < SEVERITIES.index(best[1]):
+                    best = (what, sev, why)
+            if best is None:
+                continue
+            seen.add(host)
+            what, sev, why = best
+            bf = meta.get(host, {})
+            mtime = bf.get("mtime") or self.col.member_time(rel)[0]
+            size = self.col._sizes.get(low, 0)
+            t.add(sev, host, os.path.basename(host), os.path.dirname(host),
+                  what, why, size, human_size(size), mtime,
+                  self.uid_name(bf.get("uid", "")) or bf.get("uid", ""),
+                  bf.get("mode", ""), rel)
+            self.use(rel, "SENSITIVE_FILES")
+            groups.setdefault((sev, what, why), []).append((host, mtime))
+
+        # One finding per kind rather than per file: forty SSH keys under
+        # /home is one fact about the host, and forty findings about it push
+        # everything else off the page.
+        for (sev, what, why), rows in sorted(
+                groups.items(), key=lambda kv: SEVERITIES.index(kv[0][0])):
+            rows.sort()
+            self.tri.add(sev, "Filesystem",
+                         "Credential material on disk: %s" % what,
+                         "%s. Matched on the filename alone - the contents "
+                         "were not read - so treat each as a lead to confirm "
+                         "rather than as a confirmed secret."
+                         % (why[0].upper() + why[1:]),
+                         evidence=["%s%s" % (h, "   %s" % m if m else "")
+                                   for h, m in rows[:40]],
+                         source="SENSITIVE_FILES", count=len(rows),
+                         times=[m for _h, m in rows if m],
+                         mitre="T1552 Unsecured Credentials")
+
     # -- driver -------------------------------------------------------------
     EXTRACTORS = [
         "t_metadata", "t_disk_layout", "t_collection_log",
@@ -20919,6 +21322,7 @@ class TableBuilder:
         # views, which are snapshots of that list rather than artifacts in
         # their own right. Ordering them the other way silently dropped every
         # rule hit out of FINDINGS and the console report.
+        "t_sensitive_files",
         "t_hacktools", "t_yara", "t_sigma", "t_pivot", "t_rule_errors",
         "t_findings", "t_timeline",
         # why an artifact above is absent, before the list of what is left
@@ -20977,7 +21381,7 @@ class TableBuilder:
         "t_editor_history", "t_ld_preload",
         "t_suid", "t_getcap", "t_mac_policy", "t_writable", "t_hidden_files",
         "t_unknown_owner", "t_socket_files", "t_dev_files", "t_bodyfile",
-        "t_deleted_files", "t_disk_layout",
+        "t_deleted_files", "t_disk_layout", "t_sensitive_files",
         "t_file_hashes", "t_user_artifacts", "t_package_logs",
         "t_journal", "t_audit_log", "t_login_records", "t_wtmpdb", "t_lastlog",
         "t_web_logs", "t_web_config", "t_samba_logs", "t_firewall_log",

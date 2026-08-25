@@ -307,6 +307,68 @@ than returning a partial tree.
 Encrypted AccessData images (`ADCRYPTEDFILE`) are identified and refused —
 decrypt in FTK Imager first.
 
+## Files, by what they are called
+
+Two of the tables answer questions that need only a filename, which means they
+answer them for a collection that took names and metadata but never the
+contents.
+
+### Credential material
+
+`SENSITIVE_FILES` lists what on this host was named for a secret — private
+keys and keystores, password databases, cloud and registry credentials,
+`.env` files, copies of `/etc/shadow`, wallets, database dumps. Nothing is
+opened; the name is the evidence, and each row says why it matched so you can
+weigh it. It also becomes a finding, one per kind rather than one per file.
+
+On a real Ubuntu workstation collection it returns 31 rows and they are almost
+all real: an OpenVPN CA key and server key, client `.p12` and `.key` files,
+two SSH private keys, `/etc/ppp/chap-secrets`, and an AWS VPN client's
+temporary credentials.
+
+Getting that signal needs the noise gone, so distribution and packaging paths
+are excluded outright, along with the things every host has and none of which
+is a secret:
+
+| excluded | why |
+|---|---|
+| `/usr/share`, `/lib`, `site-packages`, `node_modules`, `vendor`, `test/` | Python ships `secrets.py`, OpenSSL ships test keys |
+| `/etc/pam.d`, `/etc/apparmor.d`, `/etc/xdg` | configuration *about* authentication, not credentials |
+| `/boot/grub` | the bootloader ships `password.mod` — code for handling passwords |
+| `/etc/shadow-`, `/etc/passwd-`, `/etc/gshadow-` | shadow-utils' own rotation backups. A copy anywhere *else* still fires |
+| `certs/`, `ca-certificates/`, `ca-trust/` | public certificates by definition — unless the path also says `private/` |
+
+### Tool names in filenames
+
+A downloaded tool is called `mimikatz_name.zip`, `linpeas_linux_amd64`,
+`metasploit-framework`. `_` is a word character, so a ``-anchored match
+cannot see the tool in any of those — and every one of them was being missed.
+Path and command-line cells now match on a boundary that lets a separator, a
+digit or a version sit next to the name and still refuses a letter, so
+`mimikatz_name` fires and `johnson` and `cdkit` do not.
+
+Free log text keeps the strict boundary, and the ambiguous tier — `john`,
+`nmap`, `empire`, `beacon` — keeps it everywhere. Loosening a word that is
+also a word is how a wordlist directory becomes a page of findings.
+
+The sweep also reads the collection's own file list now. `BODYFILE` needs a
+collector that produced one and `SUID_SGID` needs a survey that ran, so on a
+collection with neither — and on loose files — a tool sitting on disk under
+its own name was named nowhere the sweep looked.
+
+### Times on every file
+
+`FILE_INVENTORY` carries `mtime_utc`, `atime_utc`, `ctime_utc`, `crtime_utc`
+and a `time_source` saying what they mean, because that differs:
+
+| `time_source` | |
+|---|---|
+| `filesystem` | read from the inode by the disk backend — all four |
+| `the AD1's recorded metadata` | as FTK recorded them at acquisition — all four |
+| `bodyfile` | the host's own mtime, from the bodyfile the collector produced |
+| `archive` | the mtime preserved into the tar or zip — the host's, when it was collected with the flags to keep it |
+| `collected file` | the extracted copy's own mtime, and the weakest of the five |
+
 ## Which distribution
 
 Every run establishes what the host was, and says how it knows. It lands in

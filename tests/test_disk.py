@@ -51,14 +51,14 @@ def load(built):
     sys.path.insert(0, os.path.join(ROOT, "src"))
     import linsight.image, linsight.volume, linsight.disk        # noqa
     import linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs   # noqa
-    import linsight.ad1, linsight.distro                         # noqa
+    import linsight.ad1, linsight.distro, linsight.common        # noqa
 
     class Flat(object):
         pass
 
     flat = Flat()
     for mod in (linsight.image, linsight.volume, linsight.disk, linsight.ad1,
-                linsight.distro,
+                linsight.distro, linsight.common,
                 linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs):
         for name in dir(mod):
             if not name.startswith("__"):
@@ -685,6 +685,133 @@ def check_distribution(L, res):
         finally:
             col.close()
 
+#: (path, must a tool name be found?) - the boundary cases that decide whether
+#: a downloaded tool on disk is seen at all. The underscore ones are the bug
+#: this table exists for: '_' is a word character, so the strict boundary
+#: could not see the tool in 'mimikatz_name.zip'.
+TOOL_NAME_CASES = (
+    ("/root/mimikatz_name.zip", "mimikatz"),
+    ("/tmp/linpeas_linux_amd64", "linpeas"),
+    ("/opt/metasploit-framework/msfconsole", "metasploit"),
+    ("/home/u/.mimikatz", "mimikatz"),
+    ("/home/u/AzureHound/.all-contributorsrc", "azurehound"),
+    ("/usr/local/bin/pspy64", "pspy"),
+    # and the ones that must stay quiet: a letter may never follow
+    ("/home/x/johnson_report.txt", None),
+    ("/usr/bin/cdkit", None),
+    ("/srv/mimikatzx", None),
+    ("/var/lib/lazagnette", None),
+)
+
+#: (path, must it be reported as sensitive?) - the same shape for filenames
+#: that name their own contents, plus the distribution paths that must not
+#: turn into a page of noise.
+SENSITIVE_CASES = (
+    ("/home/u/.ssh/id_rsa", True),
+    ("/root/db_secrets.txt", True),
+    ("/home/u/my_passwords.csv", True),
+    ("/etc/openvpn/private/ca.key", True),
+    ("/home/u/vault.kdbx", True),
+    ("/root/.aws/credentials", True),
+    ("/tmp/shadow.bak", True),
+    # normal, and on every host there is
+    ("/etc/passwd", False),
+    ("/etc/shadow-", False),
+    ("/etc/pam.d/common-password", False),
+    ("/usr/lib/python3.11/secrets.py", False),
+    ("/etc/ssl/certs/ca-bundle.pem", False),
+    ("/boot/grub/i386-pc/password.mod", False),
+    ("/usr/share/doc/x/password.txt", False),
+)
+
+
+def check_filename_hunts(L, res):
+    """The two questions answered from a filename alone.
+
+    Neither needs a fixture: they are decisions about a string, and the cases
+    that matter are the boundary ones. Both are checked here rather than
+    through a whole run because a run only proves the paths that happen to be
+    in the evidence, and what broke was the paths that were not.
+    """
+    print("\nfilename hunts - tool names and credential material")
+    wrong = []
+    for path, want in TOOL_NAME_CASES:
+        m = L.HACKTOOL_PATH_RE.search(path.lower())
+        got = m.group(1) if m else None
+        if got != want:
+            wrong.append("%s -> %r, expected %r" % (path, got, want))
+    if wrong:
+        res.fail("tool names in filenames", wrong[0] +
+                 ("" if len(wrong) == 1 else " (and %d more)" % (len(wrong) - 1)))
+    else:
+        res.ok("tool names in filenames    %d cases, underscores and all"
+               % len(TOOL_NAME_CASES))
+
+    wrong = []
+    for path, want in SENSITIVE_CASES:
+        hit = False
+        if not L.SENSITIVE_FILE_BENIGN.search(path) and                 not L.SENSITIVE_FILE_EXPECTED.match(path) and                 not (L.PUBLIC_CERT_DIR.search(path)
+                     and not L.PRIVATE_KEY_DIR.search(path)):
+            hit = any(rx.search(path) for rx, _w, _s, _y in L.SENSITIVE_FILE_RE)
+        if hit != want:
+            wrong.append("%s -> %s, expected %s" % (path, hit, want))
+    if wrong:
+        res.fail("credential material by name", wrong[0] +
+                 ("" if len(wrong) == 1 else " (and %d more)" % (len(wrong) - 1)))
+    else:
+        res.ok("credential material by name %d cases, noise excluded"
+               % len(SENSITIVE_CASES))
+
+
+def check_inventory_times(L, res):
+    """FILE_INVENTORY has to carry times, and say where they came from."""
+    print("\nfile inventory - times, and what they mean")
+    for name in ("gpt-ext4.dd",):
+        path = fixture(name)
+        if not path:
+            res.skip("times %s" % name, "not built")
+            continue
+        col = L.DiskCollection(path, quiet=True)
+        try:
+            rel = "[root]/etc/passwd"
+            times = col.member_time(rel)
+            if not times[0]:
+                res.fail("times %s" % name, "no mtime for /etc/passwd")
+            elif not (times[1] and times[2] and times[3]):
+                res.fail("times %s" % name,
+                         "a filesystem backend gave only some of the four "
+                         "times: %r" % (times,))
+            elif col.time_source != "filesystem":
+                res.fail("times %s" % name,
+                         "time_source is %r" % col.time_source)
+            else:
+                res.ok("times %-16s all four, from the %s"
+                       % (name, col.time_source))
+        finally:
+            col.close()
+
+    images = []
+    if os.path.isdir(FIXTURES):
+        images = [os.path.join(FIXTURES, n) for n in sorted(os.listdir(FIXTURES))
+                  if n.lower().endswith(".ad1")]
+    for path in images[:1]:
+        col = L.Ad1Collection(path, quiet=True)
+        try:
+            member = next((m for m in col._entries
+                           if col._entries[m].kind == "f"), "")
+            # member_time takes a collection-relative path, which is what the
+            # member already is - the host path is what comes back out of it
+            times = col.member_time(member) if member else ()
+            if not member:
+                res.fail("times ad1", "nothing to check")
+            elif not all(times):
+                res.fail("times ad1", "expected all four, got %r" % (times,))
+            else:
+                res.ok("times %-16s all four, from %s"
+                       % (os.path.basename(path), col.time_source))
+        finally:
+            col.close()
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--built", action="store_true",
@@ -718,6 +845,8 @@ def main(argv=None):
     check_refusals(L, res)
     check_ad1(L, res)
     check_distribution(L, res)
+    check_filename_hunts(L, res)
+    check_inventory_times(L, res)
 
     print("\n%d passed, %d failed, %d skipped"
           % (res.passed, len(res.failed), len(res.skipped)))

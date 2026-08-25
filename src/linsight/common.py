@@ -186,7 +186,7 @@ HACKTOOL_AMBIGUOUS = {
 }
 
 
-def _tool_regex(groups):
+def _tool_regex(groups, loose=False):
     """One alternation for the whole tier, so a cell costs a single pass.
 
     This is what the function always claimed to do and did not: it compiled one
@@ -214,11 +214,27 @@ def _tool_regex(groups):
     # not preceded/followed by a word character, so 'john' does not fire on
     # 'johnson' and 'cdk' does not fire on 'cdkit'; a leading '/' or '-' is
     # fine because that is how these appear in paths and argv
+    if loose:
+        # The same rule, relaxed for the one place it was wrong: a filename.
+        # '_' is a word character, so the strict form cannot see the tool in
+        # 'mimikatz_name.zip' - and a downloaded tool is named exactly like
+        # that, or 'linpeas_linux_amd64', or 'nmap-7.94.tar.gz'. Only a letter
+        # may not follow, which still stops 'johnson' and 'cdkit', while an
+        # underscore, a hyphen, a dot or a version number may.
+        return re.compile(r"(?<![A-Za-z0-9])(%s)(?![A-Za-z])" % alt), cats
     return re.compile(r"(?<![\w.])(%s)(?![\w-])" % alt), cats
 
 
 HACKTOOL_RE, HACKTOOL_CAT = _tool_regex(HACKTOOL_UNAMBIGUOUS)
 HACKTOOL_CTX_RE, HACKTOOL_CTX_CAT = _tool_regex(HACKTOOL_AMBIGUOUS)
+# The unambiguous names again, with filename punctuation allowed around them.
+# Used where the cell is a path or a command line - somewhere a filename can
+# legitimately be - and never on free log text, where the strict form is what
+# keeps an ordinary sentence from firing. The ambiguous tier never gets this:
+# 'nmap' and 'john' are words, and loosening their boundaries in a path is how
+# a wordlist directory becomes a page of findings.
+HACKTOOL_PATH_RE, HACKTOOL_PATH_CAT = _tool_regex(HACKTOOL_UNAMBIGUOUS,
+                                                  loose=True)
 # how bad a name is, before the context it was found in is considered
 HACKTOOL_SEVERITY = {
     "credential access": "CRITICAL", "active directory attack": "HIGH",
@@ -227,6 +243,114 @@ HACKTOOL_SEVERITY = {
     "cryptomining": "CRITICAL", "container escape": "HIGH",
     "exfiltration staging": "HIGH",
 }
+
+#: A word boundary for filenames. '_' counts as a word character to , which
+#: is why 'db_secrets.txt' does not match secrets - so a separator, a
+#: digit or a path element may touch the word, and only a letter may not.
+NAME_EDGE = r"(?<![A-Za-z])(?:%s)(?![A-Za-z])"
+
+# Filenames that say what a file is for, when what it is for is a secret.
+#
+# This is a name check, not a content check: nothing here is opened. What it
+# answers is the question an analyst asks early and cannot otherwise ask at
+# all - what credential material was sitting on this host, and where - and it
+# answers it for a collection that never had the file's contents in it.
+#
+# (pattern, what it is, how bad, why)
+SENSITIVE_FILE_PATTERNS = (
+    # -- private keys, which are the whole prize -------------------------
+    (r"(^|/)id_(rsa|dsa|ecdsa|ed25519|xmss)$", "ssh private key", "HIGH",
+     "an unencrypted SSH private key grants whatever it was trusted for"),
+    (r"\.(pem|key|pfx|p12|jks|keystore|ppk)$", "private key / keystore", "HIGH",
+     "key material, usable wherever the certificate was trusted"),
+    (r"(^|/)(server|client|ca|root|priv|private)[._-]?key", "private key",
+     "HIGH", "key material named for what it signs"),
+    # -- password stores -------------------------------------------------
+    (r"\.(kdbx|kdb|psafe3|agilekeychain|opvault|1pif)$", "password database",
+     "HIGH", "a password manager's vault"),
+    (r"(^|/)wallet\.dat$", "cryptocurrency wallet", "HIGH",
+     "a wallet file is bearer access to its funds"),
+    # -- credentials in configuration ------------------------------------
+    (r"(^|/)\.?(netrc|pgpass|my\.cnf|pypirc|npmrc)$",
+     "credentials in a config file", "MEDIUM",
+     "these formats hold plaintext passwords by design"),
+    (r"(^|/)\.git-credentials$", "stored git credentials", "HIGH",
+     "git writes these in plaintext"),
+    (r"(^|/)credentials$|(^|/)\.aws/", "cloud credentials", "HIGH",
+     "long-lived cloud keys"),
+    (r"(^|/)(kubeconfig|\.kube/config)$", "kubernetes credentials", "HIGH",
+     "cluster-admin in a file"),
+    (r"(^|/)\.docker/config\.json$", "docker registry credentials", "MEDIUM",
+     "registry tokens, often base64 rather than encrypted"),
+    (r"(^|/)\.env$|(^|/)\.env\.", "environment file", "MEDIUM",
+     "application secrets are conventionally kept here"),
+    (r"(^|/)\.?(ovpn|openvpn)|\.ovpn$", "vpn profile", "MEDIUM",
+     "may embed the key that gets onto the network"),
+    # -- named for what they hold ----------------------------------------
+    #
+    # These use NAME_EDGE rather than  on both sides. '_' is a word
+    # character, so secret cannot see the word in 'db_secrets.txt' - and
+    # a file someone named for its contents is called exactly that. The edge
+    # below lets a separator or a digit sit next to the word and still
+    # excludes a letter, so 'secretariat' and 'tokenizer' stay out.
+    (NAME_EDGE % "secrets?", "named 'secret'", "MEDIUM",
+     "named for its contents"),
+    (NAME_EDGE % "passwords?", "named 'password'", "MEDIUM",
+     "named for its contents"),
+    (NAME_EDGE % "passwd(?!$)", "named 'passwd'", "MEDIUM",
+     "a passwd file somewhere other than /etc"),
+    (NAME_EDGE % "creds?|credentials?", "named 'credentials'", "MEDIUM",
+     "named for its contents"),
+    (NAME_EDGE % ("api[._-]?keys?|access[._-]?keys?|secret[._-]?keys?|"
+                  "private[._-]?keys?|auth[._-]?tokens?|bearer[._-]?tokens?"),
+     "named for a key or token", "MEDIUM", "named for its contents"),
+    (NAME_EDGE % "tokens?", "named 'token'", "LOW", "named for its contents"),
+    # -- copies of the account database ----------------------------------
+    (r"(^|/)(shadow|passwd|gshadow)[.~-]", "copy of an account database",
+     "HIGH", "a copy of /etc/shadow outside /etc is staged loot"),
+    (r"(^|/)(shadow|passwd)\.(bak|old|orig|save|copy|txt|[0-9]+)$",
+     "copy of an account database", "HIGH",
+     "a copy of /etc/shadow outside /etc is staged loot"),
+    # -- database and memory dumps ---------------------------------------
+    (r"\.(sql|sqldump|dmp|dump)$", "database or memory dump", "MEDIUM",
+     "a dump is the data, already extracted"),
+    (r"(^|/)(lsass|ntds)", "credential store dump", "HIGH",
+     "the Windows credential stores, staged on a Linux host"),
+)
+SENSITIVE_FILE_RE = tuple(
+    (re.compile(p, re.I), what, sev, why)
+    for p, what, sev, why in SENSITIVE_FILE_PATTERNS)
+
+# Where a name like this is the distribution's own word rather than a finding.
+# Python ships secrets.py, OpenSSL ships test keys, and every package manager
+# has a 'credentials' example - matching those produces a page of noise that
+# buries the one key in /home that mattered.
+SENSITIVE_FILE_BENIGN = re.compile(
+    r"^/(usr/(share|src|lib|include|local/lib)|lib|lib64|opt/[^/]+/lib|"
+    r"snap|var/lib/(dpkg|rpm|apt|pacman)|etc/alternatives|"
+    r"var/cache/(apt|yum|dnf|pacman)|"
+    # the bootloader ships password.mod and legacy_password_test.mod, which
+    # are code for handling passwords rather than anybody's password
+    r"boot/(grub2?|efi|loader)|"
+    # configuration *about* authentication, which every host has and none of
+    # which is a credential: PAM stacks, AppArmor profiles, XDG autostart
+    r"etc/(pam\.d|pam\.conf\.d|apparmor\.d|xdg|security)|"
+    r"etc/(fwupd|pki/fwupd[^/]*))/|"
+    r"(^|/)(test|tests|testdata|fixtures?|examples?|samples?|docs?|"
+    r"node_modules|site-packages|dist-packages|vendor|\.git)/", re.I)
+
+#: The account databases' own rotation backups. shadow-utils writes these on
+#: every change and every host has them, so they are the baseline rather than
+#: staged loot - a copy of /etc/shadow anywhere else still is.
+SENSITIVE_FILE_EXPECTED = re.compile(
+    r"^/etc/(passwd|shadow|group|gshadow|subuid|subgid)-$", re.I)
+
+#: Directories that hold public certificates by definition. A .pem here is the
+#: public half, which is not a secret - unless the path also says 'private',
+#: which is where a CA keeps the half that is.
+PUBLIC_CERT_DIR = re.compile(
+    r"/(certs|certs_by_serial|ca-certificates|ca-trust|issued|reqs)/", re.I)
+PRIVATE_KEY_DIR = re.compile(r"/private/", re.I)
 
 # known Linux rootkit / offensive tool module and file names
 ROOTKIT_NAMES = [

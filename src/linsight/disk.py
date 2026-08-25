@@ -80,6 +80,7 @@ class DiskCollection(Collection):
         self._tar = None
         self._zip = None
         self._sizes = {}
+        self._mtimes = {}
         self._names = {}
         self._raw = {}
         self.prefix = ""
@@ -400,6 +401,20 @@ class DiskCollection(Collection):
         except Exception:
             return None
 
+    time_source = "filesystem"
+
+    def member_kind(self, rel):
+        node = self._nodes.get(self.resolve(rel) or "")
+        return node.kind if node is not None else ""
+
+    def member_time(self, rel):
+        """All four times, read from the inode rather than from a container."""
+        node = self._nodes.get(self.resolve(rel) or "")
+        if node is None:
+            return ("", "", "", "")
+        return (_stamp(node.mtime), _stamp(node.atime), _stamp(node.ctime),
+                _stamp(node.crtime))
+
     def node(self, rel):
         """The FsNode behind a collection-relative path, or None."""
         return self._nodes.get(self.resolve(rel) or "")
@@ -508,3 +523,13 @@ def looks_like_disk_arg(path):
         return looks_like_disk(path)
     except Exception:
         return False
+
+
+def _stamp(when):
+    """A filesystem time as the string every table prints, or ''."""
+    if not when:
+        return ""
+    try:
+        return when.strftime("%Y-%m-%d %H:%M:%S")
+    except (AttributeError, ValueError):
+        return ""

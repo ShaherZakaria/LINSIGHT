@@ -516,6 +516,7 @@ class Ad1Collection(Collection):
         self._tar = None
         self._zip = None
         self._sizes = {}
+        self._mtimes = {}
         self._names = {}
         self._raw = {}
         self.prefix = ""
@@ -736,6 +737,20 @@ class Ad1Collection(Collection):
         except Exception:
             return None
 
+    time_source = "the AD1's recorded metadata"
+
+    def member_kind(self, rel):
+        e = self._entries.get(self.resolve(rel) or "")
+        return e.kind if e is not None else ""
+
+    def member_time(self, rel):
+        """All four times, as FTK recorded them from the source filesystem."""
+        e = self._entries.get(self.resolve(rel) or "")
+        if e is None:
+            return ("", "", "", "")
+        return (_stamp_ad1(e.mtime), _stamp_ad1(e.atime), _stamp_ad1(e.ctime),
+                _stamp_ad1(e.crtime))
+
     def entry(self, rel):
         """The Ad1Entry behind a collection-relative path, or None."""
         return self._entries.get(self.resolve(rel) or "")
@@ -767,3 +782,12 @@ def _md5(data):
 
 def _sha1(data):
     return hashlib.sha1(data).hexdigest()
+
+
+def _stamp_ad1(when):
+    if not when:
+        return ""
+    try:
+        return when.strftime("%Y-%m-%d %H:%M:%S")
+    except (AttributeError, ValueError):
+        return ""
