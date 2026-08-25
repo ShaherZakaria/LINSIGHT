@@ -8,8 +8,8 @@
 #
 #   sh tools/mkfixtures.sh [outdir]        # default tests/fixtures
 #
-# On Windows, run it through WSL:
-#   wsl -e sh tools/mkfixtures.sh /mnt/c/.../fixtures
+# Run it on the Linux box that has mkfs; the images it writes are ordinary
+# files and linsight reads them on any platform.
 #
 # What is not built here is built by tools/mkcontainers.py, which wraps the
 # raw images produced below in E01, qcow2, vmdk and vhdx - those formats have
@@ -170,6 +170,18 @@ while [ $i -lt 400 ]; do
     echo "entry $i" > "$ROOTDIR/var/log/many/logfile-$i.log"
     i=$((i + 1))
 done
+
+# The host's time zone, both ways a Linux box records it: the name in
+# /etc/timezone, and /etc/localtime as a symlink into the zoneinfo tree. The
+# symlink is the interesting one - a disk or AD1 reader gets the target back
+# as the file's content, and the target *is* the zone name.
+mkdir -p "$ROOTDIR/usr/share/zoneinfo/Europe"
+echo "Europe/Berlin" > "$ROOTDIR/etc/timezone"
+# a real compiled zone if the box has one, so the TZif reader is exercised too
+if [ -f /usr/share/zoneinfo/Europe/Berlin ]; then
+    cp /usr/share/zoneinfo/Europe/Berlin "$ROOTDIR/usr/share/zoneinfo/Europe/Berlin"
+fi
+ln -sf /usr/share/zoneinfo/Europe/Berlin "$ROOTDIR/etc/localtime"
 
 # symlinks: one short enough to live in the inode, one that needs a block
 ln -sf /var/log/auth.log "$ROOTDIR/etc/auth-link"

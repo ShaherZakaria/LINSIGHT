@@ -247,6 +247,13 @@ python3 tools/mklvm.py tests/fixtures/ext4.img tests/fixtures/lvm-ext4.dd
 python tests/test_disk.py                    # and --built for the shipped file
 ```
 
+The first two need a Linux box: `mkfs.ext4`, `mkfs.xfs`, `mkfs.btrfs`, `sfdisk`,
+`cryptsetup` for the filesystems, and `qemu-img` and `ewfacquire` for the
+containers. None of them needs root — every `mkfs` here populates from a
+directory, and `cryptsetup luksFormat` writes a header to a plain file.
+`mklvm.py` is pure Python and runs anywhere. Whatever is missing is skipped by
+name, so a partial fixture set still tests what it has.
+
 Every container is checked byte-for-byte against the raw image it was made from,
 which is the only way to prove a container reader is right rather than merely
 self-consistent. Every filesystem reader has to return the same planted tree,
@@ -368,6 +375,57 @@ and a `time_source` saying what they mean, because that differs:
 | `bodyfile` | the host's own mtime, from the bodyfile the collector produced |
 | `archive` | the mtime preserved into the tar or zip — the host's, when it was collected with the flags to keep it |
 | `collected file` | the extracted copy's own mtime, and the weakest of the five |
+
+## Which time zone
+
+Almost every Linux log timestamp is local with no zone on it. `Mar 24
+22:14:44` is a fact about a clock; turning it into a fact about a *moment*
+needs the offset that clock was running at. An hour wrong here is an hour
+wrong in every correlation the report supports — against the firewall, against
+the EDR, against the interview.
+
+So it is established for every collection, and recorded with its source:
+
+```
+  host offset    : +01:00 (from /etc/localtime)
+  time zone      : Europe/Berlin (+01:00)
+```
+
+| key | |
+|---|---|
+| `Time zone` | `Europe/Berlin (+01:00)` |
+| `Time zone source` | the file it was read from |
+| `Host UTC offset` | the offset, and what stated it |
+| `Time zone note` | only when the sources disagree |
+
+Sources, best first: `timedatectl` output, `/etc/timezone`,
+`/etc/sysconfig/clock`, `/etc/localtime`, and the host's own `date`.
+
+Two of those are worth spelling out.
+
+**`/etc/localtime` is the compiled zone**, so it answers the question that
+actually matters — what offset was this host running at *then* — across
+daylight saving, which no single recorded number can. The TZif reader handles
+v1 and the 64-bit v2 block behind it, and returns Berlin as `+01:00` in January
+and `+02:00` in July.
+
+**`/etc/localtime` is also a symlink** into `/usr/share/zoneinfo`, and a disk
+or AD1 backend hands a symlink's target back as its content — so the target
+*is* the zone name. That is how a host that never wrote `/etc/timezone` still
+gets named.
+
+A collector that stated its own offset keeps it: `uac.log` and the Velociraptor
+context record what the host's clock was doing at the moment of collection,
+which beats anything reconstructed afterwards. The zone name is filled in
+regardless, because an offset alone cannot say whether a log line from six
+months earlier was written on summer time.
+
+When they disagree, that is a line in the report rather than a silent pick —
+`/etc/localtime` compiled at one offset while the zone name resolves to
+another is what a host whose zone was changed after the logs were written
+looks like. And when nothing records it at all, that is a `MEDIUM` finding,
+because the alternative is a timeline that agrees with itself and disagrees
+with every other source.
 
 ## Which distribution
 
