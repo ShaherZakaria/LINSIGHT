@@ -46,7 +46,31 @@ Both collection layouts are detected from the collection itself, never declared:
 
 It reads an **extracted directory** or the **archive directly** — `.tar`, `.tar.gz`, `.zip`. Reading the archive avoids extracting a multi-GB collection twice.
 
-The third kind of input is a disk. See [Disks](#disks).
+A directory that is a **mounted filesystem root** — one whose top level is
+`etc/`, `var/`, `usr/` — is recognised as one and read as the host tree it is.
+That is what a forensic mounter, `losetup` or a plugged-in disk gives you.
+
+The other two kinds of input are a disk ([Disks](#disks)) and an AD1
+([AD1 logical images](#ad1-logical-images)).
+
+### Saying what the input is
+
+What the argument is gets worked out from the thing itself. These force it,
+for when that goes wrong or when you would rather be explicit — each replaces
+the positional argument:
+
+```bash
+python linsight.py -d ./uac-host-linux-20260324/     # a directory
+python linsight.py --archive ./collection.tar.gz     # a .tar/.tar.gz/.zip
+python linsight.py --disk ./image.dd                 # a disk or device
+python linsight.py --ad1 ./case.ad1                  # an FTK logical image
+python linsight.py --file ./auth.log                 # loose artifacts
+```
+
+Passing two of them, or one of them plus the positional argument, is an error
+rather than a silent preference — a wrong guess should become a message
+naming what could not be read, not a report containing the wrong half of the
+evidence.
 
 ## Output
 

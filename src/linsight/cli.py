@@ -145,6 +145,27 @@ def main(argv=None):
                     help="read PATH as a disk even when it would not be "
                          "recognised as one - a headerless image, a damaged "
                          "partition table, a device node")
+
+    ig = ap.add_argument_group(
+        "saying what the input is",
+        "What the argument is - a collection directory, an archive, a disk, "
+        "an AD1 - is worked out from the thing itself, and these are here for "
+        "when that goes wrong or when you would rather be explicit. Each one "
+        "takes the place of the positional argument and forces one reader, so "
+        "a wrong guess becomes an error naming what it could not read instead "
+        "of a report with the wrong half of the evidence in it.")
+    ig.add_argument("-d", "--dir", metavar="PATH", dest="dir_input",
+                    help="read PATH as a directory: an extracted UAC or "
+                         "Velociraptor collection, or a mounted filesystem "
+                         "root (one whose top level is etc/, var/, usr/ ...), "
+                         "which is what a forensic mounter gives you")
+    ig.add_argument("--archive", metavar="PATH",
+                    help="read PATH as a collection archive - .tar, .tar.gz "
+                         "or .zip - rather than as anything else it might "
+                         "look like")
+    ig.add_argument("--ad1", metavar="PATH",
+                    help="read PATH as an AccessData/FTK logical image, and "
+                         "gather the rest of its .ad2/.ad3 segments")
     dg.add_argument("--list-volumes", action="store_true",
                     help="print what is on the disk - container, partitions, "
                          "logical volumes, filesystems - and stop. The first "
@@ -352,20 +373,46 @@ def main(argv=None):
             status("[*] sigma: cached %s" % opts.sigma_note)
         opts.sigma = (opts.sigma or []) + [cache]
 
-    if opts.files and opts.collection:
-        ap.error("--file parses loose files instead of a collection; pass one "
-                 "or the other, not both")
-    if opts.disk and (opts.files or opts.collection):
-        ap.error("--disk names the disk to read; do not also pass a "
-                 "collection or --file")
+    # Exactly one thing may say what is being read. Each of these names a
+    # different reader, and silently preferring one over another is how an
+    # analyst ends up with a report about half the evidence.
+    chosen = [(name, value) for name, value in
+              (("--disk", opts.disk), ("-d/--dir", opts.dir_input),
+               ("--archive", opts.archive), ("--ad1", opts.ad1),
+               ("--file", opts.files)) if value]
+    if opts.collection and chosen:
+        ap.error("%s says what to read; do not also pass it as the plain "
+                 "argument" % chosen[0][0])
+    if len(chosen) > 1:
+        ap.error("%s and %s each name what to read; pass one"
+                 % (chosen[0][0], chosen[1][0]))
 
-    # A disk is recognised rather than declared: a .dd, an .E01, a qcow2 or a
-    # device given as the ordinary argument goes to the disk backend, and
-    # --disk only exists for the image that carries no recognisable header at
-    # all. Requiring a flag would mean an analyst who forgets it gets "no
-    # readable files found", which reads as a fault in the evidence.
+    # What the input is, is worked out from the input. The explicit flags
+    # above override that, and exist because a guess can be wrong - a
+    # headerless image, an archive with no extension - and because saying it
+    # outright is sometimes just clearer.
+    forced = ""
+    if opts.disk:
+        forced, opts.collection = "disk", opts.disk
+    elif opts.dir_input:
+        forced, opts.collection = "dir", opts.dir_input
+    elif opts.archive:
+        forced, opts.collection = "archive", opts.archive
+    elif opts.ad1:
+        forced, opts.collection = "ad1", opts.ad1
+
+    if forced and forced != "disk" and not os.path.exists(opts.collection):
+        ap.error("%s not found: %s" % (forced, opts.collection))
+    if forced == "dir" and not os.path.isdir(opts.collection):
+        ap.error("-d/--dir wants a directory; %s is a file. For an archive "
+                 "use --archive, for a disk image use --disk."
+                 % opts.collection)
+    if forced == "archive" and os.path.isdir(opts.collection):
+        ap.error("--archive wants a .tar/.tar.gz/.zip; %s is a directory - "
+                 "use -d instead" % opts.collection)
+
     disk_path = opts.disk
-    if not disk_path and opts.collection and looks_like_disk(opts.collection):
+    if not forced and opts.collection and looks_like_disk(opts.collection):
         disk_path = opts.collection
 
     if not disk_path and not opts.collection and not opts.files:
@@ -383,8 +430,8 @@ def main(argv=None):
     # An AD1 is a logical image - a tree of files, not a disk - so it lands on
     # the collection side. Like every other container it is recognised rather
     # than declared.
-    ad1_path = ""
-    if not disk_path and opts.collection and looks_like_ad1(opts.collection):
+    ad1_path = opts.ad1 or ""
+    if not forced and not disk_path and opts.collection             and looks_like_ad1(opts.collection):
         ad1_path = opts.collection
 
     if ad1_path:
