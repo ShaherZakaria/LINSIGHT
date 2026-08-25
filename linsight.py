@@ -5917,10 +5917,13 @@ class ExtFilesystem(Filesystem):
         mode = _ext_u16(raw, 0x00)
         kind = KIND_BY_MODE.get(mode & S_IFMT, kind_hint or "f")
         size = _ext_u32(raw, 0x04)
-        if kind == "f":
+        if kind == "f" and len(raw) >= 0x70:
             size |= _ext_u32(raw, 0x6C) << 32
-        uid = _ext_u16(raw, 0x02) | (_ext_u16(raw, 0x78) << 16)
-        gid = _ext_u16(raw, 0x18) | (_ext_u16(raw, 0x7A) << 16)
+        # the high halves of uid and gid are in osd2, which a 128-byte inode
+        # does have - but a truncated read of one must not take the walk down
+        wide = len(raw) >= 0x80
+        uid = _ext_u16(raw, 0x02) | ((_ext_u16(raw, 0x78) << 16) if wide else 0)
+        gid = _ext_u16(raw, 0x18) | ((_ext_u16(raw, 0x7A) << 16) if wide else 0)
         nlink = _ext_u16(raw, 0x1A)
         extra = _ext_u16(raw, 0x80) if len(raw) >= 0x82 else 0
         node = FsNode(
@@ -5929,7 +5932,10 @@ class ExtFilesystem(Filesystem):
             atime=self._time(raw, 0x08, 0x8C, extra),
             ctime=self._time(raw, 0x0C, 0x84, extra),
             mtime=self._time(raw, 0x10, 0x88, extra),
-            crtime=self._time(raw, 0x90, 0x94, extra, need=0x1C),
+            # crtime lives past the 128-byte inode entirely, so it is only
+            # asked for when the inode is big enough to hold it
+            crtime=(self._time(raw, 0x90, 0x94, extra, need=0x1C)
+                    if len(raw) >= 0x98 else None),
             dtime=utc(_ext_u32(raw, 0x14)),
             fs=self, ref=raw)
         if kind == "l":
@@ -5943,7 +5949,16 @@ class ExtFilesystem(Filesystem):
         big enough to hold it. Reading it unconditionally on a 128-byte inode
         reads the next inode's mode as a nanosecond count, which produces
         timestamps decades out and a timeline that cannot be trusted.
+
+        The base field can be absent too. A 128-byte inode - which is what
+        ext2 and ext3 use, and what an ext4 filesystem made with
+        '-I 128' uses - has no crtime at all: offset 0x90 is past its end.
+        Every read here is therefore bounds-checked rather than assumed, and
+        a field that is not there comes back as no time rather than as an
+        exception in the middle of a filesystem walk.
         """
+        if len(raw) < base + 4:
+            return None
         seconds = _ext_u32(raw, base)
         if not seconds:
             return None
@@ -7880,7 +7895,20 @@ class DiskCollection(Collection):
                 self.notes.append("stopped before mounting %s: the %s-name cap "
                                   "was reached" % (point, format(max_files, ",")))
                 break
-            taken = self._walk_into(fs, point, budget, quiet)
+            # One filesystem that will not walk must not end the examination
+            # of the others. A disk carries several, they fail independently,
+            # and a /boot that cannot be read is a note next to a root
+            # filesystem that was read - not an empty report.
+            try:
+                taken = self._walk_into(fs, point, budget, quiet)
+            except Exception as exc:
+                self.notes.append(
+                    "%s on %s could not be walked (%s: %s) - it is not in the "
+                    "tree below, and anything on it was not examined"
+                    % (point, vol.name, exc.__class__.__name__, exc))
+                if getattr(self, "_debug", False):
+                    raise
+                continue
             budget -= taken
             self.mounts.append((point, vol, fs))
             if not quiet:
@@ -7992,17 +8020,34 @@ class DiskCollection(Collection):
                 break
         # A disk carries no statement of when it was imaged, and a syslog line
         # carries no year, so without an anchor every 'Mar 24 22:11' lands in
-        # 1900 and the timeline is worthless. The filesystem's own last write
-        # is a better anchor than the newest mtime - it is the last moment the
-        # host touched this filesystem, including the writes made by whatever
-        # was happening at the end.
-        anchor = fs.last_write or newest
+        # 1900 and the timeline is worthless.
+        #
+        # The anchor is the latest of two things, not one. A filesystem's
+        # superblock write time is the last moment the kernel flushed it,
+        # which is the better answer when it is the later one - but it is only
+        # updated on unmount and periodically, so a root filesystem routinely
+        # carries files newer than its own superblock says it is. Taking the
+        # superblock alone then put the anchor *before* files that plainly
+        # existed at acquisition, and every one of them was reported as
+        # "timestamped after the collection ran" - which is the timestomp
+        # check firing on the whole of /etc.
+        #
+        # A disk cannot have been acquired before the newest thing written to
+        # it, so the newest mtime is a floor. Taking the later of the two
+        # keeps the timestomp check meaningful: it now fires only for a file
+        # dated after everything else on the disk, which is what a stomp to
+        # the future actually looks like.
+        anchor = fs.last_write
+        why = "last write to the %s filesystem on %s" % (fs.kind, mountpoint)
+        if newest and (anchor is None or newest > anchor):
+            anchor = newest
+            why = "newest file mtime on the %s filesystem at %s" % (
+                fs.kind, mountpoint)
         if anchor and (self.time_hint is None or anchor > self.time_hint):
             self.time_hint = anchor
             self.time_hint_note = (
-                "last write to the %s filesystem on %s - a disk image carries "
-                "no collection time, so this is the anchor for every 'recent' "
-                "window below" % (fs.kind, mountpoint))
+                "%s - a disk image carries no acquisition time, so this is "
+                "the anchor for every 'recent' window below" % why)
         return count
 
     # -- deleted ------------------------------------------------------------
