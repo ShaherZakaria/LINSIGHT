@@ -199,9 +199,11 @@ class Collection:
         self._names = {}          # lowercase relative name -> the same name, cased
         self._raw = {}            # lowercase relative name -> archive member name
         self.prefix = ""          # archive dir that holds the layout's marker
+        self.mounted_root = False # the collection root IS the host filesystem
         self.layout = "uac"       # 'uac' or 'velociraptor'; see _find_prefix
         self._load()
         self._find_prefix()
+        self._mount_host_tree()
         self.rootfs_dirs = self._find_rootfs_dirs()
         self.velo = VelociraptorResults(self) if self.layout == "velociraptor" else None
 
@@ -517,6 +519,59 @@ class Collection:
                     found.append(top)
         return found or ["[root]"]
 
+    #: A directory whose top level holds this many of the anchors below is a
+    #: host filesystem rather than a collection. Two is deliberate: /etc alone
+    #: could be a copied-out fragment, and demanding four would miss the
+    #: minimal container images that have /etc, /usr and nothing else.
+    HOST_TREE_MIN = 2
+
+    def _mount_host_tree(self):
+        """Re-key a host filesystem root as though it were a copied one.
+
+        This is what an analyst gets by mounting an image - with a forensic
+        mounter, losetup, or by plugging the disk in - and pointing linsight
+        at the mountpoint. Read as an ordinary collection it produced a report
+        with no users, no logs and no cron in it: every parser asks for
+        /etc/passwd under the filesystem copy, and /etc/passwd was sitting
+        right there at the top with no prefix at all. An empty report reads as
+        a host with nothing on it, which is the one answer this tool must
+        never invent.
+
+        The fix is not a special case downstream. The members are renamed to
+        the [root]/... the parsers already look for, and _raw keeps what they
+        are really called on disk - which is the same mechanism that already
+        maps './[root]/etc/passwd' inside a tar back to its member name. From
+        here on this is indistinguishable from a UAC collection.
+        """
+        if self.prefix or not self._looks_like_host_tree():
+            return
+        names, sizes, mtimes, raw = {}, {}, {}, {}
+        for low, real in self._names.items():
+            member = "[root]/" + real.lstrip("/")
+            key = member.lower()
+            names[key] = member
+            sizes[key] = self._sizes.get(low, 0)
+            if low in self._mtimes:
+                mtimes[key] = self._mtimes[low]
+            raw[key] = self._raw.get(low, real)
+        self._names, self._sizes, self._mtimes, self._raw =             names, sizes, mtimes, raw
+        self.mounted_root = True
+
+    def _looks_like_host_tree(self):
+        """Whether the collection root is itself a host filesystem root."""
+        tops = set()
+        plen = len(self.prefix)
+        for low in self._names:
+            if not low.startswith(self.prefix):
+                continue
+            rest = low[plen:]
+            if "/" in rest:
+                tops.add(rest.split("/", 1)[0])
+        hits = tops & set(HOST_ANCHORS)
+        # /etc is what every parser here actually needs; a tree without it is
+        # not one this would gain anything from being read as
+        return len(hits) >= self.HOST_TREE_MIN and "etc" in hits
+
     # -- lookup -------------------------------------------------------------
     def resolve(self, rel):
         """Collection-relative path -> real member name, or None."""
@@ -594,6 +649,10 @@ class Collection:
     def host_path(self, rel):
         """Collection-relative [root]/... path -> host absolute path."""
         for rd in self.rootfs_dirs:
+            if not rd:
+                # the collection root is the host root, so the member name is
+                # already the host path bar its leading slash
+                return "/" + rel.lstrip("/")
             if rel.lower().startswith(rd + "/"):
                 return "/" + rel[len(rd) + 1:]
         return rel
@@ -601,7 +660,11 @@ class Collection:
     # -- reading ------------------------------------------------------------
     def _open(self, real):
         if self.kind == "dir":
-            return open(os.path.join(self.path, real), "rb")
+            # _raw carries what the file is really called under self.path,
+            # which differs from its member name when a mounted filesystem
+            # root was re-keyed under [root]/
+            return open(os.path.join(self.path,
+                                     self._raw.get(real.lower(), real)), "rb")
         # back to whatever the archive calls it - './[root]/etc/passwd' where
         # the rest of the tool says '[root]/etc/passwd'
         member = self._raw.get(real.lower(), real)
