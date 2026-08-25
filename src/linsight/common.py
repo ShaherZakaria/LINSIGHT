@@ -592,6 +592,47 @@ FAILED_LOGIN_RULES = [
 ]
 
 
+#: Punctuation a log wraps an address in, none of which is part of it.
+_ADDR_WRAP = " \t\r\n\"'<>(),;"
+_ADDR_BRACKET_RE = re.compile(r"^\[([0-9A-Fa-f:.]+)\](?::\d+)?$")
+_ADDR_V4_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$")
+#: What a daemon writes when it has no address to write.
+_ADDR_NONE = ("", "-", "?", "::", "unknown", "unknown-host", "n/a")
+
+
+def clean_addr(value):
+    r"""A host or address as the log meant it, without what surrounds it.
+
+    Every one of these patterns captures the address with '\S+', because a
+    log writes hostnames and v4 and v6 addresses in the same slot and none of
+    them has a fixed shape. '\S+' also takes whatever punctuation follows:
+    sshd's 'Received disconnect from 192.168.56.101: 11: disconnected by
+    user' yields '192.168.56.101:'.
+
+    That is not a cosmetic problem. The trailing colon makes a second
+    indicator for a host already in the list, of a shape that matches nothing
+    when it is searched for, and ioc_type reads it as a filename because it
+    is a dot-bearing token that is not an address. One host became two rows
+    in IOCS, one of them useless, and the useless one was typed wrongly.
+
+    The port goes too, where it can be told apart from the address: a source
+    port belongs in its own column and is not part of who connected.
+    """
+    s = (value or "").strip().strip(_ADDR_WRAP)
+    # ':' ends an address only in the '::' form, which is not a host on its own
+    while s and s[-1] in ".,;:":
+        s = s[:-1]
+    if s.lower() in _ADDR_NONE:
+        return ""
+    m = _ADDR_BRACKET_RE.match(s)          # [2001:db8::1]:443
+    if m:
+        return m.group(1)
+    m = _ADDR_V4_RE.match(s)               # 1.2.3.4:51004
+    if m:
+        return m.group(1)
+    return s
+
+
 def match_failed_login(proc, msg):
     """One log message -> (kind, user, ip, port, method, detail), or None."""
     for label, erx in FAILED_LOGIN_RULES:
@@ -604,7 +645,7 @@ def match_failed_login(proc, msg):
         pick = lambda *k: next((g[x].strip() for x in k
                                 if g.get(x) and g[x].strip()), "")
         return (label, pick("user", "target", "target2"),
-                pick("ip", "ip2"), pick("port"), pick("method"),
+                clean_addr(pick("ip", "ip2")), pick("port"), pick("method"),
                 pick("detail"))
     return None
 
@@ -732,6 +773,8 @@ IOC_TECHNIQUES = (
     ("authorized_keys", "T1098.004 SSH Authorized Keys"),
     ("interactive login", "T1078 Valid Accounts"),
     ("failed authentication source", "T1110 Brute Force"),
+    ("authentication source", "T1078 Valid Accounts"),
+    ("smb client", "T1021.002 Remote Services: SMB/Windows Admin Shares"),
     ("password spraying source", "T1110.003 Password Spraying"),
     ("systemd unit", "T1543.002 Systemd Service"),
     ("suid", "T1548.001 Setuid and Setgid"),

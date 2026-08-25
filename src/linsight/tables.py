@@ -25,7 +25,8 @@ from .common import (
     SENSITIVE_FILE_BENIGN, SENSITIVE_FILE_EXPECTED,
     SENSITIVE_FILE_RE, PRIVATE_KEY_DIR, PUBLIC_CERT_DIR,
     HACKTOOL_VARIANT_OTHER, NDJSON_TIME_COLUMNS, PRIVILEGED_GROUPS,
-    PRIV_HINT_RE, TMPFS_DIRS, _printable, _ts_text, _tz_delta, epoch,
+    PRIV_HINT_RE, TMPFS_DIRS, _printable, _ts_text, _tz_delta, clean_addr,
+    epoch,
     hexip_to_str, human_size, ioc_mitre, ioc_type, match_failed_login,
     norm_ip, norm_log_ts, span_add, split_hostport, variant_add)
 from .decode import (
@@ -3653,7 +3654,7 @@ class TableBuilder:
                                     if g.get(x) and g[x].strip()), "")
             return (label, klass, pick("user", "user2", "user3"),
                     pick("target", "target2", "target3"),
-                    pick("grp", "grp2", "grp3"), pick("ip"),
+                    pick("grp", "grp2", "grp3"), clean_addr(pick("ip")),
                     pick("port"), pick("cmd"), pick("tty"), pick("pwd"))
         return ("", "", "", "", "", "", "", "", "", "")
 
@@ -3699,7 +3700,7 @@ class TableBuilder:
                         user = um.group(1) if um else ""
                     if not ip:
                         rm = re.search(r"\brhost=([^\s]+)", msg)
-                        ip = rm.group(1) if rm and rm.group(1) not in ("", "-") else ""
+                        ip = clean_addr(rm.group(1)) if rm else ""
                     if not tty:
                         tm = re.search(r"\btty=(\S+)", msg)
                         tty = tm.group(1) if tm else ""
@@ -3710,7 +3711,10 @@ class TableBuilder:
                         r"incorrect|NOT in sudoers|error)\b", msg, re.I)
                         else "success" if event else "")
                     if ip:
-                        self.tri.ioc(ip, host_path)
+                        self.tri.ioc(ip, "failed authentication source"
+                                     if result == "failure"
+                                     else "authentication source",
+                                     host_path)
                     t.add(self.ts_utc(raw_ts), raw_ts, lhost, proc, pid or "",
                           event, klass, user, target, grp, ip, port, tty, pwd,
                           cmd, result, msg, host_path)
@@ -3857,8 +3861,10 @@ class TableBuilder:
                 continue
             self.use(rel, "FAILED_LOGINS")
             for r in parse_utmp(raw):
+                r["ip"] = clean_addr(r["ip"])
                 if r["ip"]:
-                    self.tri.ioc(r["ip"], host_path)
+                    self.tri.ioc(r["ip"], "failed authentication source",
+                                 host_path)
                 t.add(r["time"].strftime("%Y-%m-%d %H:%M:%S") if r["time"] else "",
                       "failed login", r["user"], r["host"], r["ip"], "",
                       r["line"], "", "", r["type"], "btmp", host_path)
@@ -3887,10 +3893,11 @@ class TableBuilder:
                         user = um.group(1) if um else ""
                     if not ip:
                         rm = re.search(r"\brhost=([^\s]+)", msg)
-                        ip = rm.group(1) if rm and rm.group(1) not in ("", "-") else ""
+                        ip = clean_addr(rm.group(1)) if rm else ""
                     tm = re.search(r"\btty=(\S+)", msg)
                     if ip:
-                        self.tri.ioc(ip, host_path)
+                        self.tri.ioc(ip, "failed authentication source",
+                                     host_path)
                     t.add(self.ts_utc(raw_ts), label, user, "", ip, port,
                           tm.group(1) if tm else "", proc, method,
                           detail or trunc(msg, 200), "auth.log", host_path)
@@ -3908,9 +3915,9 @@ class TableBuilder:
                 user = um.group(1) if um else ""
             if not ip:
                 rm = re.search(r"\brhost=([^\s]+)", msg)
-                ip = rm.group(1) if rm and rm.group(1) not in ("", "-") else ""
+                ip = clean_addr(rm.group(1)) if rm else ""
             if ip:
-                self.tri.ioc(ip, host_path)
+                self.tri.ioc(ip, "failed authentication source", host_path)
             t.add(ts, label, user, hostname, ip, port, tty, ident, method,
                   detail or trunc(msg, 200), "journal", host_path)
 
@@ -3933,11 +3940,10 @@ class TableBuilder:
                 if kv.get("res") in ("success", "yes", "1"):
                     continue
                 dt = epoch(ts_s)
-                addr = kv.get("addr", "")
-                if addr in ("?", "-"):
-                    addr = ""
+                addr = clean_addr(kv.get("addr", ""))
                 if addr:
-                    self.tri.ioc(addr, host_path)
+                    self.tri.ioc(addr, "failed authentication source",
+                                 host_path)
                 t.add(dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "",
                       rtype.lower().replace("_", " "),
                       kv.get("acct", kv.get("auid", "")),
@@ -5454,7 +5460,8 @@ class TableBuilder:
                     g = m.groupdict()
                     rq = self.REQ_RE.match(g["req"] or "") if g.get("req") else None
                     dash = lambda v: "" if v in ("-", None) else v
-                    self.tri.ioc(g["ip"], host)
+                    g["ip"] = clean_addr(g["ip"])
+                    self.tri.ioc(g["ip"], "web request source", host)
                     t.add(self.ts_utc(g["ts"]), g["ts"], server,
                           kind if kind != "other" else "access",
                           g["ip"], dash(g["user"]),
@@ -5474,10 +5481,11 @@ class TableBuilder:
                     rq = self.REQ_RE.match(rm.group(1)) if rm else None
                     ref = (self.NGINX_REFERRER_RE.search(msg)
                            if "referrer:" in msg else None)
-                    if cm:
-                        self.tri.ioc(cm.group(1), host)
+                    cip = clean_addr(cm.group(1)) if cm else ""
+                    if cip:
+                        self.tri.ioc(cip, "web error source", host)
                     t.add(self.ts_utc(g["ts"].replace("/", "-")), g["ts"],
-                          server, "error", cm.group(1) if cm else "", "",
+                          server, "error", cip, "",
                           rq.group("method") if rq else "",
                           rq.group("res") if rq else "",
                           rq.group("proto") if rq and rq.group("proto") else "",
@@ -5493,14 +5501,14 @@ class TableBuilder:
                     if not ip and "[client " in msg:
                         cm = self.CLIENT_RE.search(msg)
                         ip = cm.group("ip") if cm else ""
-                    ip = ip.rsplit(":", 1)[0]
+                    ip = clean_addr(ip)
                     code = ""
                     if "AH" in msg:
                         km = self.AH_CODE_RE.search(msg)
                         code = km.group(1) if km else ""
                     rq = self.ERR_REQ_RE.search(msg) if "HTTP/" in msg else None
                     if ip:
-                        self.tri.ioc(ip, host)
+                        self.tri.ioc(ip, "web error source", host)
                     t.add(self.ts_utc(re.sub(r"\.\d+", "", g["ts"])), g["ts"],
                           server, "error", ip, "",
                           rq.group("method") if rq else "",
@@ -5567,7 +5575,11 @@ class TableBuilder:
             if base.lower().startswith("log.") and \
                     base.lower() not in ("log.smbd", "log.nmbd", "log.winbindd"):
                 client = base[4:]
-                self.tri.ioc(client, host)
+                # smb.conf ships 'log file = /var/log/samba/log.%m', and samba
+                # writes that name literally when it has no client name to put
+                # in it. The file is real; '%m' is not a host.
+                if "%" not in client:
+                    self.tri.ioc(client, "smb client", host)
             cur = None
             body = []
 
@@ -5624,7 +5636,8 @@ class TableBuilder:
                     action = word
                     break
             if d.get("SRC"):
-                self.tri.ioc(d["SRC"], host)
+                d["SRC"] = clean_addr(d["SRC"])
+                self.tri.ioc(d["SRC"], "firewall-logged source", host)
             t.add(self.ts_utc(ts_raw), ts_raw, action, d.get("IN", ""),
                   d.get("OUT", ""), d.get("SRC", ""), d.get("DST", ""),
                   d.get("PROTO", ""), d.get("SPT", ""), d.get("DPT", ""),
@@ -5657,7 +5670,8 @@ class TableBuilder:
             d = dict(kv.findall(msg))
             am = act.search(msg)
             if d.get("SRC"):
-                self.tri.ioc(d["SRC"], host)
+                d["SRC"] = clean_addr(d["SRC"])
+                self.tri.ioc(d["SRC"], "firewall-logged source", host)
             t.add(ts, ts, next((w for w in ("BLOCK", "DROP", "REJECT",
                                             "ALLOW", "ACCEPT")
                                 if w in msg.upper()), ""),
@@ -5857,6 +5871,18 @@ class TableBuilder:
                 continue
             rel = real[plen:]
             if not rel.lstrip("/").lower().startswith(rootfs):
+                continue
+            # /dev is full of device nodes and symlinks, and the finding
+            # this feeds is about regular files. An archive backend answers
+            # 'f' for everything because a directory listing has nothing else
+            # in it, so this only ever excludes anything on a backend that
+            # reads the filesystem itself - which is the one that sees device
+            # nodes at all. Without it every disk image raised a HIGH on its
+            # own /dev: 90 of them on Webserver.E01, /dev/console and
+            # /dev/dsp among them, and 90 indicators that buried the four
+            # real ones.
+            kind = self.col.member_kind(rel)
+            if kind and kind != "f":
                 continue
             host = self.col.host_path(rel)
             area = ("shm" if host.startswith("/dev/shm/") else
@@ -6112,8 +6138,9 @@ class TableBuilder:
                 rtype, ts, eid, body = m.groups()
                 dt = epoch(ts)
                 kv = self._audit_kv(body)
-                if kv.get("addr") and kv["addr"] not in ("?", "-"):
-                    self.tri.ioc(kv["addr"], host)
+                kv["addr"] = clean_addr(kv.get("addr", ""))
+                if kv["addr"]:
+                    self.tri.ioc(kv["addr"], "audit event source", host)
                 t.add(dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "", eid,
                       rtype, kv.get("pid", ""), kv.get("ppid", ""),
                       kv.get("auid", ""), kv.get("uid", ""), kv.get("gid", ""),
@@ -7333,8 +7360,9 @@ class TableBuilder:
     def t_pivot(self):
         """Where each --pivot indicator was seen, one row per hit."""
         t = self.table("IOC_HITS", "Indicator hits across the collection",
-                       ["indicator", "ioc_type", "mitre", "count", "first_utc",
-                        "last_utc", "artifact", "line_no", "line"],
+                       ["indicator", "ioc_type", "why", "mitre", "count",
+                        "first_utc", "last_utc", "artifact", "line_no",
+                        "line"],
                        "Detection",
                        "Every artifact mentioning a term given with --pivot "
                        "(or '@file' of them). Sort by indicator to follow one "
@@ -7347,14 +7375,20 @@ class TableBuilder:
                        "the sample kept as evidence. A row's own time is not "
                        "a separate column because the line it quotes already "
                        "carries its stamp where the artifact recorded one. "
-                       "mitre is the technique implied by where the indicator "
-                       "was picked up, and is empty for a term supplied on "
-                       "the command line, which arrives with no such history.")
+                       "why is how this term came to be an indicator at all - "
+                       "an analyzer's provenance label, or 'pivot' for one "
+                       "given on the command line - and mitre is the technique "
+                       "that label implies. A term supplied by hand arrives "
+                       "with no such history, so both are thin for it; a term "
+                       "an analyzer raised carries the reason it was raised "
+                       "onto every row of evidence for it, which is the "
+                       "context that says whether a hit matters.")
         stats = getattr(self.tri, "pivot_stats", {})
         iocs = getattr(self.tri, "iocs", {})
         for term, host, n, line in getattr(self.tri, "pivot_hits", []):
             cnt, first, last = stats.get(term, ("", "", ""))
-            t.add(term, ioc_type(term), ioc_mitre(iocs.get(term)),
+            labels = sorted(iocs.get(term, ()))
+            t.add(term, ioc_type(term), "; ".join(labels), ioc_mitre(labels),
                   cnt, first, last, host, n, line)
 
     def t_iocs(self):
@@ -7381,16 +7415,23 @@ class TableBuilder:
         if not iocs:
             return
         t = self.table("IOCS", "Indicators extracted from this host",
-                       ["indicator", "ioc_type", "why", "count",
-                        "artifact_count", "first_utc", "last_utc",
-                        "artifacts", "mitre"],
+                       ["indicator", "ioc_type", "why", "mitre",
+                        "extracted_from", "count", "artifact_count",
+                        "first_utc", "last_utc", "artifacts"],
                        "Detection",
                        "Every indicator any analyzer extracted, with the "
-                       "provenance that made it one. 'why' is where it was "
-                       "picked up and is what separates two indicators of the "
-                       "same shape: an address seen as a failed-login source "
-                       "is a different fact from the same address seen on an "
-                       "outbound admin connection. count, first_utc and "
+                       "provenance that made it one. 'why' is what kind of "
+                       "observation it was, and is what separates two "
+                       "indicators of the same shape: an address seen as a "
+                       "failed-login source is a different fact from the same "
+                       "address seen on an outbound admin connection. "
+                       "'extracted_from' is the artifact that observation was "
+                       "read out of - where to go and look at it in context - "
+                       "and is a separate question from why, which is the "
+                       "reason it is in this list. 'artifacts' is a different "
+                       "column again: it is where the term was found by the "
+                       "sweep, which includes everything that merely mentions "
+                       "it. count, first_utc and "
                        "last_utc are measured across every artifact in the "
                        "collection rather than only the one that named it. "
                        "They are filled for the terms the run pivoted on; "
@@ -7413,14 +7454,18 @@ class TableBuilder:
                 status("[!] indicator counting failed: %s" % exc)
         stats = getattr(self.tri, "pivot_stats", {})
         arts = getattr(self.tri, "pivot_artifacts", {})
+        srcs = getattr(self.tri, "ioc_sources", {})
+        join = lambda xs: ("; ".join(xs[:12]) + (" ..." if len(xs) > 12 else ""))
         for value in sorted(iocs, key=lambda v: (ioc_type(v), v.lower())):
             labels = sorted(iocs[value])
             count, first, last = stats.get(value, ("", "", ""))
             where = arts.get(value, [])
-            t.add(value, ioc_type(value), "; ".join(labels),
-                  count, len(where), first, last,
-                  "; ".join(where[:12]) + (" ..." if len(where) > 12 else ""),
-                  ioc_mitre(labels))
+            t.add(value, ioc_type(value), "; ".join(labels), ioc_mitre(labels),
+                  join(sorted(srcs.get(value, ()))), count,
+                  # an unmeasured count is blank, not 0: 0 is the answer
+                  # 'measured, and found nowhere else', which is a finding
+                  len(where) if count != "" else "",
+                  first, last, join(where))
 
     def t_rule_errors(self):
         """Rules that would not load, and why - the coverage you did not get."""
