@@ -36,6 +36,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 
 from .term import status
+from .fsbase import GeneratedLines, epoch_seconds
 from .collect import Collection
 from .image import ImageError, open_image
 from .volume import READABLE_FS, scan
@@ -62,38 +63,6 @@ DEFAULT_MAX_FILES = 3000000
 
 class DiskError(Exception):
     pass
-
-
-class _GeneratedFile(io.RawIOBase):
-    """A read-only stream over lines produced on demand.
-
-    The bodyfile of a full server filesystem is a few hundred megabytes of
-    text that exists only because this tool wants to read it back. Generating
-    it into memory to hand to a reader that consumes it a line at a time is
-    the kind of thing that turns a 4 GB machine into a swapping one, so it is
-    produced as it is read.
-    """
-
-    def __init__(self, make_lines):
-        io.RawIOBase.__init__(self)
-        self._iter = make_lines()
-        self._buf = b""
-        self._done = False
-
-    def readable(self):
-        return True
-
-    def readinto(self, buf):
-        want = len(buf)
-        while len(self._buf) < want and not self._done:
-            try:
-                self._buf += next(self._iter)
-            except StopIteration:
-                self._done = True
-        take = min(want, len(self._buf))
-        buf[:take] = self._buf[:take]
-        self._buf = self._buf[take:]
-        return take
 
 
 class DiskCollection(Collection):
@@ -387,22 +356,22 @@ class DiskCollection(Collection):
                 name = "%s -> %s" % (name, node.target)
             yield ("0|%s|%d|%s|%d|%d|%d|%d|%d|%d|%d\n"
                    % (name, node.inode, node.mode_string(), node.uid, node.gid,
-                      node.size, _epoch(node.atime), _epoch(node.mtime),
-                      _epoch(node.ctime), _epoch(node.crtime))
+                      node.size, epoch_seconds(node.atime), epoch_seconds(node.mtime),
+                      epoch_seconds(node.ctime), epoch_seconds(node.crtime))
                    ).encode("utf-8", "surrogateescape")
         for node in self.deleted_nodes:
             yield ("0|%s (deleted)|%d|%s|%d|%d|%d|%d|%d|%d|%d\n"
                    % (node.path, node.inode, node.mode_string(), node.uid,
-                      node.gid, node.size, _epoch(node.atime),
-                      _epoch(node.mtime), _epoch(node.ctime),
-                      _epoch(node.crtime))
+                      node.gid, node.size, epoch_seconds(node.atime),
+                      epoch_seconds(node.mtime), epoch_seconds(node.ctime),
+                      epoch_seconds(node.crtime))
                    ).encode("utf-8", "surrogateescape")
 
     # -- reading ------------------------------------------------------------
     def _open(self, real):
         if real in self._virtual:
             if real == "bodyfile/bodyfile.txt":
-                return _GeneratedFile(self._bodyfile_lines)
+                return GeneratedLines(self._bodyfile_lines)
             return io.BytesIO(self._virtual[real] or b"")
         node = self._nodes.get(real)
         if node is None:
@@ -490,15 +459,6 @@ class DiskCollection(Collection):
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-def _epoch(when):
-    if not when:
-        return 0
-    try:
-        return int(when.timestamp())
-    except (OverflowError, OSError, ValueError):
-        return 0
-
 
 def _find(fs, path):
     """Resolve one absolute path without walking the whole filesystem.

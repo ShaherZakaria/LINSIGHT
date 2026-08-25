@@ -11,6 +11,7 @@ from .term import status
 from .collect import Collection, FilesCollection, parse_file_spec
 from .image import ImageError, looks_like_disk, open_image
 from .disk import DEFAULT_MAX_FILES, DiskCollection, DiskError
+from .ad1 import Ad1Collection, Ad1Error, looks_like_ad1
 from .volume import READABLE_FS, scan
 from .rules import (
     sigma_cache_count, sigma_cache_dir, sigma_cache_manifest,
@@ -379,7 +380,23 @@ def main(argv=None):
                      "or --disk PATH")
         return list_volumes(disk_path)
 
-    if disk_path:
+    # An AD1 is a logical image - a tree of files, not a disk - so it lands on
+    # the collection side. Like every other container it is recognised rather
+    # than declared.
+    ad1_path = ""
+    if not disk_path and opts.collection and looks_like_ad1(opts.collection):
+        ad1_path = opts.collection
+
+    if ad1_path:
+        try:
+            col = Ad1Collection(ad1_path, quiet=opts.quiet,
+                                max_files=max(0, opts.disk_max_files))
+        except Ad1Error as exc:
+            ap.error(str(exc))
+        status("[*] read %s file(s) out of %s"
+               % (format(len(col._names) - 1, ","),
+                  os.path.basename(col.path)))
+    elif disk_path:
         try:
             col = DiskCollection(
                 disk_path, quiet=opts.quiet,

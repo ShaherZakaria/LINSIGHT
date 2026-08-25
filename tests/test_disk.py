@@ -51,12 +51,13 @@ def load(built):
     sys.path.insert(0, os.path.join(ROOT, "src"))
     import linsight.image, linsight.volume, linsight.disk        # noqa
     import linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs   # noqa
+    import linsight.ad1                                          # noqa
 
     class Flat(object):
         pass
 
     flat = Flat()
-    for mod in (linsight.image, linsight.volume, linsight.disk,
+    for mod in (linsight.image, linsight.volume, linsight.disk, linsight.ad1,
                 linsight.fs_ext, linsight.fs_xfs, linsight.fs_btrfs):
         for name in dir(mod):
             if not name.startswith("__"):
@@ -491,6 +492,131 @@ def check_lvm(L, res):
         image.close()
 
 
+def check_ad1(L, res):
+    """Every AD1 in the fixture directory, verified against its own hashes.
+
+    This one does not need a fixture that ships with the project. FTK records
+    an MD5 and a SHA-1 for every file as it acquires it, so any AD1 anyone
+    drops into tests/fixtures carries its own answer key: extract each file,
+    hash it, and compare with what the imager wrote. A reader that has the
+    format even slightly wrong cannot produce 1,860 matching digests.
+
+    So the way to check this reader against a new image is to put that image
+    here and run this.
+    """
+    print("\nad1 - each file checked against the MD5/SHA-1 FTK stored")
+    images = []
+    if os.path.isdir(FIXTURES):
+        for name in sorted(os.listdir(FIXTURES)):
+            if name.lower().endswith(".ad1"):
+                images.append(os.path.join(FIXTURES, name))
+    if not images:
+        res.skip("ad1", "no .ad1 in tests/fixtures - drop one in to cover it")
+        return
+    for path in images:
+        name = os.path.basename(path)
+        try:
+            reader = L.Ad1Reader(L.ad1_segments(path))
+        except Exception as exc:
+            res.fail(name, "would not open: %s" % exc)
+            continue
+        try:
+            ok = bad = nohash = dirs = 0
+            first_bad = ""
+            for e in reader.walk():
+                if e.kind == "d":
+                    dirs += 1
+                    continue
+                if not (e.md5 or e.sha1):
+                    nohash += 1
+                    continue
+                try:
+                    data = reader.read(e)
+                except Exception as exc:
+                    bad += 1
+                    first_bad = first_bad or "%s: %s" % (e.path, exc)
+                    continue
+                why = []
+                if len(data) != e.size:
+                    why.append("read %d of %d bytes" % (len(data), e.size))
+                if e.md5 and hashlib.md5(data).hexdigest() != e.md5.lower():
+                    why.append("md5")
+                if e.sha1 and hashlib.sha1(data).hexdigest() != e.sha1.lower():
+                    why.append("sha1")
+                if why:
+                    bad += 1
+                    first_bad = first_bad or "%s: %s" % (e.path, ", ".join(why))
+                else:
+                    ok += 1
+            if bad:
+                res.fail(name, "%d of %d files did not match - %s"
+                               % (bad, ok + bad, first_bad))
+            elif not ok:
+                res.fail(name, "no file in it carried a stored hash to check")
+            else:
+                res.ok("%-22s %d files verified, %d directories%s"
+                       % (name, ok, dirs,
+                          ", %d without a stored hash" % nohash if nohash else ""))
+
+            # the streaming path and the whole-file path are different code
+            # and have to agree, or a large log reads differently than a
+            # small one and nothing says so
+            checked = 0
+            differed = ""
+            for e in reader.walk():
+                if e.kind == "d" or e.size < 100000:
+                    continue
+                whole = reader.read(e)
+                with reader.open(e) as fh:
+                    fh.seek(50000)
+                    piece = fh.read(20000)
+                if piece != whole[50000:70000]:
+                    differed = e.path
+                    break
+                checked += 1
+                if checked >= 10:
+                    break
+            if differed:
+                res.fail(name, "%s streams differently than it reads" % differed)
+            elif checked:
+                res.ok("%-22s streaming agrees with whole-file on %d files"
+                       % (name, checked))
+        finally:
+            reader.close()
+
+    # and the collection view: the paths the host had, and a bodyfile
+    for path in images:
+        name = os.path.basename(path)
+        try:
+            col = L.Ad1Collection(path, quiet=True)
+        except Exception as exc:
+            res.fail(name + " (collection)", "would not mount: %s" % exc)
+            continue
+        try:
+            problems = []
+            if not col._entries:
+                problems.append("mounted nothing")
+            for member in list(col._entries)[:200]:
+                if not member.startswith("[root]/"):
+                    problems.append("%s is not under [root]" % member)
+                    break
+            lines = list(col.iter_lines("bodyfile/bodyfile.txt"))
+            if len(lines) < len(col._entries):
+                problems.append("bodyfile has %d lines for %d entries"
+                                % (len(lines), len(col._entries)))
+            timed = sum(1 for ln in lines
+                        if len(ln.split("|")) > 10 and ln.split("|")[10] != "0")
+            if not timed:
+                problems.append("no entry in the bodyfile carries a crtime")
+            if problems:
+                res.fail(name + " (collection)", problems[0])
+            else:
+                res.ok("%-22s %d members, %d bodyfile lines, %d with crtime"
+                       % (name + " (coll)", len(col._entries), len(lines), timed))
+        finally:
+            col.close()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--built", action="store_true",
@@ -522,6 +648,7 @@ def main(argv=None):
     check_crtime_and_deleted(L, res)
     check_lvm(L, res)
     check_refusals(L, res)
+    check_ad1(L, res)
 
     print("\n%d passed, %d failed, %d skipped"
           % (res.passed, len(res.failed), len(res.skipped)))

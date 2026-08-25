@@ -418,7 +418,8 @@ class TableBuilder:
                 self.use(rel, "METADATA")
         t.add("Collection path", self.col.path)
         t.add("Collection kind", self.col.kind)
-        t.add("Collection layout", self.col.layout)
+        t.add("Collection layout",
+              getattr(self.col, "display_layout", "") or self.col.layout)
         t.add("Files in collection", len(self.col._names))
         t.add("Rootfs dirs", ", ".join(self.col.rootfs_dirs))
         # an export that holds half the collection has to say so on its face -
@@ -3984,7 +3985,14 @@ class TableBuilder:
                       bf.get("mtime", ""), hashes.get(p, {}).get("md5", ""), rel)
 
     def _exe_hashes(self):
-        """path -> {md5, sha1, sha256} from hash_executables, built once."""
+        """path -> {md5, sha1, sha256}, from whatever recorded them.
+
+        UAC runs a hashing pass and writes the result under hash_executables.
+        An AD1 has them already: FTK records an MD5 and a SHA-1 for every file
+        as it acquires it, and they are the acquisition's own record of what
+        the file was - better provenance than a hash computed afterwards, and
+        available for every file rather than only the executables.
+        """
         if self._exe_hash_map is None:
             out = {}
             for algo in ("md5", "sha1", "sha256"):
@@ -3994,6 +4002,12 @@ class TableBuilder:
                         if len(parts) == 2:
                             out.setdefault(parts[1].strip(), {})[algo] = \
                                 parts[0].strip()
+            for path, stored in (getattr(self.col, "stored_hashes", None)
+                                 or {}).items():
+                entry = out.setdefault(path, {})
+                for algo in ("md5", "sha1", "sha256"):
+                    if stored.get(algo) and not entry.get(algo):
+                        entry[algo] = stored[algo]
             self._exe_hash_map = out
         return self._exe_hash_map
 

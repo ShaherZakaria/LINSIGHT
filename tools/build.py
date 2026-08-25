@@ -54,6 +54,7 @@ MODULES = [
     ("fs_xfs",    "the XFS reader"),
     ("fs_btrfs",  "the btrfs reader"),
     ("disk",      "the disk backend: a filesystem on a disk, as a collection"),
+    ("ad1",       "AccessData logical images (AD1), as a collection"),
     ("rules",     "detection rules: a YARA subset and a Sigma subset"),
     ("triage",    "the triage engine"),
     ("tables",    "artifact tables - every artifact as a browsable grid"),
