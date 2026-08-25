@@ -14623,7 +14623,15 @@ class Table:
 
 
 def _human_duration(seconds):
-    """Seconds -> '3d 04:12', '02:14', '41s' - the way `last` reads."""
+    """Seconds -> '3d 04h', '2h 14m', '4m 55s', '41s'.
+
+    Every unit is labelled. `last` writes a four-minute session as '(00:04)'
+    and this followed it, which was fine while wtmp was the only source:
+    wtmp sessions are minutes at least. PAM sessions are often seconds, so
+    the column now holds '41s' and '00:04' side by side, and there is no
+    reading of '00:04' that is obviously four minutes rather than four
+    seconds. duration_seconds is the one to sort on either way.
+    """
     if seconds in ("", None):
         return ""
     try:
@@ -14636,13 +14644,38 @@ def _human_duration(seconds):
         return "%ds" % n
     days, rest = divmod(n, 86400)
     hours, rest = divmod(rest, 3600)
+    mins, secs = divmod(rest, 60)
     if days:
-        return "%dd %02d:%02d" % (days, hours, rest // 60)
-    return "%02d:%02d" % (hours, rest // 60)
+        return "%dd %02dh" % (days, hours)
+    if hours:
+        return "%dh %02dm" % (hours, mins)
+    return "%dm %02ds" % (mins, secs)
 
 
 #: 'pam_unix(sshd:session): session opened ...' -> the service that opened it.
 PAM_SERVICE_RE = re.compile(r"pam_\w+\(([^:)]+):session\)")
+
+#: How long before a session opens an addressed line may be and still be
+#: taken as belonging to it. sshd writes 'Accepted password' and 'session
+#: opened' in the same second; the slack is for a slow keyboard-interactive
+#: or two-factor prompt. A pid is reused eventually, and the point of the
+#: window is that a session does not inherit the address of whatever last
+#: held its pid - days earlier, or on the boot before.
+ADDRESS_WINDOW = 300
+
+
+def _address_for(rows, start, ip, tty):
+    """Fill a session's address in from the newest addressed line before it.
+
+    Nothing is filled from a line after the session opened, or from one so
+    far before it that the pid has plainly been reused since.
+    """
+    for when, was_ip, was_tty in reversed(rows or ()):
+        gap = _span_seconds(when, start)
+        if gap == "" or gap > ADDRESS_WINDOW:
+            continue
+        return ip or was_ip, tty or was_tty
+    return ip, tty
 
 
 def _span_seconds(start, end):
@@ -17781,12 +17814,25 @@ class TableBuilder:
         i_ip = cols.index("source_ip") if "source_ip" in cols else -1
         i_tty = cols.index("tty") if "tty" in cols else -1
         i_msg = cols.index("message") if "message" in cols else -1
-        recs = []
+        recs, ctx = [], []
         for row in auth.iter_rows():
             event = str(row[i_ev]) if i_ev < len(row) else ""
-            if event not in ("session opened", "session closed"):
-                continue
             proc = str(row[i_proc]) if i_proc < len(row) else ""
+            if event not in ("session opened", "session closed"):
+                # PAM's 'session opened' line carries no address. sshd logs
+                # where the connection came from on the line before it -
+                # 'Accepted password for mail from 192.168.210.131 port
+                # 57686' - and both lines carry the sshd child pid, which is
+                # what ties them together. Keep the addressed lines to fill
+                # the session in from. Only ones with a pid: without one the
+                # address would come from whatever else that service did.
+                pid = str(row[i_pid]) if i_pid < len(row) else ""
+                ip = str(row[i_ip]) if 0 <= i_ip < len(row) else ""
+                tty = str(row[i_tty]) if 0 <= i_tty < len(row) else ""
+                if pid and (ip or tty):
+                    ctx.append((str(row[i_ts]) if i_ts < len(row) else "",
+                                proc, pid, ip, tty))
+                continue
             # PAM names the service in its own message, and that is the clean
             # answer. The syslog ident is not: GDM really does log as
             # 'gdm-password]' and systemd's user manager as '(systemd)', which
@@ -17803,10 +17849,17 @@ class TableBuilder:
                          str(row[i_src]) if i_src < len(row) else ""))
         # undated rows keep their order and go last; they cannot be placed.
         recs.sort(key=lambda r: (r[0] == "", r[0]))
+        ctx.sort(key=lambda r: (r[0] == "", r[0]))
+        addressed = {}
+        for when, proc, pid, ip, tty in ctx:
+            addressed.setdefault((proc, pid), []).append((when, ip, tty))
         out, open_on = [], {}
         for when, event, proc, pid, user, ip, tty, src in recs:
             key = (proc, pid, user)
             if event == "session opened":
+                if pid and not (ip and tty):
+                    ip, tty = _address_for(addressed.get((proc, pid)), when,
+                                           ip, tty)
                 sess = {"user": user, "service": proc, "pid": pid,
                         "start": when, "end": "", "state": "",
                         "host": ip, "line": tty, "source": src}
