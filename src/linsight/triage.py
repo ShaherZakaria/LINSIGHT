@@ -76,6 +76,8 @@ class Triage:
         self.host_tz = {}
         self.iocs = defaultdict(set)         # ioc -> why it is one
         self.ioc_sources = defaultdict(set)  # ioc -> artifacts it came from
+        self.ioc_count = defaultdict(int)    # ioc -> times an analyzer saw it
+        self.ioc_span = defaultdict(lambda: ['', ''])   # ioc -> first, last
         self.pivot_artifacts = {}     # indicator -> the artifacts naming it
         self.pivot_reported = set()   # the ones that earn a finding
         self.ww_paths = set()         # world-writable paths confirmed from the bodyfile
@@ -361,7 +363,7 @@ class Triage:
             self.events.append(Event(ts.replace(tzinfo=timezone.utc), f.category,
                                      f.title, f.severity, f.source or "(finding)"))
 
-    def ioc(self, value, why, source=""):
+    def ioc(self, value, why, source="", when=""):
         """Record an indicator, why it is one, and the artifact it came from.
 
         These are two different facts and used to be one argument. `why` is a
@@ -369,7 +371,17 @@ class Triage:
         protocol' - and is the only thing that knows why a string is in the
         list at all, which is also what IOC_TECHNIQUES keys on. `source` is
         the artifact it was read out of, which is where an analyst goes to
-        see it in context.
+        see it in context. `when` is the time on the row that produced it.
+
+        Counting here rather than in a sweep is the difference between a
+        table that answers 'how often, and between when and when' on every
+        run and one that answers it only when asked to spend twenty minutes
+        re-reading the whole collection. The analyzer is already standing on
+        the row: it knows it has seen this address once more, and it knows
+        what time that row carries. --count-iocs still measures every
+        mention anywhere, which is a wider question and a much slower one -
+        those land in the sweep_ columns, next to these rather than instead
+        of them.
 
         Half the callers passed a label and half passed a path, so the why
         column of IOCS read '/var/log/auth.log' for every address any log
@@ -383,6 +395,8 @@ class Triage:
             self.iocs[value].add(why)
             if source:
                 self.ioc_sources[value].add(source)
+            self.ioc_count[value] += 1
+            span_add(self.ioc_span[value], when)
 
     def log_ts(self, text):
         """Log timestamp -> UTC string, using the host's offset and clock year.
@@ -2190,11 +2204,11 @@ class Triage:
             if len(hits) >= self.BRUTE_FORCE_THRESHOLD:
                 brute.append(line)
                 brute_ts.extend(times)
-                self.ioc(ip, "failed authentication source")
+                self.ioc(ip, "failed authentication source", "", times[0].strftime("%Y-%m-%d %H:%M:%S") if times else "")
             if len(users) >= self.SPRAY_USER_THRESHOLD:
                 spray.append(line)
                 spray_ts.extend(times)
-                self.ioc(ip, "password spraying source")
+                self.ioc(ip, "password spraying source", "", times[0].strftime("%Y-%m-%d %H:%M:%S") if times else "")
             for t, *_ in hits:
                 if t:
                     self.event(t, "Authentication",
@@ -2850,7 +2864,9 @@ class Triage:
                 if is_exec:
                     tmpfs_exec.append(row)
                     when["tmpfs_exec"].append(mtime)
-                    self.ioc(path, "bodyfile (executable in tmpfs)")
+                    self.ioc(path, "bodyfile (executable in tmpfs)", src,
+                             mtime.strftime("%Y-%m-%d %H:%M:%S")
+                             if mtime else "")
                     self.event(mtime, "File", "executable in tmpfs: %s" % path, "HIGH", src)
                 elif is_reg and size != "0":
                     tmpfs_other.append(row)
