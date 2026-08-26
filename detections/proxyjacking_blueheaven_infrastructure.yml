@@ -1,0 +1,41 @@
+title: Known proxyjacking infrastructure - blueheaven control server
+id: 95ebe1c9-f81c-4941-a3c9-7cfedfaa71ad
+status: experimental
+description: |
+  The named infrastructure behind the proxy implant seen on this host: the
+  control host rr.blueheaven.live, its /1010/ endpoint path, the iprv.php and
+  ip.php registration scripts, and the hard-coded 'client' basic-auth user the
+  loader ships with. The behavioural rule beside this one is the durable
+  detection; this is the atomic one, for sweeping other hosts and historical
+  logs for the same operator.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  host:
+    cmdline|contains:
+      - 'blueheaven.live'
+      - '/1010/iprv.php'
+      - '/1010/ip.php'
+      - '-u client:'
+  host_raw:
+    message|contains:
+      - 'blueheaven.live'
+      - '/1010/iprv.php'
+      - '/1010/ip.php'
+  condition: host or host_raw
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+falsepositives:
+  - None expected.
+level: critical
+tags:
+  - attack.command_and_control
+  - attack.t1090
+  - attack.impact
+  - attack.t1496

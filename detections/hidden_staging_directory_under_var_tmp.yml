@@ -1,0 +1,89 @@
+title: Process running from a dot-hidden directory under /var/tmp or /dev/shm
+id: edb09253-d917-4cd7-900c-40b63a439ca1
+status: experimental
+description: |
+  A working directory or command path inside a dot-prefixed tree under
+  /var/tmp, /tmp or /dev/shm - '/var/tmp/.log/101068/.spoollog' and the like.
+  Nothing the distribution ships stages itself in a hidden directory under a
+  world-writable path; the leading dot is there to keep the tree out of a
+  plain ls, which is a statement of intent on its own.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  hidden:
+    cmdline|contains:
+      - '/var/tmp/.'
+      - '/dev/shm/.'
+      - '/tmp/.'
+  hidden_raw:
+    message|contains:
+      - '/var/tmp/.'
+      - '/dev/shm/.'
+  systemd_private:
+    cmdline|contains:
+      - '/tmp/.X11-unix'
+      - '/tmp/.ICE-unix'
+      - '/tmp/.font-unix'
+      - 'systemd-private-'
+  investigating:
+    cmdline|startswith:
+      - 'rm '
+      - 'ls '
+      - 'cat '
+      - 'file '
+      - 'stat '
+      - 'find '
+      - 'grep '
+      - 'md5sum '
+      - 'sha256sum '
+      - 'pkill'
+      - 'kill '
+      - 'chmod '
+      - 'chown '
+      - 'tar '
+      - 'cp /tmp'
+  investigating_raw:
+    message|contains:
+      - 'a0="rm"'
+      - 'a0="ls"'
+      - 'a0="cat"'
+      - 'a0="find"'
+      - 'a0="grep"'
+      - 'a0="stat"'
+      - 'a0="file"'
+      - 'a0="pkill"'
+      - 'a0="chmod"'
+      - 'a0="chown"'
+      - 'a0="md5sum"'
+      - 'a0="sha256sum"'
+  searching:
+    cmdline|contains:
+      - 'grep'
+      - 'pgrep'
+      - 'pidof'
+      - 'ps aux'
+      - 'ps -ef'
+  searching_raw:
+    message|contains:
+      - 'a1="grep"'
+      - 'a0="grep"'
+      - 'a0="egrep"'
+      - 'a0="pgrep"'
+      - 'a0="pidof"'
+  condition: (hidden or hidden_raw) and not (systemd_private or investigating or investigating_raw or searching or searching_raw)
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+falsepositives:
+  - Build systems and package managers that stage under /tmp/.something.
+  - Responders listing or deleting the staging tree, which is why the
+    'investigating' filter is here - see the crimeware-names rule.
+level: high
+tags:
+  - attack.defense_evasion
+  - attack.t1564.001

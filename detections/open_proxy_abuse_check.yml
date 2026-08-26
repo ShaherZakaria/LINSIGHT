@@ -1,0 +1,33 @@
+title: Open-proxy check via absolute-URI or CONNECT request
+id: a295b8cb-f533-420e-9b1e-cc5ad6e106d9
+status: experimental
+description: |
+  CONNECT requests, or GET requests whose path is an absolute URL to another
+  host. Both ask the server to fetch or tunnel to somewhere else, which a
+  correctly configured web server refuses. They arrive in bulk from actors
+  testing whether the host can be used as a relay; a 200 to one of them means
+  it can be, and the host is now part of someone else's infrastructure.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  connect:
+    method: 'CONNECT'
+  absolute:
+    resource|startswith:
+      - 'http://'
+      - 'https://'
+  condition: connect or absolute
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+falsepositives:
+  - A host that is deliberately a forward proxy.
+level: medium
+tags:
+  - attack.command_and_control
+  - attack.t1090

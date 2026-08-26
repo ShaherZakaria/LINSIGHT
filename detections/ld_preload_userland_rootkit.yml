@@ -1,0 +1,37 @@
+title: LD_PRELOAD userland rootkit installed
+id: 3fbadd44-92a6-4435-9651-2b17708cbb59
+status: experimental
+description: |
+  /etc/ld.so.preload written, or a library preloaded from a world-writable
+  path. Every dynamically linked process started afterwards loads that
+  library first, which is how a userland rootkit hides its own processes,
+  files and sockets from ps, ls and ss - including from the collector that
+  produced this evidence.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  preload:
+    cmdline|contains:
+      - 'ld.so.preload'
+      - 'LD_PRELOAD='
+  preload_raw:
+    message|contains:
+      - 'ld.so.preload'
+      - 'LD_PRELOAD='
+  condition: preload or preload_raw
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+falsepositives:
+  - Some vendor agents and profilers legitimately set LD_PRELOAD. A write to
+    /etc/ld.so.preload itself is far more rarely legitimate.
+level: critical
+tags:
+  - attack.persistence
+  - attack.t1574.006
+  - attack.defense_evasion
