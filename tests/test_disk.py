@@ -1192,6 +1192,71 @@ def check_host_identity(L, res):
                % len(HOST_CASES))
 
 
+class _IocOnly(object):
+    """Just enough of Triage for ioc(), which touches only these four."""
+
+    def __init__(self, L):
+        import collections
+        self.iocs = collections.defaultdict(set)
+        self.ioc_sources = collections.defaultdict(set)
+        self.ioc_count = collections.defaultdict(int)
+        self.ioc_span = collections.defaultdict(lambda: ["", ""])
+
+
+def check_ioc_counting(L, res):
+    """Counted and dated where it is extracted, not in a second pass.
+
+    IOCS advertised count, first_utc and last_utc and delivered none of them
+    unless the run was given --pivot or --count-iocs, the second of which
+    re-reads the whole collection. The analyzer is already standing on the
+    row that produced the indicator, so it can say how many times it saw it
+    and what times those rows carried - for nothing.
+    """
+    print("\nindicator counting - filled without a second pass")
+    t = _IocOnly(L)
+    ioc = L.Triage.ioc
+    ioc(t, "1.2.3.4", "web request source", "/var/log/a.log", "2019-10-05 09:00:00")
+    ioc(t, "1.2.3.4", "web request source", "/var/log/a.log", "2019-10-05 11:00:00")
+    ioc(t, "1.2.3.4", "failed authentication source", "/var/log/auth.log",
+        "2019-10-05 10:00:00")
+    # an observation with no time still counts; it just cannot widen the span
+    ioc(t, "1.2.3.4", "smb client", "/var/log/samba/log.1.2.3.4", "")
+    # an empty value is not an indicator
+    ioc(t, "", "web request source", "/var/log/a.log", "2019-10-05 09:00:00")
+
+    problems = []
+    if t.ioc_count["1.2.3.4"] != 4:
+        problems.append("count %d, expected 4" % t.ioc_count["1.2.3.4"])
+    if t.ioc_span["1.2.3.4"] != ["2019-10-05 09:00:00", "2019-10-05 11:00:00"]:
+        problems.append("span %r" % (t.ioc_span["1.2.3.4"],))
+    if t.iocs["1.2.3.4"] != {"web request source",
+                             "failed authentication source", "smb client"}:
+        problems.append("why %r" % (sorted(t.iocs["1.2.3.4"]),))
+    if t.ioc_sources["1.2.3.4"] != {"/var/log/a.log", "/var/log/auth.log",
+                                    "/var/log/samba/log.1.2.3.4"}:
+        problems.append("sources %r" % (sorted(t.ioc_sources["1.2.3.4"]),))
+    if "" in t.iocs:
+        problems.append("an empty value was recorded as an indicator")
+    if problems:
+        res.fail("indicator count and span", problems[0] +
+                 ("" if len(problems) == 1 else
+                  " (and %d more)" % (len(problems) - 1)))
+    else:
+        res.ok("indicator count and span 4 observations, 3 reasons, 3 sources")
+
+    # An indicator seen once, with no time anywhere, must still count 1 -
+    # a blank count is what this whole change was about.
+    t2 = _IocOnly(L)
+    ioc(t2, "port:6667", "listening socket")
+    if t2.ioc_count["port:6667"] != 1:
+        res.fail("untimed indicator", "count %d" % t2.ioc_count["port:6667"])
+    elif t2.ioc_span["port:6667"] != ["", ""]:
+        res.fail("untimed indicator", "invented a span %r"
+                 % (t2.ioc_span["port:6667"],))
+    else:
+        res.ok("untimed indicator        counted 1, and no span invented")
+
+
 def check_inventory_times(L, res):
     """FILE_INVENTORY has to carry times, and say where they came from."""
     print("\nfile inventory - times, and what they mean")
@@ -1529,6 +1594,7 @@ def main(argv=None):
     check_ad1(L, res)
     check_distribution(L, res)
     check_host_identity(L, res)
+    check_ioc_counting(L, res)
     check_filename_hunts(L, res)
     check_addresses(L, res)
     check_html_pack(L, res)

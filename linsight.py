@@ -10755,6 +10755,8 @@ class Triage:
         self.host_tz = {}
         self.iocs = defaultdict(set)         # ioc -> why it is one
         self.ioc_sources = defaultdict(set)  # ioc -> artifacts it came from
+        self.ioc_count = defaultdict(int)    # ioc -> times an analyzer saw it
+        self.ioc_span = defaultdict(lambda: ['', ''])   # ioc -> first, last
         self.pivot_artifacts = {}     # indicator -> the artifacts naming it
         self.pivot_reported = set()   # the ones that earn a finding
         self.ww_paths = set()         # world-writable paths confirmed from the bodyfile
@@ -11040,7 +11042,7 @@ class Triage:
             self.events.append(Event(ts.replace(tzinfo=timezone.utc), f.category,
                                      f.title, f.severity, f.source or "(finding)"))
 
-    def ioc(self, value, why, source=""):
+    def ioc(self, value, why, source="", when=""):
         """Record an indicator, why it is one, and the artifact it came from.
 
         These are two different facts and used to be one argument. `why` is a
@@ -11048,7 +11050,17 @@ class Triage:
         protocol' - and is the only thing that knows why a string is in the
         list at all, which is also what IOC_TECHNIQUES keys on. `source` is
         the artifact it was read out of, which is where an analyst goes to
-        see it in context.
+        see it in context. `when` is the time on the row that produced it.
+
+        Counting here rather than in a sweep is the difference between a
+        table that answers 'how often, and between when and when' on every
+        run and one that answers it only when asked to spend twenty minutes
+        re-reading the whole collection. The analyzer is already standing on
+        the row: it knows it has seen this address once more, and it knows
+        what time that row carries. --count-iocs still measures every
+        mention anywhere, which is a wider question and a much slower one -
+        those land in the sweep_ columns, next to these rather than instead
+        of them.
 
         Half the callers passed a label and half passed a path, so the why
         column of IOCS read '/var/log/auth.log' for every address any log
@@ -11062,6 +11074,8 @@ class Triage:
             self.iocs[value].add(why)
             if source:
                 self.ioc_sources[value].add(source)
+            self.ioc_count[value] += 1
+            span_add(self.ioc_span[value], when)
 
     def log_ts(self, text):
         """Log timestamp -> UTC string, using the host's offset and clock year.
@@ -12869,11 +12883,11 @@ class Triage:
             if len(hits) >= self.BRUTE_FORCE_THRESHOLD:
                 brute.append(line)
                 brute_ts.extend(times)
-                self.ioc(ip, "failed authentication source")
+                self.ioc(ip, "failed authentication source", "", times[0].strftime("%Y-%m-%d %H:%M:%S") if times else "")
             if len(users) >= self.SPRAY_USER_THRESHOLD:
                 spray.append(line)
                 spray_ts.extend(times)
-                self.ioc(ip, "password spraying source")
+                self.ioc(ip, "password spraying source", "", times[0].strftime("%Y-%m-%d %H:%M:%S") if times else "")
             for t, *_ in hits:
                 if t:
                     self.event(t, "Authentication",
@@ -13529,7 +13543,9 @@ class Triage:
                 if is_exec:
                     tmpfs_exec.append(row)
                     when["tmpfs_exec"].append(mtime)
-                    self.ioc(path, "bodyfile (executable in tmpfs)")
+                    self.ioc(path, "bodyfile (executable in tmpfs)", src,
+                             mtime.strftime("%Y-%m-%d %H:%M:%S")
+                             if mtime else "")
                     self.event(mtime, "File", "executable in tmpfs: %s" % path, "HIGH", src)
                 elif is_reg and size != "0":
                     tmpfs_other.append(row)
@@ -18202,7 +18218,7 @@ class TableBuilder:
                         self.tri.ioc(ip, "failed authentication source"
                                      if result == "failure"
                                      else "authentication source",
-                                     host_path)
+                                     host_path, self.ts_utc(raw_ts))
                     t.add(self.ts_utc(raw_ts), raw_ts, lhost, proc, pid or "",
                           event, klass, user, target, grp, ip, port, tty, pwd,
                           cmd, result, msg, host_path)
@@ -18352,7 +18368,9 @@ class TableBuilder:
                 r["ip"] = clean_addr(r["ip"])
                 if r["ip"]:
                     self.tri.ioc(r["ip"], "failed authentication source",
-                                 host_path)
+                                 host_path,
+                                 r["time"].strftime("%Y-%m-%d %H:%M:%S")
+                                 if r["time"] else "")
                 t.add(r["time"].strftime("%Y-%m-%d %H:%M:%S") if r["time"] else "",
                       "failed login", r["user"], r["host"], r["ip"], "",
                       r["line"], "", "", r["type"], "btmp", host_path)
@@ -18385,7 +18403,7 @@ class TableBuilder:
                     tm = re.search(r"\btty=(\S+)", msg)
                     if ip:
                         self.tri.ioc(ip, "failed authentication source",
-                                     host_path)
+                                     host_path, self.ts_utc(raw_ts))
                     t.add(self.ts_utc(raw_ts), label, user, "", ip, port,
                           tm.group(1) if tm else "", proc, method,
                           detail or trunc(msg, 200), "auth.log", host_path)
@@ -18405,7 +18423,8 @@ class TableBuilder:
                 rm = re.search(r"\brhost=([^\s]+)", msg)
                 ip = clean_addr(rm.group(1)) if rm else ""
             if ip:
-                self.tri.ioc(ip, "failed authentication source", host_path)
+                self.tri.ioc(ip, "failed authentication source", host_path,
+                             ts)
             t.add(ts, label, user, hostname, ip, port, tty, ident, method,
                   detail or trunc(msg, 200), "journal", host_path)
 
@@ -18431,7 +18450,7 @@ class TableBuilder:
                 addr = clean_addr(kv.get("addr", ""))
                 if addr:
                     self.tri.ioc(addr, "failed authentication source",
-                                 host_path)
+                                 host_path, dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "")
                 t.add(dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "",
                       rtype.lower().replace("_", " "),
                       kv.get("acct", kv.get("auid", "")),
@@ -19949,7 +19968,8 @@ class TableBuilder:
                     rq = self.REQ_RE.match(g["req"] or "") if g.get("req") else None
                     dash = lambda v: "" if v in ("-", None) else v
                     g["ip"] = clean_addr(g["ip"])
-                    self.tri.ioc(g["ip"], "web request source", host)
+                    self.tri.ioc(g["ip"], "web request source", host,
+                                 self.ts_utc(g["ts"]))
                     t.add(self.ts_utc(g["ts"]), g["ts"], server,
                           kind if kind != "other" else "access",
                           g["ip"], dash(g["user"]),
@@ -19971,7 +19991,8 @@ class TableBuilder:
                            if "referrer:" in msg else None)
                     cip = clean_addr(cm.group(1)) if cm else ""
                     if cip:
-                        self.tri.ioc(cip, "web error source", host)
+                        self.tri.ioc(cip, "web error source", host,
+                                     self.ts_utc(g["ts"].replace("/", "-")))
                     t.add(self.ts_utc(g["ts"].replace("/", "-")), g["ts"],
                           server, "error", cip, "",
                           rq.group("method") if rq else "",
@@ -19996,7 +20017,8 @@ class TableBuilder:
                         code = km.group(1) if km else ""
                     rq = self.ERR_REQ_RE.search(msg) if "HTTP/" in msg else None
                     if ip:
-                        self.tri.ioc(ip, "web error source", host)
+                        self.tri.ioc(ip, "web error source", host,
+                                     self.ts_utc(re.sub(r"\.\d+", "", g["ts"])))
                     t.add(self.ts_utc(re.sub(r"\.\d+", "", g["ts"])), g["ts"],
                           server, "error", ip, "",
                           rq.group("method") if rq else "",
@@ -20066,17 +20088,26 @@ class TableBuilder:
                 # smb.conf ships 'log file = /var/log/samba/log.%m', and samba
                 # writes that name literally when it has no client name to put
                 # in it. The file is real; '%m' is not a host.
-                if "%" not in client:
-                    self.tri.ioc(client, "smb client", host)
+                if "%" in client:
+                    client = ""
             cur = None
             body = []
+            recs = 0
 
             def flush():
+                nonlocal recs
                 if cur is None:
                     return
+                ts = self.ts_utc(cur["ts"].replace("/", "-"))
+                # registered per record rather than once from the filename:
+                # the name says which client, and only the records say how
+                # much it did and between when and when
+                if client:
+                    recs += 1
+                    self.tri.ioc(client, "smb client", host, ts)
                 msg = " ".join(b.strip() for b in body if b.strip())
                 um = re.search(r"user\s*\[?([^\]\s]+)\]?", msg, re.I)
-                t.add(self.ts_utc(cur["ts"].replace("/", "-")), cur["ts"],
+                t.add(ts, cur["ts"],
                       cur["lvl"], cur["ref"], cur["fn"] or "", client,
                       um.group(1) if um else "", msg, host, cur["i"])
 
@@ -20093,6 +20124,10 @@ class TableBuilder:
                 elif ln.strip():
                     t.add("", "", "", "", "", client, "", ln.strip(), host, i)
             flush()
+            # a log with no parseable record still names its client, and that
+            # the host has a log for it at all is the evidence it connected
+            if client and not recs:
+                self.tri.ioc(client, "smb client", host)
 
     def t_firewall_log(self):
         """Packets the firewall actually logged.
@@ -20125,7 +20160,8 @@ class TableBuilder:
                     break
             if d.get("SRC"):
                 d["SRC"] = clean_addr(d["SRC"])
-                self.tri.ioc(d["SRC"], "firewall-logged source", host)
+                self.tri.ioc(d["SRC"], "firewall-logged source", host,
+                             self.ts_utc(ts_raw))
             t.add(self.ts_utc(ts_raw), ts_raw, action, d.get("IN", ""),
                   d.get("OUT", ""), d.get("SRC", ""), d.get("DST", ""),
                   d.get("PROTO", ""), d.get("SPT", ""), d.get("DPT", ""),
@@ -20159,7 +20195,7 @@ class TableBuilder:
             am = act.search(msg)
             if d.get("SRC"):
                 d["SRC"] = clean_addr(d["SRC"])
-                self.tri.ioc(d["SRC"], "firewall-logged source", host)
+                self.tri.ioc(d["SRC"], "firewall-logged source", host, ts)
             t.add(ts, ts, next((w for w in ("BLOCK", "DROP", "REJECT",
                                             "ALLOW", "ACCEPT")
                                 if w in msg.upper()), ""),
@@ -20628,7 +20664,8 @@ class TableBuilder:
                 kv = self._audit_kv(body)
                 kv["addr"] = clean_addr(kv.get("addr", ""))
                 if kv["addr"]:
-                    self.tri.ioc(kv["addr"], "audit event source", host)
+                    self.tri.ioc(kv["addr"], "audit event source", host,
+                                 dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "")
                 t.add(dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "", eid,
                       rtype, kv.get("pid", ""), kv.get("ppid", ""),
                       kv.get("auid", ""), kv.get("uid", ""), kv.get("gid", ""),
@@ -21873,8 +21910,17 @@ class TableBuilder:
                        "context that says whether a hit matters.")
         stats = getattr(self.tri, "pivot_stats", {})
         iocs = getattr(self.tri, "iocs", {})
+        seen = getattr(self.tri, "ioc_count", {})
+        spans = getattr(self.tri, "ioc_span", {})
         for term, host, n, line in getattr(self.tri, "pivot_hits", []):
             cnt, first, last = stats.get(term, ("", "", ""))
+            # the sweep is the fuller answer where it ran, but a term the
+            # analyzers raised has been counted and dated already, and that
+            # is better than three empty columns
+            span = spans.get(term) or ["", ""]
+            if cnt == "":
+                cnt = seen.get(term, "") or ""
+            first, last = first or span[0], last or span[1]
             labels = sorted(iocs.get(term, ()))
             t.add(term, ioc_type(term), "; ".join(labels), ioc_mitre(labels),
                   cnt, first, last, host, n, line)
@@ -21903,9 +21949,9 @@ class TableBuilder:
         if not iocs:
             return
         t = self.table("IOCS", "Indicators extracted from this host",
-                       ["indicator", "ioc_type", "why", "mitre",
-                        "extracted_from", "count", "artifact_count",
-                        "first_utc", "last_utc", "artifacts"],
+                       ["indicator", "ioc_type", "why", "mitre", "count",
+                        "first_utc", "last_utc", "extracted_from",
+                        "sweep_count", "sweep_artifacts"],
                        "Detection",
                        "Every indicator any analyzer extracted, with the "
                        "provenance that made it one. 'why' is what kind of "
@@ -21919,16 +21965,18 @@ class TableBuilder:
                        "reason it is in this list. 'artifacts' is a different "
                        "column again: it is where the term was found by the "
                        "sweep, which includes everything that merely mentions "
-                       "it. count, first_utc and "
-                       "last_utc are measured across every artifact in the "
-                       "collection rather than only the one that named it. "
-                       "They are filled for the terms the run pivoted on; "
-                       "--count-iocs measures every indicator instead, at the "
-                       "cost of a much slower sweep. An empty count means not "
-                       "measured, and a 0 means measured and found nowhere "
-                       "else - which is itself worth knowing. Feed the "
-                       "indicator column to a SIEM; read the why column "
-                       "before you do.")
+                       "it. count, first_utc and last_utc are counted as the "
+                       "analyzers extract it and are filled on every run: how "
+                       "many times something actually observed this indicator, "
+                       "and the span of those observations. For an address in "
+                       "a web log that is how many requests came from it and "
+                       "when they ran, which is usually the question. "
+                       "sweep_count and sweep_artifacts are the wider and much "
+                       "slower measure - every mention of the string anywhere "
+                       "in the collection, including incidental ones - and are "
+                       "filled only for the terms the run pivoted on, or for "
+                       "everything under --count-iocs. Feed the indicator "
+                       "column to a SIEM; read the why column before you do.")
         # Measured here rather than during the analysis: half the indicators
         # in this table are extracted by the table extractors above, so a
         # sweep run any earlier would count the analyzers' own and quietly
@@ -21943,17 +21991,18 @@ class TableBuilder:
         stats = getattr(self.tri, "pivot_stats", {})
         arts = getattr(self.tri, "pivot_artifacts", {})
         srcs = getattr(self.tri, "ioc_sources", {})
+        seen = getattr(self.tri, "ioc_count", {})
+        spans = getattr(self.tri, "ioc_span", {})
         join = lambda xs: ("; ".join(xs[:12]) + (" ..." if len(xs) > 12 else ""))
         for value in sorted(iocs, key=lambda v: (ioc_type(v), v.lower())):
             labels = sorted(iocs[value])
-            count, first, last = stats.get(value, ("", "", ""))
+            span = spans.get(value) or ["", ""]
+            swept, _first, _last = stats.get(value, ("", "", ""))
             where = arts.get(value, [])
             t.add(value, ioc_type(value), "; ".join(labels), ioc_mitre(labels),
-                  join(sorted(srcs.get(value, ()))), count,
-                  # an unmeasured count is blank, not 0: 0 is the answer
-                  # 'measured, and found nowhere else', which is a finding
-                  len(where) if count != "" else "",
-                  first, last, join(where))
+                  seen.get(value, "") or "", span[0], span[1],
+                  join(sorted(srcs.get(value, ()))),
+                  swept, join(where))
 
     def t_rule_errors(self):
         """Rules that would not load, and why - the coverage you did not get."""
