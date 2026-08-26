@@ -1,0 +1,38 @@
+title: Running process whose executable was deleted from a world-writable path
+id: 3b90566d-c844-4115-8410-d6311bfc294e
+status: experimental
+description: |
+  A live process whose /proc/pid/exe points at a deleted file under /tmp,
+  /var/tmp or /dev/shm. Unlinking the binary immediately after launch is a
+  deliberate anti-forensic step: the process keeps running, the path shows
+  nothing to an investigator listing the filesystem, and the image only
+  survives in the inode and in memory. A package upgrade leaves deleted
+  executables too - but under /usr, not under /tmp.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: process_creation
+detection:
+  deleted:
+    exe|contains: '(deleted)'
+  writable:
+    exe|startswith:
+      - '/tmp/'
+      - '/var/tmp/'
+      - '/dev/shm/'
+      - '/run/shm/'
+  condition: deleted and writable
+fields:
+  - pid
+  - user
+  - start_utc
+  - exe
+  - args
+falsepositives:
+  - None expected.
+level: critical
+tags:
+  - attack.defense_evasion
+  - attack.t1070.004
+  - attack.t1036.005

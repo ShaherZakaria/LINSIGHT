@@ -1,0 +1,45 @@
+title: Host registering its own addresses with a remote proxy control server
+id: fc2e57c2-7ee1-4fd8-bffd-442100f511af
+status: experimental
+description: |
+  curl invoked with --interface, binding each local address in turn, and
+  posting form fields to a remote endpoint. This is how residential-proxy
+  monetisation implants (proxyjacking) enrol a compromised host: they walk
+  the local ranges, bind each address, and register it as a usable exit with
+  the operator's control server. It is not covered by miner or webshell
+  signatures, because nothing about it looks like either.
+  Written on behaviour rather than on any one domain or client id, so it
+  survives the operator changing infrastructure.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  curl:
+    cmdline|contains: 'curl'
+  bind:
+    cmdline|contains: '--interface'
+  register:
+    cmdline|contains: '--data-urlencode'
+  curl_raw:
+    message|contains: '"curl"'
+  bind_raw:
+    message|contains: '"--interface"'
+  register_raw:
+    message|contains: '"--data-urlencode"'
+  condition: (curl and bind and register) or (curl_raw and bind_raw and register_raw)
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+falsepositives:
+  - Multi-homed hosts whose own monitoring binds each interface in turn to
+    report to a central collector. Check who the destination belongs to.
+level: high
+tags:
+  - attack.impact
+  - attack.t1496
+  - attack.command_and_control
+  - attack.t1090

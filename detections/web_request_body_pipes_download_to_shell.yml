@@ -1,0 +1,52 @@
+title: Web request body downloads a payload and pipes it to a shell
+id: 543910f8-ac4a-43ea-bd2f-9f9463f3f009
+status: experimental
+description: |
+  A request body or logged request line containing curl or wget whose output
+  is piped straight into an interpreter. This is the delivery half of a web
+  RCE: the exploit gets one command, and that command fetches the real
+  payload. Requires the server to log bodies (mod_dumpio, or the URL itself
+  carrying the command), so absence here is not evidence of absence.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  fetch:
+    message|contains:
+      - 'curl '
+      - 'wget '
+  pipe:
+    message|contains:
+      - '|bash'
+      - '| bash'
+      - '|sh'
+      - '| sh'
+      - '|python'
+      - '| python'
+  urlfetch:
+    resource|contains:
+      - 'curl '
+      - 'wget '
+      - 'curl%20'
+      - 'wget%20'
+  urlpipe:
+    resource|contains:
+      - '|bash'
+      - '|sh'
+      - '%7Cbash'
+      - '%7Csh'
+  condition: (fetch and pipe) or (urlfetch and urlpipe)
+fields:
+  - client_ip
+  - resource
+  - message
+falsepositives:
+  - Documentation or installer pages that quote a curl-pipe-to-shell command.
+level: critical
+tags:
+  - attack.execution
+  - attack.t1059.004
+  - attack.command_and_control
+  - attack.t1105

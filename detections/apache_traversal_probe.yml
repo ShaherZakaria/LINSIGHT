@@ -1,0 +1,42 @@
+title: Apache path traversal probe, not confirmed executed
+id: 20654f78-f2f6-4301-8956-801a3fb64381
+status: experimental
+description: |
+  Traversal-encoded request paths that did not return 200 on an interpreter.
+  Scanning, or exploitation against a host that is patched or configured with
+  the stock 'Require all denied'. Kept separate from the confirmed-execution
+  rule so that 'someone tried' and 'it worked' are never read as one number.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  traversal:
+    resource|contains:
+      - '.%2e/'
+      - '%2e%2e/'
+      - '.%%32%65/'
+      - '%252e%252e'
+      - '..%2f'
+      - '.%2e%2f'
+  executed:
+    status: '200'
+  interpreter:
+    resource|contains:
+      - '/bin/sh'
+      - '/bin/bash'
+      - '/bin/dash'
+      - '/bin/zsh'
+  condition: traversal and not (executed and interpreter)
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+falsepositives:
+  - Vulnerability scanners run by the owner of the host.
+level: medium
+tags:
+  - attack.reconnaissance
+  - attack.t1595.002

@@ -1,0 +1,66 @@
+title: Commodity Linux crimeware executing - kinsing, kdevtmpfsi, xmrig, Mozi
+id: 26b4138e-7288-4a32-9c61-db7e562650a3
+status: experimental
+description: |
+  The named families that colonise exposed Linux hosts, matched only where
+  the name is the thing being RUN - argv[0] of an execve, or a live process's
+  comm or exe. Not where the name merely appears in a command line.
+  That distinction is the whole rule. On a host under active investigation
+  the string 'kinsing' is everywhere: in the responder's 'egrep
+  kinsing|kdevtmpfsi', in every 'rm -rf /tmp/kinsing*', in each statx of the
+  files, in the cleanup cron. A rule that matches the name anywhere reports
+  the defender's work as an infection and fires hundreds of times on a host
+  where the malware never actually ran.
+  Names are the weakest kind of indicator and these families rename their
+  droppers on every download - the behavioural rules beside this one are what
+  actually holds. This one exists because when it does fire it names the
+  family outright, and that is worth having in the first ten minutes.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  executed:
+    message|contains:
+      - 'a0="kinsing'
+      - 'a0="/tmp/kinsing'
+      - 'a0="kdevtmpfsi'
+      - 'a0="/tmp/kdevtmpfsi'
+      - 'a0="xmrig'
+      - 'a0="./xmrig'
+      - 'a0="/tmp/Mozi'
+      - 'a0="Mozi'
+  running:
+    comm|contains:
+      - 'kinsing'
+      - 'kdevtmpfsi'
+      - 'xmrig'
+      - 'Mozi'
+  image:
+    exe|contains:
+      - 'kinsing'
+      - 'kdevtmpfsi'
+      - 'xmrig'
+      - 'Mozi'
+  condition: 1 of executed or running or image
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - exe
+  - cmdline
+falsepositives:
+  - >-
+    None expected. A legitimate process is not named kinsing. Note the
+    inverse risk instead - this rule stays silent when the family is present
+    on disk but never executed, which is exactly what happened on the host it
+    was written against, where the operator had already made every dropped
+    binary zero-length and read-only. File presence is a different question
+    and the file inventory answers it.
+level: high
+tags:
+  - attack.execution
+  - attack.t1059.004
+  - attack.impact
+  - attack.t1496

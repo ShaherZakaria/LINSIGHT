@@ -1,0 +1,51 @@
+title: Apache path traversal reaching a shell interpreter (CVE-2021-41773/42013)
+id: 9a750cce-3e62-4e14-a4ff-4f39e95ea148
+status: experimental
+description: |
+  A traversal-encoded request that resolved to /bin/sh or /bin/bash and
+  returned HTTP 200. In Apache 2.4.49/2.4.50 with mod_cgi enabled and no
+  'Require all denied' on <Directory />, that is not a file read - the
+  interpreter ran and its output is the response body. Every row here is one
+  unauthenticated command execution as the web server's user.
+  The status is what separates this from a scan: the same request returning
+  403 or 404 is a probe being refused.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-41773
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-42013
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  traversal:
+    resource|contains:
+      - '.%2e/'
+      - '%2e%2e/'
+      - '.%%32%65/'
+      - '%252e%252e'
+      - '..%2f'
+      - '.%2e%2f'
+  interpreter:
+    resource|contains:
+      - '/bin/sh'
+      - '/bin/bash'
+      - '/bin/dash'
+      - '/bin/zsh'
+  executed:
+    status: '200'
+  condition: traversal and interpreter and executed
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - size
+falsepositives:
+  - None. A 200 on a traversal path ending at an interpreter has no benign form.
+level: critical
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - attack.execution
+  - attack.t1059.004

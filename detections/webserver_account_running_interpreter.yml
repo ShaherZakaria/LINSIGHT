@@ -1,0 +1,51 @@
+title: Web server account running a shell, downloader or interpreter
+id: 782f41ae-db13-47d1-b1a3-0bebc8c9ee87
+status: experimental
+description: |
+  A process owned by the web server's own account whose executable is a
+  shell, a downloader or a scripting interpreter. The daemon account exists
+  to serve requests; it does not run curl, and it does not run a shell with
+  no controlling terminal. Where a web application legitimately shells out,
+  this fires constantly and should be tuned to that application rather than
+  disabled - the point is that the set of things it runs should be small,
+  known, and stable.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: process_creation
+detection:
+  account:
+    user:
+      - 'daemon'
+      - 'www-data'
+      - 'apache'
+      - 'httpd'
+      - 'nginx'
+      - 'nobody'
+  interpreter:
+    exe|contains:
+      - '/sh'
+      - '/bash'
+      - '/dash'
+      - '/curl'
+      - '/wget'
+      - '/perl'
+      - '/python'
+      - '/nc'
+      - '/ncat'
+      - '/socat'
+  condition: account and interpreter
+fields:
+  - pid
+  - ppid
+  - user
+  - start_utc
+  - exe
+  - args
+falsepositives:
+  - CGI applications and web hooks that legitimately execute scripts.
+level: high
+tags:
+  - attack.execution
+  - attack.t1059.004
