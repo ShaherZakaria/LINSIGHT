@@ -254,6 +254,26 @@ def _span_seconds(start, end):
     return secs if secs >= 0 else ""
 
 
+def _event_dt(value):
+    """A row's start as an aware UTC datetime, whichever form it is in.
+
+    These tables carry a time as a datetime where they decoded one out of a
+    binary and as 'YYYY-MM-DD HH:MM:SS' where they normalised one out of text.
+    Both are already UTC; only the type differs, and the timeline needs the
+    datetime.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value or "")[:19]
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
 def _end_after(start, seconds):
     """A 'YYYY-MM-DD HH:MM:SS' start plus a duration -> when it ended, or ''.
 
@@ -623,8 +643,19 @@ class TableBuilder:
                        "its own severity, so the timeline and the findings "
                        "list answer a severity filter with the same set - a "
                        "finding-derived row carries the artifact it came from "
-                       "in source, or '(finding)' where it had none.")
-        for e in self.tri.events:
+                       "in source, or '(finding)' where it had none. Sessions "
+                       "and elevations are here as events in their own right: "
+                       "a successful sign-in from LOGINS, LOGIN_RECORDS or "
+                       "WTMPDB, and every sudo, su, pkexec and account change "
+                       "from PRIVILEGE_ACTIVITY. Each is drawn once however "
+                       "many of the logs recorded it, so 'how many times did "
+                       "they elevate' is answered by counting rows.")
+        # Sorted here rather than trusting the order they arrived in. The
+        # analyzers sort their own events when they finish, and then the
+        # extractors above add more - every session and every elevation -
+        # which land after that sort and would otherwise sit in a block at the
+        # end, out of order, in a table whose whole purpose is order.
+        for e in sorted(self.tri.events, key=lambda ev: ev.ts):
             t.add(e.ts, e.severity, e.category, e.description, e.source)
 
     def t_file_inventory(self):
@@ -3699,6 +3730,42 @@ class TableBuilder:
         return (user, tty, host or "", self._last_ts(when), "", "",
                 "open when the collector ran")
 
+    def _login_event(self, user, line, host, when, source, service=""):
+        """A successful sign-in, on the timeline once however often it was recorded.
+
+        wtmp, what `last` printed and PAM's own session lines are three
+        records of one session, and LOGINS deliberately keeps all three. The
+        timeline wants the session. They are matched to the minute rather than
+        to the second because `last` prints no seconds at all - a session wtmp
+        dates 11:15:38 is '11:15' there, read as 11:15:00 - so a key with
+        seconds in it would let exactly the duplicate this exists to stop
+        through. The cost is that two sign-ins by one user on one terminal
+        inside the same minute are drawn once; that is a rarer event than the
+        triple it prevents, and both records are still in LOGINS.
+        """
+        ts = _event_dt(when)
+        if ts is None or not user:
+            return False
+        return self.tri.event_once(
+            ("login", user, line or "", ts.strftime("%Y-%m-%d %H:%M")),
+            ts, "Authentication",
+            "login %s on %s%s from %s"
+            % (user, line or "?", " via %s" % service if service else "",
+               host or "local"),
+            "INFO", source)
+
+    #: Elevation and account change that is worth more than INFO on a timeline.
+    #:
+    #: A successful sudo is what an administrator does all day. A refused one
+    #: is somebody finding out what they are not allowed to do, and an account
+    #: or group change is the intruder's own foothold being built - both are
+    #: the rows a reader scanning a timeline for the turn is looking for.
+    PRIV_NOTABLE = frozenset((
+        "account created", "account deleted", "account modified",
+        "group created", "group deleted", "group membership change",
+        "password changed",
+    ))
+
     def t_logins(self):
         t = self.table("LOGINS", "Login history",
                        ["user", "service", "terminal", "source_host", "start",
@@ -3772,6 +3839,8 @@ class TableBuilder:
                 user, tty, host, start, end, secs, state = row
                 t.add(user, "", tty, host, start, end,
                       _human_duration(secs), secs, outcome, state, "", base)
+                if outcome == "success":
+                    self._login_event(user, tty, host, start, base)
 
         # And the sessions wtmp itself describes. On a disk image this is the
         # whole table; anywhere else it is the cross-check, measured from the
@@ -3789,6 +3858,9 @@ class TableBuilder:
                   end.strftime("%Y-%m-%d %H:%M:%S") if end else "",
                   _human_duration(secs), secs, "success", sess["state"],
                   sess["pid"], sess["source"])
+            self._login_event(sess["user"], sess["line"],
+                              sess["host"] or sess["ip"], start,
+                              sess["source"])
 
         # and what PAM recorded, which covers the sessions wtmp never sees
         for sess in self._auth_sessions():
@@ -3796,6 +3868,9 @@ class TableBuilder:
             t.add(sess["user"], sess["service"], sess["line"], sess["host"],
                   sess["start"], sess["end"], _human_duration(secs), secs,
                   "success", sess["state"], sess["pid"], sess["source"])
+            self._login_event(sess["user"], sess["line"], sess["host"],
+                              sess["start"], sess["source"],
+                              service=sess["service"])
 
     # message shape -> (event label, regex whose named groups fill user/ip/port)
     # (event label, regex, class) - class 'priv' feeds PRIVILEGE_ACTIVITY.
@@ -4023,8 +4098,32 @@ class TableBuilder:
 
         def emit(ts, event, actor, target, grp, cmd, tty, pwd, ip, result,
                  origin, detail, src):
-            t.add(ts, event, name_for(actor), target, grp, cmd, tty, pwd, ip,
+            who = name_for(actor)
+            t.add(ts, event, who, target, grp, cmd, tty, pwd, ip,
                   result, origin, trunc(detail, 400), src)
+            # On the timeline once, however many of the three logs kept it.
+            # An elevation is what a reader is looking for when they open a
+            # timeline, and until now it was only there as a finding - which
+            # says a host had 41 sudo calls, not when each of them was.
+            when = _event_dt(ts)
+            if when is None:
+                return
+            sev = ("MEDIUM" if result == "failure"
+                   or event in self.PRIV_NOTABLE else "INFO")
+            desc = event
+            if who:
+                desc += " by %s" % who
+            if target and target != who:
+                desc += " as %s" % target
+            if grp:
+                desc += " in %s" % grp
+            if cmd:
+                desc += ": %s" % trunc(cmd, 120)
+            if result == "failure":
+                desc += " [refused]"
+            self.tri.event_once(("priv", ts, event, who, target, grp,
+                                 (cmd or "")[:120], result),
+                                when, "Privilege", desc, sev, src)
 
         # -- 1. auth.log / secure
         rx = re.compile(r"^(\w{3}\s+\d+\s+[\d:]+|\S+T\S+|\d{4}-\d\d-\d\d \S+)\s+"
@@ -5184,11 +5283,9 @@ class TableBuilder:
                 t.add(r["time"].strftime("%Y-%m-%d %H:%M:%S") if r["time"] else "",
                       r["type"], r["user"], r["line"], r["pid"], r["host"],
                       r["ip"], outcome, host)
-                if r["time"] and r["user"] and r["type"] == "USER_PROCESS":
-                    self.tri.event(r["time"], "Authentication",
-                                   "login %s on %s from %s"
-                                   % (r["user"], r["line"], r["host"] or "local"),
-                                   "INFO", host)
+                if r["type"] == "USER_PROCESS":
+                    self._login_event(r["user"], r["line"], r["host"],
+                                      r["time"], host)
         # Some profiles run utmpdump on the host instead of copying the binary.
         # Its output is the same records already decoded above when both are
         # present, but it is the only copy when the wtmp file itself was not
@@ -5262,11 +5359,8 @@ class TableBuilder:
                               str(lo - li) if li and lo else "",
                               types.get(ty, ty), user or "", tty or "",
                               rhost or "", svc or "", host)
-                        if li and user:
-                            self.tri.event(li, "Authentication",
-                                           "login %s on %s via %s from %s"
-                                           % (user, tty or "?", svc or "?",
-                                              rhost or "local"), "INFO", host)
+                        self._login_event(user, tty, rhost, li, host,
+                                          service=svc)
                 finally:
                     con.close()
             finally:

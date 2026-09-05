@@ -62,6 +62,7 @@ class Triage:
         self.opts = opts
         self.findings = []
         self.events = []
+        self._event_keys = set()   # see event_once
         self.meta = {}
         self.processes = {}          # pid -> dict
         self.hidden_pids = set()
@@ -109,6 +110,28 @@ class Triage:
     def event(self, ts, category, description, severity="INFO", source=""):
         if ts is not None:
             self.events.append(Event(ts, category, description, severity, source))
+
+    def event_once(self, key, ts, category, description, severity="INFO",
+                   source=""):
+        """One timeline event for an act several artifacts recorded.
+
+        A sudo call reaches this three ways on a host that keeps auth.log, the
+        journal and auditd, and one login is in wtmp, in what `last` printed
+        and in PAM's own session lines. Every one of those is a record worth
+        keeping as a row, and the tables keep all of them with the origin in a
+        column, because two records of one act disagreeing is itself the
+        finding. The timeline is the other question - it is a list of what
+        happened, and the same elevation three times over is three answers to
+        "how many times did they become root".
+
+        The key is the caller's, because only the caller knows which fields
+        identify the act rather than the record of it. -> True if it was added.
+        """
+        if key in self._event_keys:
+            return False
+        self._event_keys.add(key)
+        self.event(ts, category, description, severity, source)
+        return True
 
     def resolve_host_timezone(self):
         """Establish the host's time zone, for every layout.
