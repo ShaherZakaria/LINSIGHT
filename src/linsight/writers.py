@@ -405,7 +405,7 @@ def _check_output_paths(col, opts):
     It contaminates the collection, and the next run would then parse the
     previous run's own tables back in as artifacts.
     """
-    if col.kind != "dir":
+    if col is None or col.kind != "dir":
         return
     base = os.path.abspath(col.path)
     for path in (opts.export, opts.csv_dir, opts.tables_json, opts.tables_html,
@@ -464,12 +464,40 @@ def export_tables(tri, col, opts, tb=None):
              " (--scope %s: %s artifacts only)"
              % (scope, "live response" if scope == "live" else "on-disk")))
 
+    return _emit_outputs(tri, tables, meta, opts, tb)
+
+
+def write_merged_tables(tri, tables, meta, opts):
+    """The same writers, over a table set somebody else built.
+
+    A merged multi-host export has no TableBuilder behind it - the tables were
+    built once per collection and joined afterwards - so the half of
+    export_tables that decides what to write is shared and the half that
+    builds is not.
+    """
+    _check_output_paths(None, opts)
+    status("[*] writing the merged export: %d table(s), %s row(s)"
+           % (len(tables), "{:,}".format(meta.get("rows_total", 0))))
+    return _emit_outputs(tri, tables, meta, opts, None)
+
+
+def _emit_outputs(tri, tables, meta, opts, tb=None):
+    """Whichever formats were asked for, over the tables as they now stand."""
     outdir = opts.export
-    csv_dir = opts.csv_dir or (os.path.join(outdir, "csv") if outdir else None)
+    # Serving, the database is what the console reads and what an examiner
+    # queries; the CSV and NDJSON directories exist for tools outside this
+    # one. Writing all three means serialising every row three times - on a
+    # 3.4M-row collection that is minutes of the wait before the server comes
+    # up, spent on files nothing in the session will open. Asked for
+    # explicitly they are still written; derived from --export they are not.
+    serving = bool(getattr(opts, "serve", None))
+    csv_dir = opts.csv_dir or (None if serving else
+                               (os.path.join(outdir, "csv") if outdir else None))
     # --export writes one .json per table, mirroring the CSV directory.
     # --tables-json FILE still writes the single combined document, for a
     # consumer that wants one file to load.
-    json_dir = os.path.join(outdir, "json") if outdir else None
+    json_dir = None if serving else (os.path.join(outdir, "json")
+                                     if outdir else None)
     json_path = opts.tables_json
     html_path = opts.tables_html or (os.path.join(outdir, "browser.html") if outdir else None)
 

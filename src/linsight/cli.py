@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import re
 import sys
@@ -19,7 +20,14 @@ from .rules import (
     update_sigma_rules)
 from .triage import Triage
 from .tables import Table, TableBuilder
-from .writers import _check_output_paths, export_tables
+from .writers import (
+    _check_output_paths, export_tables, write_merged_tables)
+from .ask import ASK_URL, ask
+from .skills import SKILLS, render
+from .mcp import CaseError, _open, serve_mcp
+from .correlate import (
+    Correlator, HostCase, _label_for, merge_tables, merge_triage,
+    write_correlation)
 from .report import (
     print_banner, print_console, write_html, write_json, write_timeline)
 
@@ -216,6 +224,105 @@ def list_volumes(path):
         image.close()
 
 
+def _skill_args(opts):
+    """What a playbook was pointed at, from --skill-arg name=value."""
+    out = {}
+    for pair in opts.skill_arg or []:
+        name, _sep, value = str(pair).partition("=")
+        if not _sep:
+            raise CaseError("--skill-arg wants name=value, not %r" % pair)
+        out[name.strip()] = value.strip()
+    return out
+
+
+def _list_skills():
+    """The playbooks, so --skill has something to name."""
+    print("")
+    print("playbooks - run one with --skill NAME, and point it with "
+          "--skill-arg name=value")
+    print("")
+    for sk in SKILLS:
+        need = [a for a, _d, r in sk["args"] if r]
+        print("  %-22s %s%s" % (sk["name"], sk["about"],
+                                (" (needs --skill-arg %s=...)"
+                                 % need[0]) if need else ""))
+    print("")
+    return 0
+
+
+def _ask_once(opts):
+    """One question, answered against a case that already exists.
+
+    The steps are printed under the answer for the same reason the panel shows
+    them: a local model's answer is worth what the queries behind it are
+    worth, and an analyst who cannot see them has been handed a rumour rather
+    than a finding.
+    """
+    path = opts.db or _case_db_beside(opts)
+    question = opts.ask or ""
+    try:
+        if opts.skill:
+            # The playbook goes to the model in place of the question, and
+            # what the analyst typed goes on the end of it. A skill run from
+            # the command line is the same thing the button in the page does,
+            # by the same route, so the two cannot drift apart.
+            db = _open(path)
+            try:
+                question = render(opts.skill, db, _skill_args(opts))
+            finally:
+                db.close()
+            if opts.ask:
+                question += (chr(10) * 2 + "The analyst asked it this way, "
+                             "so answer that, using the method above: "
+                             + opts.ask)
+        out = ask(path, question,
+                  opts.llm_url or ASK_URL, opts.llm_model)
+    except CaseError as e:
+        status("[!] ask: %s" % e)
+        return 2
+    except KeyboardInterrupt:
+        status("[!] ask: interrupted")
+        return 130
+    answer = (out.get("answer") or "").strip()
+    print("")
+    print(answer or "(the model answered with nothing)")
+    bad = out.get("unsupported") or []
+    if bad:
+        print("")
+        print("!! %d figure(s) above appear in NO query result: %s"
+              % (len(bad), ", ".join(bad)))
+        print("   Those did not come from this case. Treat the answer as "
+              "unreliable and check the queries below yourself.")
+    steps = out.get("steps") or []
+    if steps:
+        print("")
+        print("-- what it looked at, in order " + "-" * 46)
+        for st in steps:
+            print("   %s" % st.get("note") or st.get("tool"))
+            sql = (st.get("args") or {}).get("sql")
+            if sql:
+                print("      %s" % str(sql).replace(chr(10), " "))
+    print("")
+    status("[*] ask: answered by %s against %s"
+           % (out.get("model") or "?", os.path.basename(path)))
+    return 0
+
+
+def _case_db_beside(opts):
+    """The database --serve or --db would have written, if any.
+
+    --export DIR puts case.db in DIR, which is where an examiner who
+    ran the triage yesterday will look for it today. Falling back to
+    the working directory means "linsight --mcp" works from inside
+    the export without naming anything.
+    """
+    for cand in (os.path.join(opts.export or "", "case.db"),
+                 os.path.join(os.getcwd(), "case.db")):
+        if cand and os.path.isfile(cand):
+            return cand
+    return os.path.join(opts.export or os.getcwd(), "case.db")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Parse a UAC or Velociraptor Linux collection, or a disk "
@@ -223,96 +330,57 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  python linsight.py ./uac-host-linux-20260324\n"
-               "  python linsight.py collection.tar.gz --html report.html --json out.json\n"
-               "  python linsight.py ./coll --min-severity HIGH --timeline timeline.csv\n"
-               "  python linsight.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3\n"
-               "  python linsight.py ./disk.dd            # a raw disk image\n"
-               "  python linsight.py evidence.E01         # the whole E01 set\n"
-               "  python linsight.py vm.qcow2 --html report.html\n"
-               "  python linsight.py ./disk.dd --list-volumes  # what is on it\n"
-               "  sudo python linsight.py /dev/sda        # the live disk\n"
-               "  python linsight.py --file /var/log/auth.log\n"
-               "  python linsight.py --file ./loose-logs/ --file ps.txt\n"
+               "  python linsight.py collection.tar.gz --html report.html\n"
+               "  python linsight.py evidence.E01 --export ./out\n"
+               "  python linsight.py ./disk.dd --list-volumes\n"
+               "  python linsight.py ./coll --pivot @iocs.txt\n"
+               "  python linsight.py ./coll --sigma ./detections\n"
+               "  python linsight.py ./coll --update-sigma\n"
                "  python linsight.py --file capture.txt:/var/log/auth.log\n"
-               "  python linsight.py ./coll --export ./triage_out\n"
-               "  python linsight.py ./coll --csv-dir ./tables --quiet\n"
-               "  python linsight.py ./coll --export ./live --scope live\n"
-               "  python linsight.py ./coll --export ./disk --scope offline\n"
-               "  python linsight.py ./coll --update-sigma   # fetch SigmaHQ, then hunt\n"
-               "  python linsight.py ./coll --sigma-cached   # hunt offline with the cache\n"
-               "  python linsight.py --update-sigma          # refresh the cache only\n")
+               "\n"
+               "more: README.md\n")
     ap.add_argument("--file", dest="files", action="append", metavar="PATH[:DEST]",
-                    help="parse loose files instead of a collection. Repeatable, "
-                         "and PATH may be a directory. Each file is mounted at "
-                         "the path its parser looks for, chosen from the name "
-                         "('auth.log' -> /var/log/auth.log, 'ps.txt' -> the "
-                         "process listing); a directory whose top level looks "
-                         "like a host tree (etc/, var/, ...) is mounted as it "
-                         "stands. Append ':/host/path' to say what a file is "
-                         "when the name does not: "
-                         "--file capture.txt:/var/log/auth.log")
-    ap.add_argument("collection", nargs="?", metavar="COLLECTION|DISK",
-                    help="a collection directory, .tar, .tar.gz or .zip (UAC "
-                         "output or a Velociraptor offline collector zip), or "
-                         "a disk: a raw/dd image, an E01 set, a qcow2, vmdk, "
-                         "vhdx or vhd, or a device such as /dev/sda. Which of "
-                         "the two it is, and for a collection which tool "
-                         "produced it, is detected rather than declared. "
-                         "Optional only when --update-sigma is refreshing "
-                         "rules on its own")
+                    help="parse loose files instead of a collection (repeatable; PATH "
+                         "may be a directory). Append ':/host/path' when the name does "
+                         "not say what a file is: --file capture.txt:/var/log/auth.log")
+    ap.add_argument("collections", nargs="*", metavar="COLLECTION|DISK",
+                    help="a collection (directory, .tar, .tar.gz, .zip) or a disk "
+                         "(raw/dd, E01, qcow2, vmdk, vhdx, vhd, or /dev/sda). Which it "
+                         "is, is detected. Repeatable: several are read one after "
+                         "another, each into its own directory under --out. Optional "
+                         "only with --update-sigma on its own.")
     dg = ap.add_argument_group(
         "disks",
-        "Point the same parsers at a disk instead of a collection. The image "
-        "is read directly - no loop device, no mount, no root, nothing "
-        "written to the evidence. Partition tables, LVM volume groups and "
-        "LUKS containers are walked through; the root filesystem is the one "
-        "that holds /etc, and whatever /etc/fstab places is mounted where the "
-        "host had it. A volume that cannot be opened is reported by name, "
-        "because an encrypted partition and an absence of evidence must not "
-        "look alike in the output.")
-    dg.add_argument("--disk", metavar="PATH",
-                    help="read PATH as a disk even when it would not be "
-                         "recognised as one - a headerless image, a damaged "
-                         "partition table, a device node")
+        "Read a disk image directly - no loop device, no mount, no root, nothing written to the evidence.")
+    dg.add_argument("--disk", metavar="PATH", action="append",
+                    help="read PATH as a disk even when it does not look like one "
+                         "(repeatable)")
 
     ig = ap.add_argument_group(
         "saying what the input is",
-        "What the argument is - a collection directory, an archive, a disk, "
-        "an AD1 - is worked out from the thing itself, and these are here for "
-        "when that goes wrong or when you would rather be explicit. Each one "
-        "takes the place of the positional argument and forces one reader, so "
-        "a wrong guess becomes an error naming what it could not read instead "
-        "of a report with the wrong half of the evidence in it.")
+        "Force one reader when the automatic detection guesses wrong, or when you would rather be explicit.")
     ig.add_argument("-d", "--dir", metavar="PATH", dest="dir_input",
-                    help="read PATH as a directory: an extracted UAC or "
-                         "Velociraptor collection, or a mounted filesystem "
-                         "root (one whose top level is etc/, var/, usr/ ...), "
-                         "which is what a forensic mounter gives you")
-    ig.add_argument("--archive", metavar="PATH",
-                    help="read PATH as a collection archive - .tar, .tar.gz "
-                         "or .zip - rather than as anything else it might "
-                         "look like")
-    ig.add_argument("--ad1", metavar="PATH",
-                    help="read PATH as an AccessData/FTK logical image, and "
-                         "gather the rest of its .ad2/.ad3 segments")
+                    action="append",
+                    help="read PATH as a directory: an extracted collection, or a "
+                         "mounted filesystem root (repeatable)")
+    ig.add_argument("--archive", metavar="PATH", action="append",
+                    help="read PATH as a collection archive (.tar, .tar.gz, .zip) "
+                         "(repeatable)")
+    ig.add_argument("--ad1", metavar="PATH", action="append",
+                    help="read PATH as an AccessData/FTK logical image, with its "
+                         ".ad2/.ad3 parts (repeatable)")
     dg.add_argument("--list-volumes", action="store_true",
-                    help="print what is on the disk - container, partitions, "
-                         "logical volumes, filesystems - and stop. The first "
-                         "thing to run against an unfamiliar image: it costs "
-                         "one pass over the metadata, not a filesystem walk.")
+                    help="print the disk's volumes and stop - run this first on an "
+                         "unfamiliar image")
     dg.add_argument("--disk-volume", metavar="NAME",
-                    help="read this volume (part1, p2, vg/lv) instead of the "
-                         "one that holds /etc")
+                    help="read this volume (part1, p2, vg/lv) instead of the one holding "
+                         "/etc")
     dg.add_argument("--disk-max-files", type=int, default=DEFAULT_MAX_FILES,
                     metavar="N",
-                    help="stop the filesystem walk after N names (default "
-                         "%s). A truncated walk becomes a HIGH finding, "
-                         "because an absence in a partial read is not evidence "
-                         "of absence." % format(DEFAULT_MAX_FILES, ","))
+                    help="stop the filesystem walk after N names (default 3,000,000); a "
+                         "truncated walk becomes a finding")
     dg.add_argument("--no-deleted", action="store_true",
-                    help="skip the deleted-inode scan. It reads every inode "
-                         "table on the filesystem, which on a multi-terabyte "
-                         "disk is the slowest part of the load.")
+                    help="skip the deleted-inode scan - the slowest part of a large disk")
     ap.add_argument("--min-severity", default="INFO", choices=SEVERITIES,
                     help="lowest severity to print on the console (default INFO)")
     ap.add_argument("--window", type=int, default=72, metavar="H",
@@ -321,13 +389,8 @@ def main(argv=None):
                     help="evidence lines printed per finding on the console (default 25)")
     ap.add_argument("--json", metavar="PATH", help="write full findings as JSON")
     ap.add_argument("--html", metavar="PATH",
-                    help="write a self-contained HTML report of the findings - "
-                         "a document to read top to bottom and hand to "
-                         "someone. The artifact tables are a browsable grid "
-                         "rather than a document and are not in it: --export "
-                         "DIR writes those, as browser.html plus csv/ and "
-                         "json/. This report lists them and says where they "
-                         "went.")
+                    help="write a self-contained HTML findings report (artifact tables "
+                         "go to --export, which this report points at)")
     ap.add_argument("--timeline", metavar="PATH", help="write the event timeline as CSV")
     ap.add_argument("--show-timeline", action="store_true",
                     help="also print the timeline on the console")
@@ -336,136 +399,167 @@ def main(argv=None):
     ap.add_argument("--timeline-limit", type=int, default=3000,
                     help="max file events kept in the timeline (default 3000)")
     ap.add_argument("--pivot", action="append", metavar="TERM",
-                    help="search every collected artifact for TERM, case-"
-                         "insensitively (repeatable). Use '@file' to read a "
-                         "list of indicators, one per line, '#' for comments - "
-                         "all terms are matched in one pass, so a long list "
-                         "costs no more than a short one.")
+                    help="search every artifact for TERM, case-insensitively "
+                         "(repeatable). '@file' reads an indicator list - one per line, "
+                         "'#' comments, defanged forms accepted - all matched in a "
+                         "single pass.")
     ap.add_argument("--count-iocs", action="store_true",
-                    help="also count every extracted indicator across the "
-                         "whole collection, filling count/first_utc/last_utc "
-                         "in the IOCS table for all of them rather than only "
-                         "for the terms that were pivoted on. It folds them "
-                         "into the same single pass --pivot makes, but that "
-                         "pass then reads every text artifact against a much "
-                         "larger pattern: on a 31 GB image it took a four "
-                         "minute run to twenty. The indicators, their types "
-                         "and their provenance are in IOCS either way.")
+                    help="also count every indicator the analyzers extracted, not just "
+                         "the pivoted ones. Same single pass, larger pattern: minutes on "
+                         "a big image.")
     ap.add_argument("--pivot-limit", type=int, default=500,
                     help="max indicators to search for (default 500)")
     ap.add_argument("--deep", action="store_true",
                     help="also scan memory_dump/*strings* (slow, multi-GB)")
     rg = ap.add_argument_group(
         "detection rules",
-        "Hunt with your own rules. Both engines are built in - nothing to "
-        "install - and cover the constructs Linux IR rules use; PyYAML is used "
-        "for Sigma if it happens to be importable. A rule the engine cannot "
-        "represent faithfully is rejected and listed in RULE_ERRORS rather "
-        "than half-applied, because a rule that silently matches nothing looks "
-        "exactly like a clean result. Sigma rules go stale the same way: "
-        "--update-sigma keeps a local copy of the public ruleset current, and "
-        "is the only thing here that uses the network.")
+        "Hunt with your own rules. Both engines are built in. A rule this engine cannot represent faithfully is rejected into RULE_ERRORS rather than half-applied.")
     rg.add_argument("--yara", action="append", metavar="PATH",
-                    help="YARA rule file or directory (repeatable). Scans the "
-                         "collected filesystem and the per-process memory "
-                         "strings; add --deep for the memory image strings.")
+                    help="YARA rule file or directory (repeatable); scans collected "
+                         "files and per-process memory strings")
     rg.add_argument("--no-hunt", action="store_true",
-                    help="skip the built-in offensive-tool keyword sweep. The "
-                         "sweep reads the normalised tables, so it costs the "
-                         "table build even when no export was asked for - on a "
-                         "mid-size collection that is roughly 12s to 65s. Use "
-                         "this when you want the analyzer findings only.")
+                    help="skip the built-in offensive-tool keyword sweep")
     rg.add_argument("--keywords", action="append", metavar="PATH",
-                    help="file of extra terms to hunt for, one per line "
-                         "(repeatable). Matched the same way as the built-in "
-                         "tool names, across every artifact - use it for "
-                         "case-specific names, hostnames or filenames.")
+                    help="file of extra terms to hunt for, one per line (repeatable)")
     rg.add_argument("--sigma", action="append", metavar="PATH",
-                    help="Sigma rule file or directory (repeatable). Runs "
-                         "against the normalised tables - auth, journal, "
-                         "auditd, processes, cron, web logs - routed by each "
-                         "rule's logsource.")
+                    help="Sigma rule file or directory (repeatable), routed to the "
+                         "normalised tables by each rule's logsource")
     rg.add_argument("--update-sigma", action="store_true",
-                    help="fetch the current SigmaHQ ruleset into a local cache "
-                         "and hunt with it. Keeps the rules that can reach a "
-                         "table this tool builds - the Linux and web-log ones - "
-                         "and skips the ~3000 Windows event log rules, which "
-                         "would only slow the load and fill RULE_ERRORS. The "
-                         "fetch is conditional: an unchanged ruleset is a 304 "
-                         "and no download. Works with no collection argument "
-                         "when you just want the cache refreshed.")
+                    help="fetch the current SigmaHQ ruleset into the cache and hunt with "
+                         "it. Conditional - unchanged means no download. The only option "
+                         "that uses the network.")
     rg.add_argument("--sigma-cached", action="store_true",
-                    help="hunt with the cached ruleset as last fetched, without "
-                         "touching the network - the offline half of "
-                         "--update-sigma.")
+                    help="hunt with the cached ruleset, offline")
     rg.add_argument("--sigma-dir", metavar="DIR",
-                    help="where the cached ruleset lives (default "
-                         "~/.linsight/sigma, or $LINSIGHT_SIGMA_DIR). It is a "
-                         "plain directory of .yml files, so --sigma takes it "
-                         "too.")
+                    help="where the cache lives (default: your own temp directory, or "
+                         "$LINSIGHT_SIGMA_DIR)")
     rg.add_argument("--sigma-source", metavar="URL|ZIP|DIR",
-                    help="what --update-sigma reads instead of SigmaHQ's "
-                         "master zip: another ruleset's URL, a zip already "
-                         "downloaded, or a directory - for the evidence "
-                         "workstation with no route out, and for your own "
-                         "rule repository.")
+                    help="what --update-sigma reads instead of SigmaHQ's zip: a URL, a "
+                         "downloaded zip, or a directory")
     rg.add_argument("--sigma-all", action="store_true",
-                    help="cache every rule --update-sigma finds, including the "
-                         "ones for platforms this tool builds no table for. "
-                         "SIGMA_COVERAGE then says, rule by rule, why each one "
-                         "could not fire here.")
+                    help="cache every rule found, including ones for platforms this tool "
+                         "builds no table for")
+    mg = ap.add_argument_group(
+        "several collections at once",
+        "Read more than one collection or image in one command. Each gets its own "
+        "directory of output; --correlate then asks what is true of more than one "
+        "of them.")
+    mg.add_argument("--split", metavar="DIR", dest="out",
+                    help="keep the collections apart instead of merging them: "
+                         "one directory of output per input, as DIR/<name>/, "
+                         "named after the input's own file or folder. On its "
+                         "own it writes a full export per input - csv/, json/ "
+                         "and browser.html.")
+    mg.add_argument("--correlate", action="store_true",
+                    help="also work out what is true of more than one of them - "
+                         "the indicators, findings and file hashes several hosts "
+                         "share, and which host saw each first. Adds CROSS_IOCS, "
+                         "CROSS_FINDINGS, CROSS_HASHES and HOSTS to the export; "
+                         "under --split it writes DIR/_correlation/ instead. "
+                         "Needs two or more inputs.")
     tg = ap.add_argument_group(
         "artifact tables",
-        "Normalise every interesting artifact into browsable grids - one table "
-        "per artifact type, with a source column keeping the originating file.")
+        "Normalise every artifact into browsable grids - one table per artifact type, each row keeping its source file.")
     tg.add_argument("--scope", choices=TableBuilder.SCOPES, default="full",
-                    help="which half of the collection to build tables from: "
-                         "'live' = the volatile snapshot (processes, sockets, "
-                         "open files, modules, live sessions); 'offline' = what "
-                         "a dead-box exam recovers (filesystem, config, logs, "
-                         "persistence, bodyfile); 'full' = both (default). "
-                         "Findings and the timeline always use the whole "
-                         "collection - they are cross-artifact by nature.")
+                    help="which half of the collection to build tables from: 'live' "
+                         "(processes, sockets, modules), 'offline' (filesystem, config, "
+                         "logs), or 'full' (default). Findings and the timeline always "
+                         "use everything.")
     tg.add_argument("--export", metavar="DIR",
-                    help="write every table format into DIR "
-                         "(csv/ and json/, one file per table, plus "
-                         "browser.html - the console)")
+                    help="write every table into DIR - csv/, json/ and browser.html")
     tg.add_argument("--csv-dir", metavar="DIR",
                     help="write one CSV per table into DIR")
     tg.add_argument("--tables-json", metavar="PATH",
                     help="write every table as a single JSON document")
     tg.add_argument("--tables-html", metavar="PATH",
-                    help="write the self-contained console: findings, ATT&CK, "
-                         "timeline, indicators and every artifact table")
+                    help="write the self-contained console: findings, timeline, "
+                         "indicators and every table")
     tg.add_argument("--process-map", metavar="PATH",
-                    help="write ONLY the correlated one-row-per-PID process table "
-                         "to a single file (.csv/.html/.json by extension)")
+                    help="write only the one-row-per-PID process table (.csv/.html/.json "
+                         "by extension)")
+    tg.add_argument("--serve", nargs="?", const="127.0.0.1:8000",
+                    metavar="[HOST:]PORT",
+                    help="open the investigation server instead of writing a "
+                         "page: the same console, plus marking, labelling, "
+                         "scoring and notes saved to a case file. Builds the "
+                         "SQLite database and skips the CSV/JSON exports "
+                         "unless --csv-dir or --tables-json ask for them. "
+                         "Loopback only unless a host is named.")
+    tg.add_argument("--ask", metavar="QUESTION",
+                    help="put one question to a local model with the "
+                         "case behind it, and print what it found and "
+                         "the queries it ran. Reads a case an earlier "
+                         "run wrote; parses nothing. Same engine as "
+                         "the Ask panel and --mcp.")
+    tg.add_argument("--skill", nargs="?", const="", metavar="NAME",
+                    help="run an investigative playbook instead of a bare "
+                         "question - the sequence an examiner follows, with "
+                         "the tables and the joins named for the model. "
+                         "Name it with no value to list them. Combines with "
+                         "--ask, which then says how to answer it.")
+    tg.add_argument("--skill-arg", action="append", metavar="NAME=VALUE",
+                    help="what to point a playbook at: "
+                         "--skill-arg address=209.141.62.185. Repeatable. "
+                         "A playbook that needs one and is not given it is "
+                         "refused rather than pointed at a guess.")
+    tg.add_argument("--llm-url", metavar="URL",
+                    help="an OpenAI-compatible endpoint for the Ask "
+                         "panel - Ollama, LM Studio, llama.cpp, vLLM. "
+                         "Default http://127.0.0.1:11434/v1, which is "
+                         "Ollama. The server calls it; the page never "
+                         "does, and nothing leaves the machine.")
+    tg.add_argument("--llm-model", metavar="NAME",
+                    help="which model to ask. Default: whatever the "
+                         "runtime lists first. It must support tool "
+                         "calling, because the model queries the case "
+                         "rather than being handed it.")
+    tg.add_argument("--mcp", nargs="?", const="", metavar="DB",
+                    help="answer MCP over stdin/stdout against a case "
+                         "database an earlier run wrote, so a model can "
+                         "query the case itself - read-only, and "
+                         "nothing leaves the machine. Defaults to "
+                         "case.db beside --export. Parses nothing: "
+                         "point it at a case that already exists.")
+    tg.add_argument("--db", metavar="PATH",
+                    help="write every artifact table into a SQLite database "
+                         "as well - one SQL table each, plus the marks when "
+                         "--serve is used. Implied by --serve, which defaults "
+                         "it to case.db beside the export.")
+    tg.add_argument("--case", metavar="PATH",
+                    help="where --serve keeps its marks and notes (default: "
+                         "case.json beside the export, or in the working "
+                         "directory)")
     tg.add_argument("--html-rows", type=int, default=0, metavar="N",
-                    help="rows per table embedded in the HTML browser. 0, the "
-                         "default, embeds every row, so the page carries the "
-                         "whole export and 'Search all' really does search "
-                         "all of it. Set a number to cap it when the page "
-                         "would be too large to open comfortably - the size "
-                         "is printed either way, and the CSV and JSON exports "
-                         "are unaffected.")
+                    help="rows per table embedded in the HTML browser (0, the default, "
+                         "embeds every row)")
 
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colour")
     ap.add_argument("--quiet", action="store_true", help="suppress the console report")
     ap.add_argument("--debug", action="store_true", help="re-raise analyzer exceptions")
     ap.add_argument("--low-memory", action="store_true",
-                    help="spill large tables to a temp file instead of holding "
-                         "every row in memory - roughly halves peak memory on a "
-                         "large collection and costs about 20%% of the run time")
+                    help="spill large tables to a temp file - roughly half the peak "
+                         "memory, about a fifth more time")
     ap.add_argument("--timing", action="store_true",
-                    help="report wall time per table extractor and per output "
-                         "writer - use it to find which artifact a slow "
-                         "collection is spending its minutes on")
+                    help="report wall time per table extractor and per output writer")
     opts = ap.parse_args(argv)
 
     # set before any table is built, because a table that has already buffered
     # its rows cannot be made to have spilled them
     if opts.low_memory and "LINSIGHT_SPILL_AFTER" not in os.environ:
         Table.SPILL_AFTER = 20000
+
+    # Before the banner, and before anything else can print: stdout is
+    # the protocol here, and one stray line of it is a client that
+    # cannot parse the stream and an error that looks like anything but
+    # this. Nothing is parsed either - the case has to exist already.
+    if opts.mcp is not None:
+        path = opts.mcp or opts.db or _case_db_beside(opts)
+        return serve_mcp(path, quiet=opts.quiet)
+
+    if opts.skill == "":
+        return _list_skills()
+    if opts.ask or opts.skill:
+        return _ask_once(opts)
 
     opts.color = (not opts.no_color) and sys.stdout.isatty()
     if opts.color and os.name == "nt":
@@ -524,79 +618,242 @@ def main(argv=None):
             status("[*] sigma: cached %s" % opts.sigma_note)
         opts.sigma = (opts.sigma or []) + [cache]
 
-    # Exactly one thing may say what is being read. Each of these names a
-    # different reader, and silently preferring one over another is how an
-    # analyst ends up with a report about half the evidence.
-    chosen = [(name, value) for name, value in
-              (("--disk", opts.disk), ("-d/--dir", opts.dir_input),
-               ("--archive", opts.archive), ("--ad1", opts.ad1),
-               ("--file", opts.files)) if value]
-    if opts.collection and chosen:
-        ap.error("%s says what to read; do not also pass it as the plain "
-                 "argument" % chosen[0][0])
-    if len(chosen) > 1:
-        ap.error("%s and %s each name what to read; pass one"
-                 % (chosen[0][0], chosen[1][0]))
-
-    # What the input is, is worked out from the input. The explicit flags
-    # above override that, and exist because a guess can be wrong - a
-    # headerless image, an archive with no extension - and because saying it
-    # outright is sometimes just clearer.
-    forced = ""
-    if opts.disk:
-        forced, opts.collection = "disk", opts.disk
-    elif opts.dir_input:
-        forced, opts.collection = "dir", opts.dir_input
-    elif opts.archive:
-        forced, opts.collection = "archive", opts.archive
-    elif opts.ad1:
-        forced, opts.collection = "ad1", opts.ad1
-
-    if forced and forced != "disk" and not os.path.exists(opts.collection):
-        ap.error("%s not found: %s" % (forced, opts.collection))
-    if forced == "dir" and not os.path.isdir(opts.collection):
-        ap.error("-d/--dir wants a directory; %s is a file. For an archive "
-                 "use --archive, for a disk image use --disk."
-                 % opts.collection)
-    if forced == "archive" and os.path.isdir(opts.collection):
-        ap.error("--archive wants a .tar/.tar.gz/.zip; %s is a directory - "
-                 "use -d instead" % opts.collection)
-
-    # With nothing declared, the argument identifies itself - and says so.
-    # A directory holding one Webserver.E01 is not a collection with two files
-    # in it; reading it as one built five empty tables and reported a host
-    # with nothing on it.
-    detected = ""
-    disk_path = opts.disk
-    if not forced and opts.collection:
-        kind, target, why = identify_input(opts.collection)
-        detected = why
-        opts.collection = target
-        if kind == "disk":
-            disk_path = target
-        elif kind == "ad1":
-            opts.ad1 = target
-    if detected and not opts.quiet:
-        status("[*] reading %s - %s" % (os.path.basename(opts.collection.rstrip("/\\"))
-                                        or opts.collection, detected))
-
-    if not disk_path and not opts.collection and not opts.files:
+    targets = _resolve_targets(ap, opts)
+    if not targets:
         if opts.update_sigma:
             return 0                    # a rule refresh on its own
         ap.error("a collection, a disk or --file is required (or "
                  "--update-sigma on its own to refresh the rule cache)")
 
     if opts.list_volumes:
-        if not disk_path:
+        disks = [t for t in targets if t[0] == "disk"]
+        if len(targets) > 1:
+            ap.error("--list-volumes reads one disk; pass one")
+        if not disks:
             ap.error("--list-volumes needs a disk; pass an image, a device, "
                      "or --disk PATH")
-        return list_volumes(disk_path)
+        return list_volumes(disks[0][1])
+
+    _check_multi(ap, opts, targets)
+
+    # One input keeps the flags exactly as they were typed: a single run has
+    # nowhere to collide with, and rewriting its paths under --out when --out
+    # was not given would be a change of behaviour for every existing command.
+    if len(targets) == 1 and not opts.out:
+        return _run_one(ap, opts, targets[0][0], targets[0][1])
+
+    labels, taken = [], set()
+    for _kind, path in targets:
+        labels.append(_label_for(path, taken))
+    status("[*] %d collection(s) to read: %s"
+           % (len(targets), ", ".join(labels)))
+
+    # Two shapes, and they answer different questions. --split keeps each
+    # collection in a directory of its own, which is what you want when the
+    # hosts are separate cases. The default merges them into one export with a
+    # host column on every row, which is what you want when they are one case:
+    # an unfiltered console then shows every host at once, and choosing one
+    # narrows every grid - rather than opening three exports and joining by
+    # eye. The cost is that the merged set is held whole; --low-memory spills
+    # it, which is what that flag is for.
+    merging = not opts.out
+    cases, tris, per_host, worst = [], [], [], 0
+    for i, ((kind, path), label) in enumerate(zip(targets, labels)):
+        status("")
+        status("[*] === %s (%d of %d): %s ===" % (label, i + 1, len(labels), path))
+        hopts = _host_opts(opts, label)
+        if merging:
+            # every output is written once at the end, over the merged set
+            for attr in ("export",) + OUTPUT_PATHS:
+                setattr(hopts, attr, None)
+            hopts.serve = None
+        rc, tri, tables = _run_one(ap, hopts, kind, path, collect=True)
+        worst = max(worst, rc)
+        if tri is None:
+            continue
+        cases.append(HostCase(label, path, tri, tables))
+        tris.append(tri)
+        if merging:
+            per_host.append((label, tables))
+
+    if not merging:
+        if opts.correlate:
+            status("")
+            write_correlation(cases, os.path.join(opts.out, "_correlation"), opts)
+        return worst
+
+    status("")
+    tables, hostcol = merge_tables(per_host)
+    cor = None
+    if opts.correlate:
+        cor = Correlator(cases, opts)
+        # the cross-host tables join the export rather than becoming a second
+        # one: the console carrying every host's rows is also where "which of
+        # these hosts share this" is the natural next question
+        tables += [t for t in cor.run()
+                   if t.name not in ("FINDINGS", "TIMELINE")]
+    status("[*] merged %d table(s) from %d collections, %s row(s) total"
+           % (len(tables), len(per_host),
+              "{:,}".format(sum(len(t) for t in tables))))
+    merged = merge_triage(cases, opts, tris)
+    if cor is not None:
+        merged.findings.extend(cor.tri.findings)
+        merged.findings.sort(key=lambda f: (SEVERITIES.index(f.severity),
+                                            f.category, f.title))
+    _write_merged(merged, tables, labels, hostcol, opts)
+    return worst
+
+
+def _write_merged(tri, tables, labels, hostcol, opts):
+    """Every output this run asked for, once, over the merged table set."""
+    if opts.json:
+        write_json(tri, opts.json)
+    if opts.html:
+        write_html(tri, opts.html, opts, None)
+    if opts.timeline:
+        write_timeline(tri, opts.timeline)
+    if not any((opts.export, opts.csv_dir, opts.tables_json, opts.tables_html,
+                opts.process_map, opts.serve, opts.db)):
+        return
+    meta = {"collection": ", ".join(labels),
+            "hostname": tri.meta.get("Hostname", ""),
+            "collected": "", "scope": getattr(opts, "scope", "full"),
+            "layout": "merged", "hosts": list(labels),
+            "host_column": hostcol,
+            "tables": len(tables),
+            "rows_total": sum(len(t) for t in tables)}
+    write_merged_tables(tri, tables, meta, opts)
+
+
+def _resolve_targets(ap, opts):
+    """Every input this run was given, as [(forced kind, path)].
+
+    The forcing flags each name a reader, and each may be repeated: a run over
+    three images is three --disk, or three plain arguments, and mixing the two
+    is refused because "which of these did I mean to force" has no good
+    answer. What is not refused any more is repeating one flag - argparse used
+    to overwrite silently, so `--disk a.dd --disk b.dd` read b.dd and reported
+    on it as though a.dd had never been named.
+
+    --file is the exception that stays singular: several loose files are one
+    synthetic collection by construction, not several inputs.
+    """
+    named = [("--disk", "disk", list(opts.disk or [])),
+             ("-d/--dir", "dir", list(opts.dir_input or [])),
+             ("--archive", "archive", list(opts.archive or [])),
+             ("--ad1", "ad1", list(opts.ad1 or []))]
+    used = [(flag, kind, vals) for flag, kind, vals in named if vals]
+    if opts.collections and (used or opts.files):
+        ap.error("%s says what to read; do not also pass it as a plain argument"
+                 % (used[0][0] if used else "--file"))
+    if opts.files and used:
+        ap.error("--file and %s each name what to read; pass one" % used[0][0])
+
+    if opts.files:
+        return [("files", "")]
+
+    targets = []
+    for _flag, kind, vals in used:
+        for path in vals:
+            if kind != "disk" and not os.path.exists(path):
+                ap.error("%s not found: %s" % (kind, path))
+            if kind == "dir" and not os.path.isdir(path):
+                ap.error("-d/--dir wants a directory; %s is a file. For an "
+                         "archive use --archive, for a disk image use --disk."
+                         % path)
+            if kind == "archive" and os.path.isdir(path):
+                ap.error("--archive wants a .tar/.tar.gz/.zip; %s is a "
+                         "directory - use -d instead" % path)
+            targets.append((kind, path))
+
+    # With nothing declared, each argument identifies itself - and says so.
+    # A directory holding one Webserver.E01 is not a collection with two files
+    # in it; reading it as one built five empty tables and reported a host
+    # with nothing on it.
+    for raw in opts.collections:
+        if not os.path.exists(raw):
+            ap.error("collection not found: %s" % raw)
+        kind, target, why = identify_input(raw)
+        if why and not opts.quiet:
+            status("[*] reading %s - %s"
+                   % (os.path.basename(target.rstrip("/\\")) or target, why))
+        targets.append((kind if kind in ("disk", "ad1") else "", target))
+    return targets
+
+
+#: Every output flag that names a path, and the attribute holding it. Under
+#: --out each becomes a name inside that input's own directory, so three runs
+#: cannot write three reports over one another.
+OUTPUT_PATHS = ("csv_dir", "tables_json", "tables_html", "json", "html",
+                "timeline", "process_map", "db", "case")
+
+
+def _check_multi(ap, opts, targets):
+    """Refuse the combinations that cannot mean what they look like."""
+    if opts.correlate and len(targets) < 2:
+        ap.error("--correlate compares collections with each other; it needs "
+                 "at least two")
+    if len(targets) > 1 and opts.out and opts.serve:
+        # merged, --serve is one console over every host and works; split, it
+        # would have to serve three at once from one blocking process
+        ap.error("--serve and --split are different answers to the same "
+                 "question: --serve wants one console, --split writes one "
+                 "export per collection. Drop --split to serve the merged "
+                 "set, or drop --serve and open the export you want")
+
+
+def _host_opts(opts, label):
+    """This input's own copy of the options, writing into its own directory.
+
+    Shallow: the lists and dictionaries on opts are read, never mutated, so
+    the copies share them. What is rewritten is every path an output would be
+    written to - and only its basename is kept, because an absolute path
+    given once cannot name three different files.
+    """
+    o = copy.copy(opts)
+    o.collections, o.disk, o.dir_input, o.archive, o.ad1 = [], None, None, None, None
+    if not opts.out:
+        # Console-only: nothing is written, so there is nothing to move. The
+        # per-host header above is the whole separation these runs need.
+        return o
+    hdir = os.path.join(opts.out, label)
+    # Made here rather than by each writer: --export creates its own directory
+    # but --html and --tables-json do not, and a run that parses a disk for a
+    # minute and then fails on a missing parent has wasted the minute.
+    os.makedirs(hdir, exist_ok=True)
+    if opts.export:
+        # --export already means "a directory of everything"; under --out that
+        # directory is the host's own, rather than one nested inside it
+        o.export = hdir
+    for attr in OUTPUT_PATHS:
+        value = getattr(opts, attr, None)
+        if value:
+            setattr(o, attr, os.path.join(hdir, os.path.basename(str(value))))
+    if not any(getattr(o, a, None) for a in ("export",) + OUTPUT_PATHS):
+        # --out on its own has to mean something, and the something an
+        # analyst wants from it is the export they would have asked for
+        o.export = hdir
+    return o
+
+
+def _run_one(ap, opts, forced, target, collect=False):
+    """Read one collection and write whatever this run asked for.
+
+    Returns the exit code on a single-input run, and (code, triage, tables)
+    when a caller is gathering several - the correlation needs what each run
+    concluded, and the tables are handed over rather than re-read.
+    """
+    disk_path = target if forced == "disk" else ""
+    ad1_path = target if forced == "ad1" else ""
+    opts.collection = target
+    if forced == "dir":
+        opts.dir_input = target
+    elif forced == "archive":
+        opts.archive = target
 
     # An AD1 is a logical image - a tree of files, not a disk - so it lands on
     # the collection side. Like every other container it is recognised rather
     # than declared.
-    ad1_path = opts.ad1 or ""
-
     if ad1_path:
         try:
             col = Ad1Collection(ad1_path, quiet=opts.quiet,
@@ -670,12 +927,13 @@ def main(argv=None):
         write_timeline(tri, opts.timeline)
 
     if any((opts.export, opts.csv_dir, opts.tables_json,
-            opts.tables_html, opts.process_map)):
+            opts.tables_html, opts.process_map, getattr(opts, "serve", None))):
         export_tables(tri, col, opts, tb)
 
     crit = sum(1 for f in tri.findings if f.severity == "CRITICAL")
     high = sum(1 for f in tri.findings if f.severity == "HIGH")
-    return 2 if crit else (1 if high else 0)
+    code = 2 if crit else (1 if high else 0)
+    return (code, tri, (tb.tables if tb is not None else [])) if collect else code
 
 
 if __name__ == "__main__":
