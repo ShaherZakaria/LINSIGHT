@@ -81,6 +81,7 @@ class Triage:
         self.pivot_artifacts = {}     # indicator -> the artifacts naming it
         self.pivot_reported = set()   # the ones that earn a finding
         self.ww_paths = set()         # world-writable paths confirmed from the bodyfile
+        self.timestomp = {"rows": defaultdict(list), "n": defaultdict(int)}
         self.bodyfile_seen = False
         self.auto_pivot = set()       # indicators worth chasing across every artifact
         self.pivot_hits = []          # (term, artifact, line_no, line) for IOC_HITS
@@ -2808,6 +2809,208 @@ class Triage:
                      mitre="T1222 File and Directory Permissions Modification")
 
     # -- 16. bodyfile / timeline -------------------------------------------
+    #: What "timestomped" means when it is a fact rather than a suspicion.
+    #:
+    #: Three of the four Linux timestamps can be written from userspace:
+    #: utimensat sets atime and mtime to any value a caller likes, and crtime
+    #: is only ever as good as the filesystem that recorded it. ctime cannot
+    #: be - the kernel stamps it on every inode change and exposes no
+    #: interface to set it - and that asymmetry is what turns the comparisons
+    #: below into evidence rather than opinion. A forged stamp is not a value
+    #: that looks wrong on its own; it is a set of values that cannot all be
+    #: true at once.
+    #:
+    #: Which is also why this splits in two. Forward-dating breaks an
+    #: invariant - the same pair the AD1 reader leans on to identify its
+    #: unlabelled timestamp attributes, ctime >= mtime and crtime <= ctime -
+    #: so it is provable from the inode alone and needs no window, no
+    #: baseline and no corroboration. Backdating breaks nothing: "mtime much
+    #: older than ctime" is equally what every dpkg install, cp -p, tar -p
+    #: and rsync -t leaves behind, and on a Linux host those outnumber real
+    #: timestomps by orders of magnitude. The backdating rules are therefore
+    #: scoped to the incident window, demoted when they fire in bulk, and
+    #: worded as leads rather than as conclusions.
+    #:
+    #: rule -> (severity, title, what it means, what it means at volume)
+    TIMESTOMP_RULES = {
+        "mtime_ahead": (
+            "HIGH",
+            "Content timestamp later than the last metadata change",
+            "The kernel sets ctime every time it sets mtime, so on a "
+            "filesystem nobody has edited ctime is never earlier than mtime. "
+            "An mtime later than its own ctime means mtime was written "
+            "directly - touch -d, utimensat, or a stomper - to a moment after "
+            "the write it claims to describe. Nothing done through the normal "
+            "file interface produces this.",
+            "At this volume the host's clock stepped backwards, or the tree "
+            "was restored with its mtimes preserved and its metadata rewritten "
+            "afterwards. Both produce this on thousands of files at once; a "
+            "targeted timestomp does not."),
+        "pre_creation": (
+            "HIGH",
+            "Metadata changed before the file was created",
+            "crtime is when the inode came into existence and ctime is the "
+            "last time anything about it changed, so ctime cannot precede "
+            "crtime. When it does, one of the two was written into the inode "
+            "from outside the filesystem's own bookkeeping - debugfs, a raw "
+            "image edit, or a stomper that set crtime and did not think about "
+            "ctime.",
+            "This many means the crtime column itself is unreliable on this "
+            "image - a filesystem that does not record creation times, or a "
+            "collector that filled the field with something else - rather "
+            "than that every file was edited."),
+        "new_file_old_mtime": (
+            "MEDIUM",
+            "Created inside the incident window, timestamped long before it",
+            "The file was created during the window and claims an mtime from "
+            "long before it. That is the backdating case, and crtime is what "
+            "gives it away: the content date can be forged, the moment the "
+            "inode was allocated is much harder to. Confirm against the "
+            "package database before calling it - dpkg and rpm preserve the "
+            "package's build date as mtime and create the file at install "
+            "time, which looks identical.",
+            "A run this size is an install or an upgrade writing its own "
+            "build dates across the tree, not a file someone backdated. "
+            "Narrow --window past it, or read PACKAGE_HISTORY for the session "
+            "that caused it."),
+        "minute_aligned": (
+            "MEDIUM",
+            "Access and content timestamps set to an exact minute",
+            "atime and mtime are identical and land exactly on a minute "
+            "boundary while ctime does not. That is the shape `touch -t "
+            "YYYYMMDDhhmm` leaves: it writes both stamps to the value given, "
+            "which carries no seconds, and cannot touch ctime at all. A "
+            "genuine write lands on an arbitrary second - one in sixty of "
+            "them by chance.",
+            "At this volume it is a build system stamping its output to a "
+            "fixed date, or an archive unpacked with minute-resolution times, "
+            "rather than a file someone re-dated by hand."),
+        "stamp_missing": (
+            "MEDIUM",
+            "File with its content or metadata timestamp zeroed",
+            "The inode carries times, but the one named here is zero. A live "
+            "filesystem does not leave mtime or ctime unset on a regular "
+            "file; a wiper that could not set a convincing date and settled "
+            "for none does.",
+            "This many is a collector or a filesystem that did not record the "
+            "field at all - check whether the column is empty everywhere "
+            "before reading anything into it."),
+    }
+    TIMESTOMP_SKEW = timedelta(seconds=2)     # bodyfile rounding, coarse clocks
+    TIMESTOMP_BACKDATE = timedelta(days=180)  # a gap that stops being a build date
+    TIMESTOMP_BULK = 200        # above this the cause is systemic, not targeted
+    TIMESTOMP_ROW_CAP = 5000    # rows kept per rule; the count stays exact
+
+    @staticmethod
+    def _stomp_gap(delta):
+        """A timedelta as the coarsest unit that still says something."""
+        secs = abs(int(delta.total_seconds()))
+        if secs >= 172800:
+            return "%d days" % (secs // 86400)
+        if secs >= 7200:
+            return "%dh" % (secs // 3600)
+        if secs >= 120:
+            return "%dm" % (secs // 60)
+        return "%ds" % secs
+
+    def _timestomp(self, path, mode, inode, uid, size,
+                   atime, mtime, ctime, crtime, ws):
+        """Score one bodyfile entry against every timestamp rule.
+
+        Called for every regular file rather than for a pre-narrowed subset,
+        because there is nothing to narrow on: the whole test is this file's
+        four clocks compared against each other, and a forged stamp announces
+        itself nowhere else. That is one call and a handful of datetime
+        comparisons per entry, which over a bodyfile of a few hundred thousand
+        lines costs a fraction of a second - against a check that cannot be
+        run afterwards, because the console gets whole seconds and the answer
+        lives in the inode.
+
+        Counts stay exact while the retained rows are capped: a host whose
+        clock stepped backwards fails a rule on every file it has, and the
+        number is the interesting part of that answer rather than the list.
+        """
+        rows, n = self.timestomp["rows"], self.timestomp["n"]
+
+        def flag(rule, note):
+            n[rule] += 1
+            if len(rows[rule]) < self.TIMESTOMP_ROW_CAP:
+                rows[rule].append((path, mode, uid, size, inode,
+                                   atime, mtime, ctime, crtime, note))
+
+        if mtime and ctime:
+            if ctime < mtime - self.TIMESTOMP_SKEW:
+                flag("mtime_ahead", "mtime is %s ahead of ctime (m=%s c=%s)"
+                     % (self._stomp_gap(mtime - ctime),
+                        _ts_text(mtime), _ts_text(ctime)))
+            if atime and atime == mtime and atime != ctime \
+                    and atime.second == 0 and ctime.second != 0:
+                flag("minute_aligned", "a=m=%s exactly, ctime %s"
+                     % (_ts_text(mtime), _ts_text(ctime)))
+        elif atime or mtime or ctime or crtime:
+            flag("stamp_missing", "%s zero (a=%s m=%s c=%s b=%s)"
+                 % ("mtime and ctime" if not (mtime or ctime)
+                    else "mtime" if not mtime else "ctime",
+                    _ts_text(atime) or "-", _ts_text(mtime) or "-",
+                    _ts_text(ctime) or "-", _ts_text(crtime) or "-"))
+
+        if crtime:
+            if ctime and ctime < crtime - self.TIMESTOMP_SKEW:
+                flag("pre_creation", "ctime %s precedes crtime %s by %s"
+                     % (_ts_text(ctime), _ts_text(crtime),
+                        self._stomp_gap(crtime - ctime)))
+            # Backdating, and the only rule here that needs the window: the
+            # gap on its own is what a packaged file looks like, and it is
+            # the file having been created during the incident that makes an
+            # ancient content date worth reading at all.
+            if ws and mtime and crtime >= ws \
+                    and mtime < crtime - self.TIMESTOMP_BACKDATE \
+                    and ("x" in mode[1:]
+                         or path.startswith(SYSTEM_BIN_DIRS + SYSTEM_CFG_DIRS
+                                            + TMPFS_DIRS)):
+                flag("new_file_old_mtime",
+                     "created %s, mtime reads %s - %s earlier"
+                     % (_ts_text(crtime), _ts_text(mtime),
+                        self._stomp_gap(crtime - mtime)))
+
+    #: Report order: the two provable rules first, then the corroborating ones.
+    TIMESTOMP_ORDER = ("mtime_ahead", "pre_creation", "new_file_old_mtime",
+                       "minute_aligned", "stamp_missing")
+
+    def _timestomp_findings(self, src):
+        """Raise one finding per rule that fired, and date it by ctime.
+
+        ctime is the clock the forger could not set, so it is the one an entry
+        goes on the timeline under. Dating a stomped file by its own mtime
+        would file the finding exactly where the intruder asked for it to be
+        filed, which is the opposite of the point.
+
+        Per-file events only while a rule stays below the bulk threshold.
+        Above it the cause is a clock step or a package run, and one event
+        each would bury the rest of the timeline under a fact that is already
+        stated once as a finding.
+        """
+        rows, n = self.timestomp["rows"], self.timestomp["n"]
+        for rule in self.TIMESTOMP_ORDER:
+            hits = rows.get(rule) or []
+            if not hits:
+                continue
+            sev, title, detail, bulk_detail = self.TIMESTOMP_RULES[rule]
+            total = n[rule]
+            bulk = total > self.TIMESTOMP_BULK
+            when = [r[7] or r[6] or r[8] for r in hits]
+            self.add("INFO" if bulk else sev, "Anti-forensics",
+                     "%s: %d file(s)" % (title, total),
+                     "%s\n\n%s" % (detail, bulk_detail) if bulk else detail,
+                     evidence=["%-58s %s" % (trunc(r[0], 58), r[9])
+                               for r in hits[:30]],
+                     source=src, mitre="T1070.006 Timestomp",
+                     times=when, count=total)
+            if not bulk and rule in ("mtime_ahead", "pre_creation"):
+                for r in hits:
+                    self.event(r[7], "Anti-forensics",
+                               "%s: %s" % (title.lower(), r[0]), sev, src)
+
     def analyze_bodyfile(self):
         src = None
         for cand in ("bodyfile/bodyfile.txt", "bodyfile/bodyfile.csv"):
@@ -2848,6 +3051,15 @@ class Triage:
             if newest:
                 oldest = newest if oldest is None or newest < oldest else oldest
                 latest = newest if latest is None or newest > latest else latest
+
+            # Timestamp forgery, on the pass we are already making. Unlike
+            # everything else in this loop these rules need no window and no
+            # collection time - they compare the entry against itself - so
+            # they are the one part of the bodyfile analysis that still
+            # answers on a collection whose clock nothing recorded.
+            if is_reg:
+                self._timestomp(path, mode, inode, uid, size,
+                                atime, mtime, ctime, crtime, ws)
 
             # World-writable, but only for objects where it means anything:
             # symlinks are always lrwxrwxrwx, and sticky directories (/tmp) are
@@ -2938,6 +3150,7 @@ class Triage:
                       "remains when mtime is forged: ctime cannot be set from userspace."),
                      stomped[:25], source=src, mitre="T1070.006 Timestomp",
                      times=when["stomped"], count=len(stomped))
+        self._timestomp_findings(src)
         if suid_bodies:
             self.add("INFO", "Privilege", "%d setuid/setgid file(s) in the filesystem timeline" % len(suid_bodies),
                      evidence=suid_bodies[:40], source=src,
