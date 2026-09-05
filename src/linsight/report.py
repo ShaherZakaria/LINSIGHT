@@ -281,7 +281,7 @@ def write_html(tri, path, opts, tb=None):
 
     # What this document is not. It carries the findings - the conclusions,
     # ranked, to read top to bottom and hand to someone - and it deliberately
-    # does not carry the 88 artifact tables, which are a browsable grid rather
+    # does not carry the 94 artifact tables, which are a browsable grid rather
     # than a document and would run to hundreds of megabytes here. Saying so
     # is the point: a reader who does not find the process table in this file
     # must be told where it is, not left to conclude it was never built.
