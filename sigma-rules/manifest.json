@@ -1,0 +1,10 @@
+{
+  "considered": 4265,
+  "etag": "\"599f0b9872720a41e6cac8a32c1de85c54411e03f9513a4bdd971eb7cd66cb6d\"",
+  "fetched_utc": "2026-08-26 09:25:49",
+  "filtered": true,
+  "rules": 334,
+  "source": "https://codeload.github.com/SigmaHQ/sigma/zip/refs/heads/master",
+  "tool_version": "1.0",
+  "url": "https://codeload.github.com/SigmaHQ/sigma/zip/refs/heads/master"
+}
