@@ -311,6 +311,48 @@ def _fs_ts(when):
         return ""
 
 
+def _netstat_hostport(addr):
+    """Split the way netstat prints, which is not the way ss does.
+
+    netstat never brackets an IPv6 address: it writes ":::80" for
+    every address on port 80, and "::1:631" for loopback on 631. The
+    last colon is the separator whatever the address looks like.
+    Read as a bare IPv6 address instead - which is what a general
+    splitter has to assume, because "::ffff:1.2.3.4" really is one -
+    the port is dropped, and this host's own IPv6 listeners on 80
+    and 22 were recorded as listening on nothing at all.
+    """
+    a = (addr or "").strip()
+    if not a:
+        return "", ""
+    if a.startswith("["):                 # [::]:80, if it ever appears
+        h, sep, p = a.rpartition("]:")
+        if sep:
+            return norm_ip(h.lstrip("[")), p
+        return norm_ip(a), ""
+    h, sep, p = a.rpartition(":")
+    if not sep:                           # a path, or a bare host
+        return norm_ip(a), ""
+    return (norm_ip(h) if h else "::"), p
+
+
+def _port_text(addr):
+    """The port field exactly as printed, a service name included.
+
+    split_hostport answers with a number or None, which is what
+    anything comparing ports wants. This is for recording what the
+    tool actually said.
+    """
+    a = (addr or "").strip()
+    if a.startswith("["):
+        _h, sep, p = a.rpartition("]:")
+        return p if sep else ""
+    h, sep, p = a.rpartition(":")
+    if not sep or h.count(":") >= 2:      # bare IPv6, no port
+        return ""
+    return p
+
+
 def _s(v):
     """Cell -> display string."""
     if v is None:
@@ -1841,8 +1883,16 @@ class TableBuilder:
             # driven off the section header rather than fixed offsets
             has_user = False
             unix_section = False
+            # State is optional - a DGRAM row has none - and is only ever a
+            # word. Left unconstrained it matched the I-Node instead, and the
+            # I-Node group then took the digits off the front of the next
+            # token: "unix 2 [ ] DGRAM 733323 602/systemd /run/..." recorded
+            # its inode as a state, the pid as an inode, and "/systemd
+            # /run/..." as the path. 38 rows of netstat_-anp.txt here.
+            # Letters for the state, and a whole token for the I-Node.
             unix_rx = re.compile(r"^(unix)\s+(\d+)\s+\[([^\]]*)\]\s+(\S+)"
-                                 r"(?:\s+(\S+))?\s+(\d+)\s*(.*)$")
+                                 r"(?:\s+([A-Z][A-Z_]*))?\s+(\d+)(?=\s|$)"
+                                 r"\s*(.*)$")
             for ln in lines:
                 s = ln.rstrip()
                 if not s.strip():
@@ -1894,8 +1944,13 @@ class TableBuilder:
                             pid = ""
                     elif tok.isdigit() and not inode:
                         inode = tok
-                la, lp = split_hostport(local)
-                pa, pp = split_hostport(peer)
+                # Split netstat's own way, and keep the port as printed: a
+                # service name where -n was not given, '*' for a wildcard.
+                # Both used to come back empty - '0.0.0.0:ssh' and ':::80'
+                # were recorded as listeners on no port at all, which is the
+                # sshd and the web server missing from the port column.
+                la, lp = _netstat_hostport(local)
+                pa, pp = _netstat_hostport(peer)
                 i = self.proc_of(pid)
                 # netstat -e prints the owner as a numeric uid; show the name
                 # when /etc/passwd resolves it, and fall back to the process's
