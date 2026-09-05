@@ -192,6 +192,11 @@ def side_tables(label):
         # web01 tried and failed
         auth.append(["2026-03-24 03:40:00", "failed password", "deploy",
                      ADDR["web01"], "failure", "sshd"])
+        # and db02 got in - which makes web01 -> db02 -> app03 one route
+        auth.append(["2026-03-24 03:35:00", "accepted publickey", "root",
+                     ADDR["db02"], "success", "sshd"])
+        logins.append(["root", "sshd", "pts/0", ADDR["db02"],
+                       "2026-03-24 03:35:01", "success"])
     if label == "web01":
         # and web01's own history says where it was going
         hist.append(["root", "2026-03-24 03:19:00", "bash",
@@ -203,7 +208,37 @@ def side_tables(label):
         # a command that reaches nowhere in this case
         hist.append(["root", "2026-03-24 03:22:00", "bash",
                      "/root/.bash_history", "4", "curl https://example.org/x"])
+    # when each hashed file was created here, which is what gives a shared
+    # hash a direction. /tmp/.x is created on web01 and appears on db02 twenty
+    # minutes later; hide.so has no creation time on app03, so that pair can
+    # only be ordered by mtime and has to say so.
+    inv = [["/usr/bin/curl", "2019-01-01 00:00:00", "2019-01-01 00:00:00"]]
+    sudo = [["/etc/sudoers", "%sudo ALL=(ALL:ALL) ALL", ""]]
+    groups = [["sudo", "27", "root", "1"]]
+    web = []
+    if label == "web01":
+        inv.append(["/tmp/.x", "2026-03-24 03:05:00", "2026-03-24 03:04:00"])
+        inv.append(["/opt/a/hide.so", "2026-03-24 02:00:00",
+                    "2026-03-24 02:00:00"])
+        sudo.append(["/etc/sudoers.d/svc", "svc ALL=(ALL) NOPASSWD: ALL", "1"])
+        groups = [["sudo", "27", "root,svc", "2"]]
+        web = [["2026-03-24 03:00:00", OUTSIDE, "GET", "/wp-login.php", "404"],
+               ["2026-03-24 03:01:00", OUTSIDE, "GET", "/shell.php", "200"],
+               ["2026-03-24 03:02:00", "198.51.100.7", "GET", "/only-here",
+                "200"]]
+    if label == "db02":
+        inv.append(["/tmp/.x", "2026-03-24 03:25:00", "2026-03-24 03:04:00"])
+        sudo.append(["/etc/sudoers.d/svc", "svc ALL=(ALL) NOPASSWD: ALL", "1"])
+        web = [["2026-03-24 03:30:00", OUTSIDE, "GET", "/wp-login.php", "404"]]
+    if label == "app03":
+        # mtime only: the copy carried its timestamp and nothing wrote a crtime
+        inv.append(["/usr/local/lib/hide.so", "", "2026-03-24 02:30:00"])
     return [
+        Grid("FILE_INVENTORY", ["host_path", "crtime_utc", "mtime_utc"], inv),
+        Grid("SUDOERS", ["file", "rule", "nopasswd"], sudo),
+        Grid("GROUPS", ["group", "gid", "members", "member_count"], groups),
+        Grid("WEB_LOG", ["timestamp_utc", "client_ip", "method", "resource",
+                         "status"], web),
         Grid("INTERFACES", ["name", "addresses"], ifaces),
         Grid("AUTH_LOG", ["timestamp_utc", "event", "user", "source_ip",
                           "result", "process"], auth),
@@ -544,6 +579,137 @@ def check_techniques(L, res):
               rows["T1036"]["severity"] == "CRITICAL")
 
 
+def check_paths(L, res):
+    print("\ntwo hops, read as one route")
+    cor = build(L)
+    rows = rows_of(cor, "CROSS_PATHS")
+    res.check("web01 -> db02 -> app03 is drawn as one path",
+              any(r["path"] == "web01 -> db02 -> app03" for r in rows),
+              "got %s" % [r["path"] for r in rows])
+    one = next(r for r in rows if r["path"] == "web01 -> db02 -> app03")
+    res.check("both hops succeeded, so the route was reached",
+              one["result"] == "reached", "got %s" % one["result"])
+    res.check("and it is dated from the first hop to the last",
+              one["first_utc"].endswith("03:20:00")
+              and one["last_utc"].endswith("03:35:00"),
+              "got %s .. %s" % (one["first_utc"], one["last_utc"]))
+    res.check("a route travelled end to end is CRITICAL",
+              any(f.severity == "CRITICAL" and "travelled end to end" in f.title
+                  for f in cor.tri.findings),
+              "got %s" % [(f.severity, f.title) for f in cor.tri.findings])
+    res.check("a path never doubles back on itself",
+              not any(r["path"].split(" -> ")[0] == r["path"].split(" -> ")[2]
+                      for r in rows))
+
+
+def check_paths_window(L, res):
+    print("\na hop too late to be the same movement")
+    cor = build(L)
+    edges = [{"when": "2026-03-24 03:00:00", "from": "a", "to": "b",
+              "user": "root", "ok": True, "service": "sshd"},
+             {"when": "2026-03-30 03:00:00", "from": "b", "to": "c",
+              "user": "root", "ok": True, "service": "sshd"}]
+    cor.session_edges = edges
+    cor.tables = [t for t in cor.tables if t.name != "CROSS_PATHS"]
+    cor.t_cross_paths()
+    res.check("six days apart is not one route",
+              "CROSS_PATHS" not in [t.name for t in cor.tables])
+    edges[1]["when"] = "2026-03-24 06:00:00"
+    cor.t_cross_paths()
+    res.check("three hours apart is", "CROSS_PATHS" in
+              [t.name for t in cor.tables])
+
+
+def check_transfers(L, res):
+    print("\nthe same file, and which host had it first")
+    cor = build(L)
+    rows = dict((r["digest"], r) for r in rows_of(cor, "CROSS_TRANSFERS"))
+    res.check("the implant is reported as a transfer", IMPLANT in rows,
+              "got %s" % list(rows))
+    got = rows[IMPLANT]
+    res.check("from the host that created it first",
+              got["from_collection"] == "web01"
+              and got["to_collection"] == "db02",
+              "got %s -> %s" % (got["from_collection"], got["to_collection"]))
+    res.check("with the gap between the two creations",
+              got["gap"] == "20m", "got %s" % got["gap"])
+    res.check("and the basis named as crtime", got["basis"] == "crtime",
+              "got %s" % got["basis"])
+    res.check("a file the distribution ships is not a transfer",
+              SHARED_OS not in rows)
+    res.check("a pair that can only be ordered by mtime says so",
+              rows.get(MOVED, {}).get("basis") == "mtime",
+              "got %s" % rows.get(MOVED))
+    res.check("crtime-ordered transfers are HIGH",
+              any(f.severity == "HIGH" and "and then on another" in f.title
+                  for f in cor.tri.findings),
+              "got %s" % [(f.severity, f.title) for f in cor.tri.findings])
+    res.check("mtime-ordered ones are reported apart, at MEDIUM",
+              any(f.severity == "MEDIUM" and "ordered by mtime" in f.title
+                  for f in cor.tri.findings))
+
+
+def check_privilege(L, res):
+    print("\nprivilege granted the same way twice")
+    cor = build(L)
+    rows = rows_of(cor, "CROSS_PRIVILEGE")
+    grants = dict((r["grant"], r) for r in rows)
+    res.check("a sudoers rule on two hosts is here",
+              "svc ALL=(ALL) NOPASSWD: ALL" in grants, "got %s" % list(grants))
+    got = grants["svc ALL=(ALL) NOPASSWD: ALL"]
+    res.check("named on both", got["host_count"] == 2
+              and set(got["hosts"].split(", ")) == set(["web01", "db02"]),
+              "got %s" % got["hosts"])
+    res.check("and marked passwordless", got["nopasswd"] == "yes")
+    res.check("a privileged group membership on every host is here too",
+              grants.get("sudo: root", {}).get("host_count") == 3,
+              "got %s" % grants.get("sudo: root"))
+    res.check("a member only one host has is not",
+              "sudo: svc" not in grants)
+    res.check("a passwordless shared rule makes the finding HIGH",
+              any(f.severity == "HIGH" and "privilege grant" in f.title
+                  for f in cor.tri.findings),
+              "got %s" % [(f.severity, f.title) for f in cor.tri.findings])
+    res.check("the rule somebody wrote is notable",
+              got["notable"] == "yes", "got %s" % got.get("notable"))
+    res.check("the line every Ubuntu ships is not",
+              grants["%sudo ALL=(ALL:ALL) ALL"]["notable"] == "",
+              "got %s" % grants.get("%sudo ALL=(ALL:ALL) ALL"))
+    res.check("nor is a system account in a privileged group",
+              grants["sudo: root"]["notable"] == "",
+              "got %s" % grants.get("sudo: root"))
+    res.check("and the stock ones are counted apart, at INFO",
+              any(f.severity == "INFO" and "further privilege grant" in f.title
+                  for f in cor.tri.findings),
+              "got %s" % [(f.severity, f.title) for f in cor.tri.findings])
+
+
+def check_web(L, res):
+    print("\nthe web logs, which nothing cross-host read before")
+    cor = build(L)
+    clients = dict((r["client"], r) for r in rows_of(cor, "CROSS_WEB_CLIENTS"))
+    res.check("an address that reached two hosts is here", OUTSIDE in clients,
+              "got %s" % list(clients))
+    got = clients[OUTSIDE]
+    res.check("with both named", got["host_count"] == 2
+              and set(got["hosts"].split(", ")) == set(["web01", "db02"]),
+              "got %s" % got["hosts"])
+    res.check("and the requests it was answered counted",
+              int(got["requests"]) == 3 and int(got["answered"]) == 1,
+              "got %s of %s" % (got["answered"], got["requests"]))
+    res.check("an address only one host saw is not here",
+              "198.51.100.7" not in clients)
+    res.check("being answered on more than one host is HIGH",
+              any(f.severity == "HIGH" and "web client" in f.title
+                  for f in cor.tri.findings),
+              "got %s" % [(f.severity, f.title) for f in cor.tri.findings])
+    reqs = dict((r["resource"], r) for r in rows_of(cor, "CROSS_WEB_REQUESTS"))
+    res.check("a path asked for on two hosts is here", "/wp-login.php" in reqs,
+              "got %s" % list(reqs))
+    res.check("a path only one host was asked for is not",
+              "/shell.php" not in reqs and "/only-here" not in reqs)
+
+
 def check_tab_contract(L, res):
     """The console's Correlation tab reads these by name, so they must exist."""
     print("\nthe Correlation tab table contract")
@@ -625,6 +791,11 @@ def main():
     check_accounts(L, res)
     check_persistence(L, res)
     check_techniques(L, res)
+    check_paths(L, res)
+    check_paths_window(L, res)
+    check_transfers(L, res)
+    check_privilege(L, res)
+    check_web(L, res)
     check_tab_contract(L, res)
 
     print("\n%d passed, %d failed" % (res.passed, len(res.failed)))

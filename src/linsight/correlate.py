@@ -30,6 +30,8 @@ kind of sentence a report should not be able to make silently.
 
 from __future__ import annotations
 
+import bisect
+
 from collections import defaultdict
 from datetime import datetime
 import os
@@ -38,7 +40,8 @@ import sys
 
 from .model import Finding, SEVERITIES, SEV_RANK
 from .term import status, trunc
-from .common import TMPFS_DIRS, _ts_text, ioc_type, span_of
+from .common import (
+    PRIVILEGED_GROUPS, TMPFS_DIRS, _ts_text, ioc_type, span_of)
 from .triage import Triage
 from .tables import Table
 from .writers import write_tables_csv, write_tables_html, write_tables_json
@@ -50,6 +53,39 @@ from .writers import write_tables_csv, write_tables_html, write_tables_json
 #: system and buries the four files that matter.
 NOTABLE_DIRS = TMPFS_DIRS + ("/home/", "/root/", "/usr/local/", "/opt/",
                              "/var/www/", "/srv/", "/var/spool/")
+
+#: How long after a sign-in a second sign-in still reads as the same movement.
+#: Long enough to cover an intruder who lands, looks around and moves on;
+#: short enough that two unrelated administrative logins a week apart are not
+#: drawn as one path.
+CHAIN_WINDOW_SECONDS = 24 * 3600
+
+
+def _bump(store, key, when, ok, code):
+    """Fold one web-log row into a per-key aggregate."""
+    got = store.get(key)
+    if got is None:
+        got = store[key] = {"n": 0, "first": "", "last": "", "ok": 0,
+                            "codes": set()}
+    got["n"] += 1
+    got["ok"] += 1 if ok else 0
+    if when:
+        if not got["first"] or when < got["first"]:
+            got["first"] = when
+        if not got["last"] or when > got["last"]:
+            got["last"] = when
+    if code and len(got["codes"]) < 12:
+        got["codes"].add(code)
+    return got
+
+
+def _cap_by_count(store, cap):
+    """The busiest `cap` keys, or all of them where there are fewer."""
+    if len(store) <= cap:
+        return store
+    keep = sorted(store.items(), key=lambda kv: -kv[1]["n"])[:cap]
+    return dict(keep)
+
 
 #: Findings are grouped across hosts by title, and a title carries its own
 #: count - "3 executable file(s)" on one host and "7 executable file(s)" on
@@ -264,13 +300,21 @@ class HostCase(object):
         self.keys = {}            # authorized key -> [the files holding it]
         self.persist = {}         # (kind, value) -> where it was found
         self.techniques = {}      # ATT&CK id -> worst severity that carried it
+        self.file_times = {}      # digest -> when this host first held it
+        self.sudo_rules = {}      # a sudoers rule -> the file it is in
+        self.group_members = {}   # (privileged group, member) -> gid
+        self.web_clients = {}     # client address -> what it asked this host
+        self.web_requests = {}    # (method, resource) -> how it was answered
         self._take_identity(tables)
         self._take_sessions(tables)
         self._take_commands(tables)
         self._take_hashes(tables)
+        self._take_file_times(tables)
         self._take_accounts(tables)
         self._take_keys(tables)
         self._take_persistence(tables)
+        self._take_privilege(tables)
+        self._take_web(tables)
         self._take_techniques()
 
     def _take_hashes(self, tables):
@@ -296,6 +340,128 @@ class HostCase(object):
             path = (row[ip] or "").strip()
             if digest and path:
                 self.hashes.setdefault(digest, []).append(path)
+
+    def _take_file_times(self, tables):
+        """When each hashed file was created on this host, where that is known.
+
+        A shared hash says two machines hold the same bytes. It does not say
+        which of them had them first, and that is the whole difference between
+        "these hosts run the same distribution" and "this file was put on that
+        one from this one". crtime is the clock that answers it: mtime rides
+        along with a copy - scp -p, cp -a and every archive preserve it, which
+        is exactly why an implant carries the same mtime on all three machines
+        - while the creation time is written by the filesystem that received
+        the file and cannot be carried in from anywhere.
+
+        FILE_HASHES already carries mtime, so only the creation time has to be
+        looked up. It is read off FILE_INVENTORY for the hashed paths alone: a
+        few hundred lookups against one pass of a table that is otherwise a
+        quarter of a million rows about files nobody hashed.
+        """
+        paths = {}
+        for digest, plist in self.hashes.items():
+            for path in plist:
+                paths.setdefault(path, digest)
+        if not paths:
+            return
+        for r in self._stream(tables, "FILE_INVENTORY",
+                             ("host_path", "crtime_utc", "mtime_utc")):
+            digest = paths.get(r["host_path"])
+            if not digest:
+                continue
+            crtime, mtime = r["crtime_utc"].strip(), r["mtime_utc"].strip()
+            when = crtime or mtime
+            if not when:
+                continue
+            got = self.file_times.get(digest)
+            # The earliest copy is the one that answers "when did this host
+            # first hold these bytes"; a second copy made later is a local
+            # copy, not the arrival.
+            if got is None or when < got["when"]:
+                self.file_times[digest] = {
+                    "path": r["host_path"], "when": when,
+                    "basis": "crtime" if crtime else "mtime",
+                    "mtime": mtime}
+
+    def _take_privilege(self, tables):
+        """Sudo rules and privileged group membership, as configuration.
+
+        Both answer "who is root here", and both are worth comparing across
+        machines. One NOPASSWD rule for a service account on three hosts is a
+        single decision that made all three reachable from any of them, and a
+        name in sudo or wheel on hosts that share nothing else is either a
+        management standard or a foothold that was built three times.
+        """
+        for r in self._cells(tables, "SUDOERS", ("file", "rule", "nopasswd")):
+            rule = " ".join((r["rule"] or "").split())
+            if rule and not rule.startswith(("Defaults", "#include", "@include")):
+                self.sudo_rules[rule] = "%s%s" % (
+                    r["file"], " [NOPASSWD]" if r["nopasswd"] else "")
+        for r in self._cells(tables, "GROUPS", ("group", "gid", "members")):
+            if r["group"].strip().lower() not in PRIVILEGED_GROUPS:
+                continue
+            for member in (m.strip() for m in r["members"].split(",")):
+                if member:
+                    self.group_members[(r["group"].strip(), member)] = r["gid"]
+
+    #: How many distinct web values one host may contribute to the join.
+    #:
+    #: A scanned host answers hundreds of thousands of requests from tens of
+    #: thousands of addresses, and a cross-host table is not improved by all
+    #: of them: the shape worth seeing is "this one thing reached several of
+    #: these machines". Capped by count, so what survives is what that host
+    #: saw most of.
+    WEB_CAP = 20000
+
+    def _take_web(self, tables):
+        """What each host was asked for over HTTP, aggregated before the join.
+
+        Per address and per request, because they answer different questions.
+        One client address reaching several of these machines is a single
+        actor working the estate. One request path appearing on several is a
+        pattern - a scanner's list, or the same exploit tried everywhere - and
+        it is a pattern whether or not one address is behind it, which is why
+        it is counted separately.
+
+        Aggregated here rather than in the correlator because WEB_LOG is half
+        a million rows on a busy host, and three of those held at once row by
+        row is the memory this class exists not to spend.
+        """
+        clients, requests = {}, {}
+        for r in self._stream(tables, "WEB_LOG",
+                             ("timestamp_utc", "client_ip", "method",
+                              "resource", "status")):
+            when = r["timestamp_utc"]
+            code = r["status"].strip()
+            ok = code[:1] in ("2", "3")
+            ip = r["client_ip"].strip()
+            if ip:
+                _bump(clients, ip, when, ok, code)
+            res = r["resource"].strip()
+            if res:
+                _bump(requests, ((r["method"] or "").strip().upper(), res),
+                      when, ok, code)
+        self.web_clients = _cap_by_count(clients, self.WEB_CAP)
+        self.web_requests = _cap_by_count(requests, self.WEB_CAP)
+
+    @staticmethod
+    def _stream(tables, name, wanted):
+        """_cells, one row at a time.
+
+        The same projection, without building a list first. WEB_LOG is half a
+        million rows on a busy host and FILE_INVENTORY a quarter of a million
+        on any disk image; a list of dicts over either is hundreds of
+        megabytes held to read five columns and throw the rest away.
+        """
+        t = next((x for x in (tables or []) if x.name == name), None)
+        if t is None:
+            return
+        at = dict((c, i) for i, c in enumerate(t.columns))
+        if not all(c in at for c in wanted):
+            return
+        for row in t.iter_rows():
+            yield dict((c, (row[at[c]] if at[c] < len(row) else "") or "")
+                       for c in wanted)
 
     @staticmethod
     def _cells(tables, name, wanted):
@@ -499,19 +665,24 @@ class Correlator(object):
     #: the strongest claim first. A shared indicator or a shared key is
     #: evidence of one intrusion; a shared technique is evidence of one
     #: playbook, which is weaker and much more often innocent.
-    CROSS_TABLES = ("CROSS_SESSIONS", "CROSS_COMMANDS", "CROSS_IOCS",
-                    "CROSS_HASHES", "CROSS_KEYS", "CROSS_ACCOUNTS",
-                    "CROSS_PERSISTENCE", "CROSS_FINDINGS", "CROSS_TECHNIQUES",
-                    "HOSTS")
+    CROSS_TABLES = ("CROSS_SESSIONS", "CROSS_PATHS", "CROSS_COMMANDS",
+                    "CROSS_TRANSFERS", "CROSS_IOCS", "CROSS_WEB_CLIENTS",
+                    "CROSS_WEB_REQUESTS", "CROSS_HASHES", "CROSS_KEYS",
+                    "CROSS_PRIVILEGE", "CROSS_ACCOUNTS", "CROSS_PERSISTENCE",
+                    "CROSS_FINDINGS", "CROSS_TECHNIQUES", "HOSTS")
 
     def run(self):
         self.t_hosts()
         self.check_clocks()
         self.t_cross_sessions()
+        self.t_cross_paths()
         self.t_cross_commands()
+        self.t_cross_transfers()
         self.t_cross_iocs()
+        self.t_cross_web()
         self.t_cross_hashes()
         self.t_cross_keys()
+        self.t_cross_privilege()
         self.t_cross_accounts()
         self.t_cross_persistence()
         self.t_cross_findings()
@@ -643,6 +814,13 @@ class Correlator(object):
         rows.sort()
         for r in rows:
             t.add(*r)
+        # Kept for t_cross_paths, which walks these as edges of a graph. Built
+        # here rather than read back out of the table because a hop is a fact
+        # about two hosts and a time, not about how the row was formatted.
+        self.session_edges = [
+            {"when": r[0], "from": r[1], "to": r[2], "user": r[3],
+             "ok": "fail" not in (r[4] or "").lower(), "service": r[5]}
+            for r in rows if r[0]]
         if not pairs:
             return
         good = [(a, b, p) for (a, b), p in pairs.items() if p["ok"]]
@@ -845,6 +1023,416 @@ class Correlator(object):
                      times=[d["first_utc"] for _n, _v, d in ordered])
 
     # -- 4. the same conclusion on more than one host ----------------------
+    # -- 2d. one hop after another: A -> B and then B -> C ------------------
+    def t_cross_paths(self):
+        """Two sign-ins that are one movement through the estate.
+
+        CROSS_SESSIONS answers "did this machine sign in to that one" one hop
+        at a time. An intrusion is a path: the shape worth seeing is web01 ->
+        db02 and then db02 -> backup03 an hour later, which read as two rows
+        is two facts a reader has to notice sit together, and read as a path
+        is the route. The route is what an incident report needs.
+
+        A hop only extends a path when it happens after the hop it extends and
+        within a day of it. Without a window, every administrative login into
+        a jump host in six months of logs chains to every login out of it and
+        the table fills with routes nobody travelled.
+
+        One row per route rather than one per pair of hops, and the pairing is
+        a merge over each leg's own sorted times rather than a comparison of
+        every hop against every other. A busy estate has thousands of sessions
+        between the same few machines; pairing them off would be millions of
+        comparisons to produce a handful of distinct routes, most of them the
+        same three names over and over.
+        """
+        edges = getattr(self, "session_edges", [])
+        if len(edges) < 2:
+            return
+        legs = defaultdict(list)
+        for e in edges:
+            legs[(e["from"], e["to"])].append(e)
+        for v in legs.values():
+            v.sort(key=lambda e: e["when"])
+
+        routes = {}
+        for (a, b), first_leg in legs.items():
+            for (b2, c), second_leg in legs.items():
+                if b2 != b or c == a:
+                    continue
+                times = [e["when"] for e in second_leg]
+                for e1 in first_leg:
+                    # the first hop out of b that could be this one continuing
+                    j = bisect.bisect_left(times, e1["when"])
+                    if j >= len(second_leg):
+                        continue
+                    e2 = second_leg[j]
+                    gap = _seconds_between(e1["when"], e2["when"])
+                    if gap is None or gap > CHAIN_WINDOW_SECONDS:
+                        continue
+                    path = "%s -> %s -> %s" % (a, b, c)
+                    r = routes.get(path)
+                    if r is None:
+                        r = routes[path] = {
+                            "chains": 0, "ok": False, "users": set(),
+                            "first": e1["when"], "last": e2["when"],
+                            "tightest": None, "detail": ""}
+                    r["chains"] += 1
+                    r["ok"] = r["ok"] or (e1["ok"] and e2["ok"])
+                    for u in (e1["user"], e2["user"]):
+                        if u and len(r["users"]) < 12:
+                            r["users"].add(u)
+                    if e1["when"] < r["first"]:
+                        r["first"] = e1["when"]
+                    if e2["when"] > r["last"]:
+                        r["last"] = e2["when"]
+                    if r["tightest"] is None or gap < r["tightest"]:
+                        r["tightest"] = gap
+                        r["detail"] = ("%s as %s, then %s as %s, %s apart"
+                                       % (e1["service"] or "session",
+                                          e1["user"] or "?",
+                                          e2["service"] or "session",
+                                          e2["user"] or "?",
+                                          _gap(e1["when"], e2["when"]) or "no gap"))
+        if not routes:
+            return
+        t = self.table("CROSS_PATHS", "Sign-ins that chain into one route",
+                       ["path", "hops", "chains", "first_utc", "last_utc",
+                        "elapsed", "users", "result", "tightest"],
+                       "Correlation",
+                       "A sign-in from one collection to another followed by "
+                       "a sign-in out of that second one, inside a day. Each "
+                       "hop is a row in CROSS_SESSIONS; this is the route they "
+                       "make, one row however many times it was walked. "
+                       "`result` is 'reached' only where some walk of it "
+                       "succeeded at every hop - a route whose hops all failed "
+                       "is an attempt at a route, which is worth seeing and is "
+                       "not the same claim. `tightest` is the closest the two "
+                       "hops ever came, which is the walk to look at first.")
+        rows = sorted(routes.items(), key=lambda kv: (not kv[1]["ok"],
+                                                      kv[1]["first"]))
+        for path, r in rows:
+            t.add(path, 2, r["chains"], r["first"], r["last"],
+                  _gap(r["first"], r["last"]), ", ".join(sorted(r["users"])),
+                  "reached" if r["ok"] else "attempted", r["detail"])
+        done = [(p, r) for p, r in rows if r["ok"]]
+        if done:
+            self.add("CRITICAL", "Correlation",
+                     "%d route(s) of two hops between these collections were "
+                     "travelled end to end" % len(done),
+                     "Somebody signed in to one of these machines from "
+                     "another and then signed in from there to a third, "
+                     "inside a day. Two successful hops in sequence is not a "
+                     "shared credential or a common configuration - it is "
+                     "movement, and the third host was reached through the "
+                     "second.",
+                     evidence=["%s   %s .. %s as %s   %s"
+                               % (p, r["first"], r["last"],
+                                  ", ".join(sorted(r["users"])) or "(no user)",
+                                  r["detail"])
+                               for p, r in done[: self.EVIDENCE]],
+                     source="CROSS_PATHS", count=len(done),
+                     times=[r["first"] for _p, r in done],
+                     mitre="T1021 Remote Services / T1570 Lateral Tool Transfer")
+        tried = [(p, r) for p, r in rows if not r["ok"]]
+        if tried:
+            self.add("HIGH", "Correlation",
+                     "%d two-hop route(s) were attempted and a hop on them "
+                     "failed" % len(tried),
+                     "The route was walked and something on it refused. Where "
+                     "the first hop worked and the second did not, the middle "
+                     "host is compromised and the far one held.",
+                     evidence=["%s   %s" % (p, r["detail"])
+                               for p, r in tried[: self.EVIDENCE]],
+                     source="CROSS_PATHS", count=len(tried),
+                     mitre="T1021 Remote Services")
+
+    # -- 4b. the same bytes, and which host had them first ------------------
+    def t_cross_transfers(self):
+        """A file that is on two hosts, in the order they came to hold it.
+
+        CROSS_HASHES says two machines have the same file. This says which one
+        had it first and how long the other took to get it - which is the
+        difference between a fact about a distribution and a fact about an
+        intrusion. Only files outside the packaged tree are here: /usr/bin is
+        identical on two machines built from one image, and the order it
+        arrived in is the order they were installed.
+
+        The direction rests on the creation time, and the basis is a column
+        because it decides how much the row is worth. crtime is written by the
+        filesystem that received the file and cannot be forged by the copy;
+        mtime travels with the file, so a row resting on mtime alone says the
+        two hosts hold a file with the same modification time - which is what
+        a copy looks like, and also what two downloads of one release look
+        like.
+        """
+        moves = []
+        for digest, holders in _shared_digests(self.cases):
+            timed = [(c.file_times[digest], c) for c in holders
+                     if digest in c.file_times]
+            if len(timed) < 2:
+                continue
+            paths = [ft["path"] for ft, _c in timed]
+            if not any(p.startswith(NOTABLE_DIRS) for p in paths):
+                continue
+            timed.sort(key=lambda tc: tc[0]["when"])
+            (first_ft, first_c), (last_ft, last_c) = timed[0], timed[-1]
+            if first_ft["when"] == last_ft["when"]:
+                continue        # same instant on both: no direction to state
+            moves.append({
+                "digest": digest, "from": first_c.label, "to": last_c.label,
+                "from_path": first_ft["path"], "to_path": last_ft["path"],
+                "first": first_ft["when"], "last": last_ft["when"],
+                "basis": "crtime" if first_ft["basis"] == last_ft["basis"] ==
+                         "crtime" else "mtime",
+                "hosts": len(timed)})
+        if not moves:
+            return
+        t = self.table("CROSS_TRANSFERS",
+                       "Files that reached one host and then another",
+                       ["digest", "from_collection", "to_collection",
+                        "first_utc", "last_utc", "gap", "basis",
+                        "from_path", "to_path", "host_count"],
+                       "Correlation",
+                       "The same bytes on two collections, with the earlier "
+                       "one named as the source. Only files outside the "
+                       "packaged tree, because a shared /usr/bin is a shared "
+                       "distribution. `basis` is which clock the order rests "
+                       "on: 'crtime' is the filesystem's own record of when "
+                       "it received the file and is the strong form; 'mtime' "
+                       "travels with a copy, so it is consistent with a "
+                       "transfer and also with both hosts downloading the "
+                       "same release.")
+        moves.sort(key=lambda m: (m["basis"] != "crtime", m["first"]))
+        for m in moves:
+            t.add(m["digest"], m["from"], m["to"], m["first"], m["last"],
+                  _gap(m["first"], m["last"]), m["basis"],
+                  m["from_path"], m["to_path"], m["hosts"])
+        strong = [m for m in moves if m["basis"] == "crtime"]
+        if strong:
+            self.add("HIGH", "Correlation",
+                     "%d file(s) appear on one of these hosts and then on "
+                     "another" % len(strong),
+                     "The receiving filesystem wrote the creation time, so "
+                     "the order is the order the hosts came to hold the file "
+                     "- not something a copy carried with it. A file that "
+                     "exists on one machine and appears on a second an hour "
+                     "later, outside the packaged tree, was put there.",
+                     evidence=["%s  %s -> %s after %s\n      %s"
+                               % (m["digest"][:32], m["from"], m["to"],
+                                  _gap(m["first"], m["last"]) or "no gap",
+                                  m["to_path"])
+                               for m in strong[: self.EVIDENCE]],
+                     source="CROSS_TRANSFERS", count=len(strong),
+                     times=[m["first"] for m in strong],
+                     mitre="T1105 Ingress Tool Transfer / T1570 Lateral Tool Transfer")
+        weak = len(moves) - len(strong)
+        if weak:
+            self.add("MEDIUM", "Correlation",
+                     "%d further shared file(s) are ordered by mtime alone"
+                     % weak,
+                     "No creation time was recorded for at least one copy, so "
+                     "the order rests on a timestamp that travels with the "
+                     "file. Consistent with a transfer, and equally "
+                     "consistent with two hosts fetching one release.",
+                     source="CROSS_TRANSFERS", count=weak)
+
+    # -- 6b. who is root here, asked of every host at once -------------------
+    def t_cross_privilege(self):
+        """Sudo rules and privileged group membership shared between hosts.
+
+        Both answer "who is root here", and both are worth comparing across
+        machines. One NOPASSWD rule for a service account on three hosts is a
+        single decision that made all three reachable from any of them, and a
+        name in sudo or wheel on hosts that share nothing else is either a
+        management standard or a foothold that was built three times.
+
+        Which is why `notable` is the column to read, and the same discipline
+        CROSS_HASHES applies. Two Ubuntu machines have identical /etc/sudoers
+        and syslog in adm, because that is what Ubuntu ships - reported as a
+        finding it is four rows of "these hosts run the same distribution"
+        sitting on top of the one rule somebody added.
+        """
+        grants = defaultdict(dict)
+        for c in self.cases:
+            for rule, where in c.sudo_rules.items():
+                grants[("sudoers", rule)][c.label] = where
+            for (group, member), gid in c.group_members.items():
+                grants[("group", "%s: %s" % (group, member))][c.label] = (
+                    "gid %s" % gid if gid else group)
+        shared = dict((k, v) for k, v in grants.items() if len(v) > 1)
+        if not shared:
+            return
+        t = self.table("CROSS_PRIVILEGE",
+                       "Privilege granted the same way on several hosts",
+                       ["kind", "grant", "host_count", "hosts", "notable",
+                        "nopasswd", "where"],
+                       "Correlation",
+                       "A sudoers rule, or a name in a privileged group, "
+                       "present on more than one collection. Shared privilege "
+                       "is shared reach: an account that can become root on "
+                       "three of these machines turns one stolen credential "
+                       "into three compromised hosts. `notable` is what "
+                       "somebody decided rather than what the distribution "
+                       "ships - a passwordless rule, or a grant naming an "
+                       "account that is not a system account. The rest is "
+                       "here because a shipped default that has been edited "
+                       "on one host and not another is worth being able to "
+                       "see, and it is not a finding.")
+        rows = sorted(shared.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        notable = []
+        for (kind, grant), by_host in rows:
+            free = any("NOPASSWD" in w for w in by_host.values())
+            mine = free or _somebody_decided(kind, grant, self.cases)
+            t.add(kind, grant, len(by_host), ", ".join(sorted(by_host)),
+                  "yes" if mine else "", "yes" if free else "",
+                  " | ".join("%s: %s" % (h, w)
+                             for h, w in sorted(by_host.items())))
+            if mine:
+                notable.append(((kind, grant), by_host, free))
+        if notable:
+            free_n = [n for n in notable if n[2]]
+            self.add("HIGH" if free_n else "MEDIUM", "Correlation",
+                     "%d privilege grant(s) somebody added are identical "
+                     "across these hosts" % len(notable),
+                     "One decision reaching several machines. Where it is "
+                     "passwordless the reach needs no credential at all - "
+                     "code execution as that account is root on every host "
+                     "carrying the rule.",
+                     evidence=["%-8s %-58s %s" % (k, trunc(g, 58),
+                                                  ", ".join(sorted(by_host)))
+                               for (k, g), by_host, _f in
+                               notable[: self.EVIDENCE]],
+                     source="CROSS_PRIVILEGE", count=len(notable),
+                     mitre="T1078 Valid Accounts / T1548.003 Sudo and Sudo Caching")
+        rest = len(rows) - len(notable)
+        if rest:
+            self.add("INFO", "Correlation",
+                     "%d further privilege grant(s) are identical across "
+                     "these hosts" % rest,
+                     "Every one of them is what the distribution ships - the "
+                     "stock /etc/sudoers lines and the system accounts in adm "
+                     "and friends. Listed in CROSS_PRIVILEGE rather than "
+                     "here, because a stock rule edited on one host and not "
+                     "another is worth being able to look up.",
+                     source="CROSS_PRIVILEGE", count=rest)
+
+    # -- 7b. the web, which reaches every host that answers on port 80 ------
+    def t_cross_web(self):
+        """One client, and one request, seen by more than one of these hosts.
+
+        WEB_LOG is the one artifact where the other side of the conversation
+        is a first-class column, and until now the correlator never read it.
+        Two questions it answers that nothing else does: which addresses
+        worked more than one of these machines, and which requests were tried
+        on more than one - the second being a pattern even where every request
+        came from a different address, which is what a distributed scan looks
+        like.
+        """
+        clients = defaultdict(dict)
+        requests = defaultdict(dict)
+        for c in self.cases:
+            for ip, agg in c.web_clients.items():
+                clients[ip][c.label] = agg
+            for key, agg in c.web_requests.items():
+                requests[key][c.label] = agg
+        multi_c = {k: v for k, v in clients.items() if len(v) > 1}
+        multi_r = {k: v for k, v in requests.items() if len(v) > 1}
+        if multi_c:
+            t = self.table("CROSS_WEB_CLIENTS",
+                           "Web clients that reached more than one host",
+                           ["client", "host_count", "hosts", "requests",
+                            "answered", "first_utc", "last_utc", "spread",
+                            "per_host"],
+                           "Correlation",
+                           "One address in the access logs of several of "
+                           "these collections. `answered` counts the requests "
+                           "that got a 2xx or 3xx anywhere - the difference "
+                           "between an address that knocked on several doors "
+                           "and one that was let through at least one.")
+            got = []
+            for ip, by_host in sorted(
+                    multi_c.items(),
+                    key=lambda kv: (-len(kv[1]),
+                                    -sum(a["n"] for a in kv[1].values()))):
+                n = sum(a["n"] for a in by_host.values())
+                ok = sum(a["ok"] for a in by_host.values())
+                first = min(a["first"] for a in by_host.values() if a["first"]) \
+                    if any(a["first"] for a in by_host.values()) else ""
+                last = max(a["last"] for a in by_host.values() if a["last"]) \
+                    if any(a["last"] for a in by_host.values()) else ""
+                t.add(ip, len(by_host), ", ".join(sorted(by_host)), n, ok,
+                      first, last, _gap(first, last),
+                      " | ".join("%s: %d req, %d answered"
+                                 % (h, a["n"], a["ok"])
+                                 for h, a in sorted(by_host.items())))
+                got.append((ip, by_host, n, ok, first))
+            served = [g for g in got if g[3]]
+            self.add("HIGH" if served else "MEDIUM", "Correlation",
+                     "%d web client(s) reached more than one of these hosts"
+                     % len(got),
+                     "One address working several machines in the same case. "
+                     "Where it was answered rather than refused, it had a "
+                     "conversation with more than one of them, which is the "
+                     "shape of a single actor rather than of two unrelated "
+                     "scans.",
+                     evidence=["%-39s %d hosts, %d req, %d answered   %s"
+                               % (g[0], len(g[1]), g[2], g[3], g[4] or "?")
+                               for g in got[: self.EVIDENCE]],
+                     source="CROSS_WEB_CLIENTS", count=len(got),
+                     times=[g[4] for g in got if g[4]],
+                     mitre="T1595 Active Scanning / T1190 Exploit Public-Facing Application")
+        if multi_r:
+            t = self.table("CROSS_WEB_REQUESTS",
+                           "Requests made to more than one host",
+                           ["method", "resource", "host_count", "hosts",
+                            "requests", "answered", "status_codes",
+                            "first_utc", "last_utc", "per_host"],
+                           "Correlation",
+                           "The same resource asked for on several of these "
+                           "collections. A pattern even where every request "
+                           "came from a different address, which is what a "
+                           "distributed scan and a shared exploit list both "
+                           "look like. `answered` is how many got a 2xx or "
+                           "3xx: a path that exists on one host and 404s on "
+                           "the rest is the row worth reading. Two caps, "
+                           "because an internet-facing host answers hundreds "
+                           "of thousands of requests: each host offers its "
+                           "20,000 busiest resources to the join, and the "
+                           "2,000 most-shared rows are written. The count on "
+                           "the finding is of every row that matched.")
+            rows = sorted(multi_r.items(),
+                          key=lambda kv: (-len(kv[1]),
+                                          -sum(a["ok"] for a in kv[1].values()),
+                                          -sum(a["n"] for a in kv[1].values())))
+            for (method, res), by_host in rows[: self.PACKAGED_ROW_CAP]:
+                n = sum(a["n"] for a in by_host.values())
+                ok = sum(a["ok"] for a in by_host.values())
+                codes = sorted({c for a in by_host.values() for c in a["codes"]})
+                first = min((a["first"] for a in by_host.values() if a["first"]),
+                            default="")
+                last = max((a["last"] for a in by_host.values() if a["last"]),
+                           default="")
+                t.add(method, trunc(res, 300), len(by_host),
+                      ", ".join(sorted(by_host)), n, ok, ", ".join(codes[:8]),
+                      first, last,
+                      " | ".join("%s: %d" % (h, a["n"])
+                                 for h, a in sorted(by_host.items())))
+            answered = [r for r in rows
+                        if any(a["ok"] for a in r[1].values())]
+            self.add("MEDIUM", "Correlation",
+                     "%d request(s) were made to more than one of these hosts"
+                     % len(rows),
+                     "The same resource asked for on several machines. Most "
+                     "of it is the internet knocking on every door it can "
+                     "find; the rows to read are the ones a host answered, "
+                     "and the ones naming something no scanner guesses.",
+                     evidence=["%-6s %-64s %d hosts, %d answered"
+                               % (m, trunc(r, 64), len(by_host),
+                                  sum(a["ok"] for a in by_host.values()))
+                               for (m, r), by_host in answered[: self.EVIDENCE]],
+                     source="CROSS_WEB_REQUESTS", count=len(rows),
+                     mitre="T1595 Active Scanning")
+
     def t_cross_findings(self):
         t = self.table("CROSS_FINDINGS", "Findings raised on more than one host",
                        ["severity", "category", "finding", "technique",
@@ -1217,6 +1805,42 @@ SYSTEM_NAMES = frozenset(("root", "nobody", "sync", "shutdown", "halt",
                           "operator"))
 
 
+#: The sudoers lines a distribution ships. Matched after whitespace has been
+#: collapsed, so a file that differs only in spacing still reads as stock.
+STOCK_SUDO_RULES = frozenset((
+    "root ALL=(ALL) ALL", "root ALL=(ALL:ALL) ALL",
+    "%admin ALL=(ALL) ALL", "%admin ALL=(ALL:ALL) ALL",
+    "%sudo ALL=(ALL) ALL", "%sudo ALL=(ALL:ALL) ALL",
+    "%wheel ALL=(ALL) ALL", "%wheel ALL=(ALL:ALL) ALL",
+    "%wheel ALL=(ALL) NOPASSWD: ALL",
+))
+
+
+def _somebody_decided(kind, grant, cases):
+    """Is this grant a decision, or is it what the distribution shipped?
+
+    The same question CROSS_HASHES asks of a shared file. Two Ubuntu hosts
+    have byte-identical /etc/sudoers and the same system accounts in adm, and
+    reporting that as shared privilege buries the one rule somebody wrote.
+    """
+    if kind == "sudoers":
+        return grant not in STOCK_SUDO_RULES
+    member = grant.split(":", 1)[-1].strip()
+    if not member or member in SYSTEM_NAMES:
+        return False
+    for c in cases:
+        info = c.accounts.get(member)
+        if info is None:
+            continue
+        try:
+            uid = int(info.get("uid") or -1)
+        except (TypeError, ValueError):
+            return True
+        if uid == 0 or uid > SYSTEM_UID_MAX:
+            return True
+    return False
+
+
 def _interesting_account(name, by_host):
     """Is this account somebody's, or the distribution's?"""
     if name in SYSTEM_NAMES:
@@ -1261,6 +1885,25 @@ def _key_type(body):
     if 0 < n <= len(raw) - 4:
         return raw[4:4 + n].decode("ascii", "replace")
     return ""
+
+
+def _seconds_between(first, last):
+    """Seconds from one normalised stamp to another, or None if either is not one."""
+    try:
+        fmt = "%Y-%m-%d %H:%M:%S"
+        return int((datetime.strptime(last[:19], fmt)
+                    - datetime.strptime(first[:19], fmt)).total_seconds())
+    except (ValueError, TypeError):
+        return None
+
+
+def _shared_digests(cases):
+    """(digest, [the cases holding it]) for every digest on more than one."""
+    holders = defaultdict(list)
+    for c in cases:
+        for digest in c.hashes:
+            holders[digest].append(c)
+    return [(d, hs) for d, hs in holders.items() if len(hs) > 1]
 
 
 def _gap(first, last):
