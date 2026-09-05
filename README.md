@@ -158,6 +158,128 @@ One file, no server, no network: the payload is embedded and the CSS and JS are 
 
 `--html-rows N` caps how many rows of each table the page carries (default 2000); the CSV and JSON exports always hold everything.
 
+## Several collections at once
+
+Pass more than one and they are read one after another into **one** export,
+every row carrying a `collection` column saying which input it came from:
+
+```bash
+python linsight.py uac1.tar disk2.dd disk3.E01 --export ./case
+python linsight.py uac1.tar disk2.dd disk3.E01 --serve
+```
+
+`./case` is a normal export — one `csv/`, one `json/`, one `browser.html` —
+holding all three hosts. Nothing is chosen for you: with no filter you see
+every host's activity at once, which is the question three disks usually
+arrive with. Narrowing to one is a dropdown in the console header, a column
+filter in a spreadsheet, or `WHERE collection = 'disk2'` in the SQLite
+database `--db` writes.
+
+The console's **collection** picker sits beside the severity chips and reaches
+as far as the time window does: every grid, both charts, the severity counts
+and the ATT&CK matrix. A table with no per-collection rows — `CROSS_IOCS` is
+about several collections by construction — says so on its face rather than
+emptying itself.
+
+The column is called `collection`, not `host`, for a reason worth knowing:
+`AUTH_LOG` and `JOURNAL` already have a `host` column holding the hostname
+syslog wrote on the line. Merging into that would have replaced it with the
+label — three auth logs all claiming to be one host, which is data rather than
+an error and would have been believed. `collection` is free across all 361
+column names the extractors declare, and it is the truer word anyway: an
+image is not always one host, and never the host's own idea of its name.
+
+Mixing input kinds is fine — a UAC tar, a raw image and an E01 in one command
+— and each identifies itself the same way it does on its own. The forcing
+flags repeat too, and now actually mean it: `--disk a.dd --disk b.dd` used to
+read `b.dd` and report on it as though `a.dd` had never been named.
+
+### Keeping them apart
+
+```bash
+python linsight.py uac1.tar disk2.dd disk3.E01 --split ./cases
+```
+
+`--split` writes one directory per input instead — `cases/uac1/`,
+`cases/disk2/`, `cases/disk3/` — named after the input's own file or folder,
+deduplicated if two collide. On its own it writes a full export per input; any
+output flag you name is placed inside each host's directory, so `--html
+report.html` becomes three reports rather than one written three times over
+itself. Use it when the hosts are separate cases; use the default when they
+are one.
+
+### What is true of more than one of them
+
+`--correlate` adds the join — the thing no single host's report can state:
+
+```bash
+python linsight.py web01.tar db02.dd app03.dd --export ./case --correlate
+```
+
+| table | |
+|---|---|
+| `CROSS_IOCS` | indicators each run extracted independently, joined on the value — with which host saw it **first**, which saw it last, and the spread between them |
+| `CROSS_HASHES` | files that are byte-identical across hosts, marked `notable` when a copy sits somewhere a package would not put it, and `same_path` when it did not move |
+| `CROSS_KEYS` | one public key trusted by several hosts, joined on the key material rather than the comment after it — whoever holds the private half reaches every host listed |
+| `CROSS_ACCOUNTS` | one username on several hosts, with `consistent` saying whether uid, shell and home agree everywhere. Distribution accounts are excluded; a second uid‑0 account is not |
+| `CROSS_PERSISTENCE` | a cron command, a systemd `ExecStart` or an `ld.so.preload` entry present on several hosts |
+| `CROSS_FINDINGS` | the same check firing on several hosts, grouped by title with its counts masked so `3 executable file(s)` and `7 executable file(s)` are one row |
+| `CROSS_TECHNIQUES` | which hosts raised which ATT&CK technique, and — the column worth reading — `missing_from` |
+| `HOSTS` | one row per input: label, hostname, distribution, offset, collection time, findings by severity |
+
+They also get a tab of their own. **Correlation** sits between Timeline and
+Graph in the console, opens with a card per collection and the top of each
+table above, and is the one view the collection picker deliberately does not
+touch — every row in it is a statement about several collections at once, so
+narrowing to one would filter out the answer. It says so rather than quietly
+showing less.
+
+```
+[HIGH] 3 indicator(s) appear on more than one host
+      | 203.0.113.9   ipv4   3 host(s): app03, db02, web01  [web01 -> app03, 1h]
+[MEDIUM] 1 indicator(s) reached one host before another
+      | 203.0.113.9   web01 03:00:00  ->  app03 04:00:00  (1h)
+```
+
+Two things it refuses to do quietly. A shared hash is only a finding when a
+copy of it sits outside the packaged tree — two machines built from one image
+share every byte of `/usr/bin`, and an unscoped hash join returns the
+operating system and buries the four files that matter. And every ordering
+rests on each run's resolved UTC offset, so a host that never recorded one
+becomes a `MEDIUM` finding of its own: if that host was not on UTC, every
+"four minutes after" in the correlation is wrong by that offset, and wrong in
+one direction.
+
+### Seeing it rather than reading it
+
+**Relationships** draws the same thing. In a merged export each collection
+becomes a circle of its own, and anything observed in more than one of them is
+joined to each — so the picture is two or three hubs with the addresses,
+accounts and files that bridge them strung between, and everything private to
+one host hanging off its own side. Only the shared entities get those edges;
+linking every node to its collection would double the drawing and say nothing.
+
+The legend is now the filter. Clicking a kind — address, account, file,
+command, tool, rule — drops it from the picture, and alt-clicking isolates
+one. Twelve command circles crowding out the two addresses the question was
+about used to be answerable only by turning the circle count down, which drops
+the *smallest* nodes rather than the kind you did not want. **collections**
+toggles the hubs off when they are in the way, and **reset** puts everything
+back.
+
+The caption under the toolbar says what the picture was drawn from — `drawn
+from 949 row(s) in 6 table(s) across all 2 collections`, or `474 row(s) in 6
+table(s) of collection xfs`. Two hosts built from one image legitimately
+produce a near-identical shape, and without that line a filter that had been
+applied looked like a filter that had been ignored.
+
+Under `--split` the same tables go to `cases/_correlation/` with a console of
+their own instead.
+
+The cost of merging is that the whole set is held at once rather than one
+collection at a time. `--low-memory` spills it to disk, which is what that
+flag is for.
+
 ## Disks
 
 Point it at a disk image and everything above runs unchanged:
@@ -296,6 +418,23 @@ directory, and `cryptsetup luksFormat` writes a header to a plain file.
 `mklvm.py` is pure Python and runs anywhere. Whatever is missing is skipped by
 name, so a partial fixture set still tests what it has.
 
+Three suites need no fixture at all, so they run everywhere and always — a
+test that skips is a test that was not run:
+
+```bash
+python tests/test_ask.py                     # the model-facing surface, over a
+                                             # SQLite case the suite writes
+python tests/test_timestomp.py               # the timestamp rules, over eleven
+                                             # bodyfile lines it writes
+python tests/test_correlate.py               # the cross-host join and the
+                                             # merge, over three synthetic runs
+```
+
+Half of `test_timestomp.py` asserts what must *not* fire — a packaged binary
+whose mtime is a year older than its crtime, a relatime file whose atime equals
+its mtime, a directory. Those are the shapes a timestomp rule is most likely to
+be wrong about, and they are worth more than the hits.
+
 Every container is checked byte-for-byte against the raw image it was made from,
 which is the only way to prove a container reader is right rather than merely
 self-consistent. Every filesystem reader has to return the same planted tree,
@@ -417,6 +556,62 @@ and a `time_source` saying what they mean, because that differs:
 | `bodyfile` | the host's own mtime, from the bodyfile the collector produced |
 | `archive` | the mtime preserved into the tar or zip — the host's, when it was collected with the flags to keep it |
 | `collected file` | the extracted copy's own mtime, and the weakest of the five |
+
+### Timestamps that disagree with each other
+
+Three of a file's four timestamps can be written from userspace: `utimensat`
+sets atime and mtime to whatever a caller asks for, and crtime is only ever as
+good as the filesystem that recorded it. **ctime cannot be.** The kernel stamps
+it on every inode change and exposes no interface to set it, and that asymmetry
+is the whole basis of `TIMESTOMP`: a forged timestamp is not a value that looks
+wrong on its own, it is a set of values that cannot all be true at once.
+
+Five rules, scored on the bodyfile pass that was already being made:
+
+| rule | | what it means |
+|---|---|---|
+| `mtime_ahead` | HIGH | mtime is later than its own ctime. The kernel sets ctime every time it sets mtime, so this only happens when mtime was written directly — `touch -d`, `utimensat`, a stomper — to a moment after the write it claims to describe. |
+| `pre_creation` | HIGH | ctime precedes crtime: the inode changed before it existed. One of the two was written from outside the filesystem's own bookkeeping — `debugfs`, a raw image edit, or a stomper that set crtime and forgot ctime. |
+| `new_file_old_mtime` | MEDIUM | created inside the incident window, mtime from six months or more before it. The content date can be forged; the moment the inode was allocated is much harder to. |
+| `minute_aligned` | MEDIUM | atime and mtime identical and exactly on a minute boundary, ctime not. That is the shape `touch -t YYYYMMDDhhmm` leaves — it carries no seconds, and it cannot touch ctime. A genuine write lands on an arbitrary second. |
+| `stamp_missing` | MEDIUM | the inode carries times, but mtime or ctime is zero. A live filesystem does not leave those unset on a regular file; a wiper that could not produce a convincing date and settled for none does. |
+
+```
+[HIGH] Content timestamp later than the last metadata change: 1 file(s)
+    The kernel sets ctime every time it sets mtime, so on a filesystem
+    nobody has edited ctime is never earlier than mtime. [...]
+      | /usr/sbin/sshd    mtime is 5h ahead of ctime (m=2026-03-24 04:01:11 c=2026-03-23 23:00:02)
+```
+
+**Two halves, and they are not equally strong.** Forward-dating breaks an
+invariant — the same pair the AD1 reader leans on to identify its unlabelled
+timestamp attributes, `ctime >= mtime` and `crtime <= ctime` — so it is provable
+from the inode alone and needs no window, no baseline and no corroboration.
+Backdating breaks nothing: *mtime much older than ctime* is equally what every
+`dpkg` install, `cp -p`, `tar -p` and `rsync -t` leaves behind, and on a Linux
+host those outnumber real timestomps by orders of magnitude. So the backdating
+rules are scoped to the incident window, demoted to `INFO` when they fire on
+more than 200 files — at that volume the cause is a clock step or a package run,
+not a person — and worded as leads rather than as conclusions.
+
+The rules are independent statements about one inode rather than a classifier,
+so a file that fails two is reported under both.
+
+Each hit lands in three places: a finding per rule, a row in `TIMESTOMP` with
+all four clocks and the rule that objected, and — for the two provable rules —
+an event on the timeline. That event sits at **ctime**, not at mtime: dating a
+stomped file by its own content stamp would file it exactly where the intruder
+asked for it to be filed. `TIMESTOMP` repeats ctime in `timestamp_utc` for the
+same reason, so the console's time window and activity chart answer for the
+moment the metadata actually changed.
+
+Four of the five need no collection time at all — they compare a file against
+itself. On a collection where nothing recorded the host's clock, and the rest of
+the bodyfile analysis therefore has no window to work in, these still answer.
+
+Row counts on the findings are exact; the rows kept per rule are capped at
+5,000, because a host whose clock stepped backwards fails a rule on every file
+it has and the number is the interesting part of that answer.
 
 ## Which time zone
 
@@ -603,17 +798,28 @@ does on a live host and nothing does for a disk image, where there is no `last`
 output and the `wtmp` file is all there is.
 
 ```
-user     terminal  source_host        start                duration   state
-shaher   tty2      tty2               2025-07-23 20:38:29  75d 14:41  ended at reboot
-root     pts/0     192.168.210.131    2019-10-05 11:20:59  00:12      closed
+user     terminal  source_host        start                duration   result   state
+shaher   tty2      tty2               2025-07-23 20:38:29  75d 14:41  success  ended at reboot
+root     pts/0     192.168.210.131    2019-10-05 11:20:59  00:12      success  closed
+UNKNOWN  pts/18    m4shl3             2026-06-11 06:45:11  0s         failure  closed
 ```
 
 A root session held open for three days across the window is a different fact
 from a root login that lasted forty seconds, and that difference is the reason
 the login records are usually being read.
 
+`result` is whether the login was granted, and it is a column because one of
+the sources feeding this table is not a session at all. UAC runs `lastb`
+beside `last`, and `lastb` prints the attempts that were **refused** in the
+same columns `last` prints the ones that were accepted. On a collection to
+hand that is 9,253 refusals against 1,946 sign-ins — four rows in five — so the
+newest row in the login history is not the last time anyone got in. The last
+sign-in is `WHERE result = 'success'`; the refusals are also in
+`FAILED_LOGINS`, with everything else that was turned away.
+
 `state` says how the session ended, because "no logout record" and "still open"
-otherwise both look like a blank end time:
+otherwise both look like a blank end time. It is not an outcome: a session that
+closed and a login that was refused are not the same fact.
 
 | state | |
 |---|---|
@@ -621,6 +827,13 @@ otherwise both look like a blank end time:
 | `ended at reboot` / `ended at shutdown` | still open when the machine went down — no logout was ever written, and that moment is the honest end |
 | `no logout record` | a second login took the terminal first |
 | `still open at the end of this wtmp` | never closed within this file |
+| `open when the collector ran` | `who` — signed in at the moment of collection |
+
+Every `start` is UTC. `last` prints a row three ways and the collector runs all
+three: `-F` dates it in full, while the plain and `-i` forms print
+`Thu Jun 11 11:15` — no year, no seconds — and put the origin in a different
+column. Those are read against the collection year, the way every other
+year-less line in the case is, and carry the minute that was printed.
 
 `duration_seconds` is the same number unformatted, so the table sorts by it. On
 the collection this was built against, `LOGINS` did not exist at all before —
@@ -702,6 +915,136 @@ A rule the engine cannot represent faithfully is **rejected** and listed in `RUL
 ### Built-in keyword sweep
 
 An offensive-tooling keyword sweep runs by default. `--keywords file` adds case-specific terms; `--no-hunt` skips it entirely (it reads the normalised tables, so it costs the table build even when you asked for no export — roughly 12–65s on a mid-size collection).
+
+## Asking a model
+
+A finished case is a SQLite database of normalised tables — 75 of them, and on
+a real collection three and a half million rows. That is more than an examiner
+reads and far more than a model can be handed. So it is not handed: the model
+gets the schema and a read-only `SELECT`, and has to go and look.
+
+**Nothing leaves the machine.** The page talks to the local server because its
+own CSP forbids it from talking to anything else, and the server talks to a
+model on loopback. The case is evidence, and the first rule of evidence is that
+you know where it went.
+
+Three ways in, one engine behind all of them:
+
+| | |
+|---|---|
+| `--ask "question"` | one question, answered on the command line, with the queries it ran printed under the answer |
+| the **Ask** panel | the same thing in the console, as a conversation, with the playbooks as buttons |
+| `--mcp` | an MCP server on stdio, so Claude Code or Claude Desktop works the case directly |
+
+```sh
+ollama pull qwen2.5-coder:7b          # anything with tool calling
+python linsight.py --serve export/     # the panel is a tab in the console
+python linsight.py --db export/case.db --ask "which addresses both failed SSH and got a 2xx?"
+```
+
+`--llm-url` points at something other than Ollama — LM Studio, llama.cpp, vLLM,
+anything OpenAI-compatible. Ollama gets its own endpoint rather than the
+compatible one for a single reason: `num_ctx`. The model advertises 131,072
+tokens and Ollama gives it the server default unless asked, so the schema falls
+out of the window part way through and the model starts inventing table names.
+
+### The tools
+
+The model never receives the case. It receives these, and has to ask:
+
+| tool | what it is for |
+|---|---|
+| `case_tables` | every table, its row count and its columns — the map |
+| `case_query` | one read-only `SELECT`. The real tool; the rest are shortcuts |
+| `case_findings` | what the triage already raised, most severe first |
+| `case_timeline` | every dated row between two times, across every table that carries a clock |
+| `case_search` | one term across every column of every table |
+| `case_values` | what a column actually contains, most common first |
+| `case_row` | the full row behind a finding's shortened quote |
+| `case_skill` | an investigative playbook — see below |
+
+**Read-only is enforced twice**, because one is not enough: the connection is
+opened `mode=ro` so the file cannot be written through it whatever arrives, and
+the statement itself has to be a single `SELECT` or `WITH`. A model writing to
+an evidence database is not a risk worth carrying for the convenience of not
+checking.
+
+**Queries are bounded by a clock.** A model writing SQL against forty tables
+eventually writes a join with no `ON` clause, and against three and a half
+million rows that is not a slow query, it is a server that has stopped
+answering. One statement gets 30 seconds and the whole-case sweep gets 60,
+after which the model is told what happened and how to narrow it — and a sweep
+that ran out says *which tables it did not reach*, because an incomplete search
+reported as a complete one is how a present indicator becomes an absent one.
+
+### Playbooks
+
+A 7B model with a schema and a `SELECT` can answer a question. It cannot decide
+which question to ask next, and that is most of the job. Asked "what happened to
+this host" it queries `FINDINGS`, reads the top row back in different words, and
+stops — which is a summary, and the one thing this is not for.
+
+So the method is written down. Each playbook is a sequence an examiner actually
+follows, with the tables named, the joins written out, and the trap that
+sequence falls into called out where it falls.
+
+```
+$ python linsight.py --skill
+  triage_host            Start here. The findings, then the rows underneath them.
+  profile_address        One IP, across every table that records an address.
+  profile_user           One account: how it signed in, what it ran, what it can do.
+  intrusion_window       What every artifact was recording around a given time.
+  persistence            Every mechanism that would run this again tomorrow.
+  web_intrusion          Request, response, and what ran on the host afterwards.
+  privilege_escalation   Sudo, SUID, group changes, and accounts that should not exist.
+  egress                 Outbound connections, listeners, and the transfers in history.
+  challenge              Take a claim and attack it. Report what survives.
+  collection_quality     The holes: what the collector missed, and what that costs.
+
+$ python linsight.py --db export/case.db --skill profile_address \
+      --skill-arg address=209.141.62.185
+```
+
+They are buttons in the Ask panel, `case_skill` to the local model, and MCP
+`prompts` to a client that speaks the protocol — one definition, three surfaces,
+so they cannot drift apart.
+
+**Every playbook is rendered against the case in front of it.** One that names
+`CRON` and `SYSTEMD_TIMERS` on a host where the collector caught neither says so
+in the text, and separates *present but empty* from *never collected* — because
+an empty table is not a clean host, and a model that reports the emptiness as a
+finding has told the examiner something false.
+
+`challenge` is the one to reach for last. It takes a conclusion and tries to
+break it, in the order conclusions actually fail: wrong column, wrong
+vocabulary, wrong operator, missing artifact, earlier evidence, benign
+explanation. It reports `STANDS`, `WRONG` or `UNSUPPORTED` and nothing softer.
+
+### What it costs, and what it is worth
+
+A 7B on CPU takes a minute or two per question, which is why `keep_alive` is set
+— without it the model is unloaded between questions and every question pays to
+read 4.9 GB back off disk.
+
+**Every answer shows the queries behind it.** A model that says "the host was
+compromised on the 8th" is worth exactly as much as the queries behind it, and
+the panel and the command line both print them. Check them. The whole design —
+schema not summary, `SELECT` not paste, steps not prose — exists so that
+checking is possible.
+
+### MCP
+
+```sh
+python linsight.py --mcp export/case.db
+```
+
+JSON-RPC 2.0 over stdio. It serves `tools`, `prompts` (the playbooks) and
+`resources` (`case://schema`, `case://findings`, `case://guide`). In Claude
+Code:
+
+```sh
+claude mcp add linsight -- python /path/to/linsight.py --mcp /path/to/case.db
+```
 
 ## Design notes
 
