@@ -1,0 +1,66 @@
+title: System account created with an interactive shell and sudo membership
+id: 4459061a-59a1-4860-a97f-462e166fbb0d
+status: experimental
+description: |
+  A useradd that asks for all three of --system, an interactive shell, and
+  membership of an administrative group in one command. Each is defensible
+  alone; together they are a backdoor account wearing a service account's
+  name.
+  --system exists so the account sorts below the login uid threshold and stays
+  out of the lists an operator reads. A real service account gets
+  /usr/sbin/nologin and no group beyond its own, because nothing is ever meant
+  to log in as it. On the host this was written against the command was
+  'useradd -d /usr/php -m --system --shell /bin/bash --skel /etc/skel -G sudo
+  php', run from PWD=/tmp two minutes after a brute-forced SSH session opened.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: sudo
+detection:
+  useradd:
+    command|contains:
+      - 'useradd'
+      - 'adduser'
+  system_account:
+    command|contains:
+      - '--system'
+      - ' -r '
+  interactive_shell:
+    command|contains:
+      - '/bin/bash'
+      - '/bin/sh'
+      - '/bin/zsh'
+      - '/bin/dash'
+      - '/bin/ksh'
+  admin_group:
+    command|contains:
+      - '-G sudo'
+      - '-G wheel'
+      - '-G admin'
+      - '-G root'
+      - '-G adm'
+      - '-G docker'
+      - '-G lxd'
+      - '-G disk'
+      - '-G shadow'
+      - 'groups=sudo'
+      - 'groups=wheel'
+  condition: useradd and system_account and interactive_shell and admin_group
+fields:
+  - timestamp_utc
+  - actor
+  - target_user
+  - command
+  - working_dir
+  - source_ip
+falsepositives:
+  - Vendor installers that create a privileged service account with a shell so
+    an operator can 'su -' to it. Those run from a package postinst, not from
+    an interactive tty in /tmp - read working_dir and tty.
+level: critical
+tags:
+  - attack.persistence
+  - attack.t1136.001
+  - attack.privilege_escalation
+  - attack.t1078.003

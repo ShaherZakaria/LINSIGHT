@@ -23,9 +23,12 @@ detection:
       - '.%2e/'
       - '%2e%2e/'
       - '.%%32%65/'
+      - '%%32%65%%32%65'
+      - '.%%32e/'
       - '%252e%252e'
       - '..%2f'
       - '.%2e%2f'
+      - '%2e%2e%2f'
   interpreter:
     resource|contains:
       - '/bin/sh'

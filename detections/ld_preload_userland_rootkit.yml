@@ -30,6 +30,11 @@ fields:
 falsepositives:
   - Some vendor agents and profilers legitimately set LD_PRELOAD. A write to
     /etc/ld.so.preload itself is far more rarely legitimate.
+  - This rule cannot tell installation from removal - 'chattr -i
+    /etc/ld.so.preload' and 'rm -f /etc/ld.so.preload' name the same path as
+    the write that put it there, and that is what fires on the host these were
+    written against, where a rival dropper was tearing the file out. Both
+    directions are worth reading; neither can be inferred from the path alone.
 level: critical
 tags:
   - attack.persistence

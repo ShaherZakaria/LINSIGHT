@@ -1,0 +1,56 @@
+title: PHP-CGI argument injection (CVE-2012-1823, CVE-2024-4577)
+id: afd87c2c-ef97-4e6e-b81f-538599143011
+status: experimental
+description: |
+  A query string that is not parameters but php-cgi's own command-line
+  switches. Where a request reaches the PHP CGI binary with the query passed
+  through as argv, '-d allow_url_include=on -d auto_prepend_file=php://input'
+  turns the request body into the script that runs.
+  Almost always URL-encoded, because the raw form is stripped: '%2D%64' is
+  '-d', and the whole switch list arrives as '%61%6C%6C%6F%77%5F%75%72%6C...'.
+  CVE-2024-4577 is the same primitive reached through a soft hyphen, '%ADd',
+  which Windows code pages fold back to '-d'; it is here because the marker
+  costs nothing and the class did not go away in 2012.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2012-1823
+  - https://nvd.nist.gov/vuln/detail/CVE-2024-4577
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  switches:
+    resource|contains:
+      - '%2D%64'
+      - '%2d%64'
+      - '\?-d+'
+      - '%ADd'
+      - '%add+'
+      - 'allow_url_include'
+      - '%61%6C%6C%6F%77%5F%75%72%6C%5F%69%6E%63%6C%75%64%65'
+      - 'auto_prepend_file'
+      - '%61%75%74%6F%5F%70%72%65%70%65%6E%64'
+      - 'suhosin.simulation'
+      - '%73%75%68%6F%73%69%6E'
+  switches_body:
+    message|contains:
+      - 'allow_url_include'
+      - 'auto_prepend_file'
+      - '%2D%64+%61%6C%6C%6F%77'
+  condition: 1 of switches*
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - user_agent
+falsepositives:
+  - None seen. 'allow_url_include' is a php.ini directive and has no reason to
+    appear in a URL; the encoded forms have none at all.
+level: high
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - attack.execution
+  - attack.t1059.004

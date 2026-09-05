@@ -1,0 +1,49 @@
+title: Proxyjacking worker reading its address list from a hidden .api directory
+id: f0f06231-1fe0-4ec3-844b-20033e913639
+status: experimental
+description: |
+  The local half of the residential-proxy implant: a loop that creates a
+  dot-hidden '.api' directory under its working directory, keeps the addresses
+  it has enumerated in '.api/ips.txt', and greps that file once per address
+  per pass before binding each one and registering it upstream.
+  proxyjacking_registration_beacon catches the outbound enrolment. This
+  catches the worker between beacons, which is what is still running when the
+  registration traffic has stopped - on the host these were written against it
+  is the single highest-count command on the box: nine thousand executions of
+  'grep <addr> .api/ips.txt', and an awk splitting the same CSV five fields at
+  a time.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  list_file:
+    cmdline|contains:
+      - '.api/ips.txt'
+  list_file_raw:
+    message|contains:
+      - '.api/ips.txt'
+  make_dir:
+    cmdline:
+      - 'mkdir -p .api'
+      - 'mkdir .api'
+  make_dir_raw:
+    message|contains:
+      - 'a0="mkdir" a1="-p" a2=".api"'
+  condition: 1 of list_file* or 1 of make_dir*
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+falsepositives:
+  - An application that genuinely keeps a file called ips.txt under a
+    directory named .api. None was found on the hosts this was written
+    against, and the name is not one any packaged software uses.
+level: high
+tags:
+  - attack.impact
+  - attack.t1496
+  - attack.discovery
+  - attack.t1046

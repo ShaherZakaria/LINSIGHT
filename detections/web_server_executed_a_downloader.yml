@@ -1,0 +1,68 @@
+title: A downloader ran under the web server and wrote to its error log
+id: 19adfa43-bfba-4edb-873d-3e212e2e531c
+status: experimental
+description: |
+  Not a request naming a downloader - the downloader's own output, arriving
+  in the error log because it ran. Apache tags stderr from a CGI process
+  AH01215 and appends the interpreter that produced it, so a line reading
+  'AH01215: curl: (23) Failed writing body (0 != 14024): /bin/sh' is curl
+  reporting on itself from inside a shell that mod_cgi spawned. The request
+  that caused it may be long gone from the access log, or have been a POST
+  body that was never logged at all; this line is the execution itself.
+  The curl exit code is worth reading. (23) is a write failure, which means
+  the transfer was working and the far end had already sent the body - so the
+  fetch reached the payload. (6) or (7) is a name or connect failure, which
+  means the same command ran and the infrastructure was already down.
+  AH01215 on its own is far too common to report: on the host this was written
+  against there were 150,171 of them, almost all a single character of a
+  script's stderr split across a line each. 334 name a downloader, and those
+  are the ones this rule keeps.
+references:
+  - https://httpd.apache.org/docs/2.4/mod/mod_cgi.html
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  cgi_stderr:
+    message|contains:
+      - 'AH01215'
+      - 'AH01214'
+      - 'exec of'
+      - 'End of script output'
+  # The downloader talking about itself, not being called: 'curl:' and
+  # 'wget:' are how each writes its own diagnostics, and '$WGET' is a
+  # dropper's variable surviving into the shell's job-control message.
+  downloader:
+    message|contains:
+      - 'curl:'
+      - 'wget:'
+      - 'curl ('
+      - 'wget ('
+      - '$wget'
+      - '$curl'
+      - 'tftp:'
+      - 'Failed writing body'
+      - 'Could not resolve host'
+  condition: cgi_stderr and downloader
+fields:
+  - client_ip
+  - resource
+  - module
+  - message
+falsepositives:
+  - >-
+    A CGI application that legitimately shells out to curl and logs a failure,
+    a payment callback, a health check, an image fetcher. Read client_ip and
+    the surrounding requests. A real one fails the same way from the server's
+    own scheduled work, not moments after a request from an address that has
+    never been seen before.
+level: critical
+tags:
+  - attack.execution
+  - attack.t1059.004
+  - attack.command_and_control
+  - attack.t1105
+  - attack.initial_access
+  - attack.t1190

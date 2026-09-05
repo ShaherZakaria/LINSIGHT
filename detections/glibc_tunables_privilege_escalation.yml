@@ -1,0 +1,57 @@
+title: Looney Tunables - GLIBC_TUNABLES buffer overflow (CVE-2023-4911)
+id: 3c7d14cc-f92e-42fd-bdbf-71ee1de7b190
+status: experimental
+description: |
+  A buffer overflow in the dynamic loader's handling of GLIBC_TUNABLES, which
+  ld.so processes before it drops privileges. Setting the variable in the
+  environment of any setuid binary - /usr/bin/su is the usual choice - gives
+  a root shell on a default install of Fedora, Ubuntu and Debian.
+  The exploit form is distinctive: the tunable is repeated, or contains an
+  '=' inside its own value, so the parser walks off the end. A normal use of
+  GLIBC_TUNABLES sets one tunable once.
+  It is worth watching for the variable at all. Almost nothing sets it in
+  production, and the crimeware families that pick up public LPEs adopted this
+  one quickly because it needs no compiler on the target.
+  Not derived from evidence on the hosts in this repository - written from the
+  Qualys advisory.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-4911
+  - https://www.qualys.com/2023/10/03/cve-2023-4911/looney-tunables-local-privilege-escalation-glibc-ld-so.txt
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  tunables:
+    cmdline|contains:
+      - 'GLIBC_TUNABLES='
+  tunables_raw:
+    message|contains:
+      - 'GLIBC_TUNABLES='
+      - 'glibc.malloc.mxfast=glibc.malloc.mxfast'
+      - 'glibc.malloc.perturb=glibc.malloc.perturb'
+  exploit_name:
+    cmdline|contains:
+      - 'looney'
+      - 'cve-2023-4911'
+      - 'CVE-2023-4911'
+  exploit_name_raw:
+    message|contains:
+      - 'cve-2023-4911'
+  condition: 1 of tunables* or 1 of exploit_name*
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+  - message
+falsepositives:
+  - Performance engineers and some database and JVM tuning guides do set
+    GLIBC_TUNABLES deliberately. A legitimate value sets one tunable; the
+    exploit repeats one or embeds an '=' in the value, so read the string
+    rather than the variable name.
+level: high
+tags:
+  - attack.privilege_escalation
+  - attack.t1068

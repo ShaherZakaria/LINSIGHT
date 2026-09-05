@@ -1,0 +1,41 @@
+title: sshd configured to permit root login
+id: 9e8511fe-e172-4f72-bb7b-38646a2c519f
+status: experimental
+description: |
+  PermitRootLogin left on, or empty passwords allowed. With root reachable
+  over SSH, every failed-password entry in auth.log is one guess against the
+  account that ends the investigation, and a successful one leaves no
+  privilege-escalation step to find later.
+  This is configuration rather than an event, which is exactly why it belongs
+  in a rule that reads the disk. On VulnOSv2 the line is 'PermitRootLogin yes'
+  in /etc/ssh/sshd_config, on a host that took 2,198 failed authentication
+  attempts from a single address in forty minutes.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: ssh_config
+detection:
+  root_login:
+    detail|contains:
+      - 'PermitRootLogin yes'
+      - 'PermitRootLogin without-password'
+      - 'PermitRootLogin prohibit-password'
+      - 'PermitEmptyPasswords yes'
+      - 'PermitUserEnvironment yes'
+  condition: root_login
+fields:
+  - type
+  - path
+  - detail
+falsepositives:
+  - PermitRootLogin without-password and prohibit-password are the cloud
+    default and mean key-only root access, which is a deliberate design on
+    most managed images rather than a mistake. They are reported at the same
+    level because the distinction between them and 'yes' is one word in one
+    file, and that word is worth confirming rather than assuming.
+level: medium
+tags:
+  - attack.persistence
+  - attack.t1078.003
+  - attack.initial_access

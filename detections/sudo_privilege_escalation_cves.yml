@@ -1,0 +1,94 @@
+title: Exploitation of a named sudo privilege-escalation flaw
+id: 1e69bb5f-b52f-4315-abad-4404795d939f
+status: experimental
+description: |
+  The command-line shapes of the sudo bugs that turn an unprivileged account
+  into root. Each is a legal-looking invocation that the vulnerable version
+  mishandles, so the argument list is the detection.
+    - CVE-2021-3156 "Baron Samedit" - heap overflow reached by running sudo in
+      shell mode with a trailing backslash: 'sudoedit -s' followed by an
+      argument ending in a lone backslash. A failed attempt leaves a
+      'malloc(): invalid size' or 'free(): invalid pointer' line from sudo.
+    - CVE-2023-22809 - sudoedit honouring extra '--' separators in EDITOR or
+      SUDO_EDITOR, letting the user append a file it was never granted.
+    - CVE-2025-32463 - sudo's '--chroot' / '-R' loading nsswitch.conf from a
+      user-controlled root, which runs attacker code as root; the option has
+      no ordinary administrative use.
+    - CVE-2025-32462 - a sudoers rule scoped to another host honoured locally
+      via '-h'.
+  Not derived from evidence on the hosts in this repository - written from the
+  published advisories.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-3156
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-22809
+  - https://nvd.nist.gov/vuln/detail/CVE-2025-32463
+  - https://nvd.nist.gov/vuln/detail/CVE-2025-32462
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  baron_samedit:
+    cmdline|contains:
+      - 'sudoedit -s '
+      - 'sudoedit -s\'
+      - 'sudo -s '
+  baron_samedit_raw:
+    message|contains:
+      - 'a0="sudoedit" a1="-s"'
+      - 'a0="sudo" a1="-s" a2="\'
+  sudo_crash:
+    message|contains:
+      - 'sudo: malloc(): invalid size'
+      - 'sudo: free(): invalid pointer'
+      - 'sudo: double free or corruption'
+      - 'sudoedit: malloc()'
+  chroot_option:
+    cmdline|contains:
+      - 'sudo -R '
+      - 'sudo --chroot'
+      - 'sudoedit -R '
+      - 'sudoedit --chroot'
+  chroot_option_raw:
+    message|contains:
+      - 'a0="sudo" a1="-R"'
+      - 'a0="sudo" a1="--chroot"'
+  remote_host_option:
+    cmdline|contains:
+      - 'sudo -h '
+      - 'sudo --host='
+  editor_separator:
+    cmdline|contains:
+      - 'SUDO_EDITOR='
+      - 'VISUAL='
+  editor_separator_extra:
+    cmdline|contains:
+      - ' -- '
+      - 'sudoedit'
+  exploit_name:
+    cmdline|contains:
+      - 'cve-2021-3156'
+      - 'CVE-2021-3156'
+      - 'baron_samedit'
+      - 'cve-2025-32463'
+      - 'CVE-2025-32463'
+  condition: 1 of baron_samedit* or sudo_crash or 1 of chroot_option* or remote_host_option or (editor_separator and editor_separator_extra) or exploit_name
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+  - message
+falsepositives:
+  - A bare sudo -s is an ordinary way to get a root shell and will fire on
+    many hosts; it is included only in the Baron Samedit selection, where the
+    audit form also requires the trailing backslash argument. Expect the
+    cmdline half of that selection to be the noisy one.
+  - Administrators do occasionally use sudo -h to check a remote-host sudoers
+    rule. The chroot options have no such excuse.
+level: high
+tags:
+  - attack.privilege_escalation
+  - attack.t1068
+  - attack.t1548.003

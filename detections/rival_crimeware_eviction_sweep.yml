@@ -1,0 +1,98 @@
+title: Crimeware eviction sweep - a hard-coded kill list of rival implants
+id: 6ed01247-1d0b-41be-a8d6-0b51be2885a7
+status: experimental
+description: |
+  A process killing a fixed list of other people's implants by name, wiping
+  the crontab, and clearing the immutable bit off the persistence paths. This
+  is a dropper making room for itself, not an administrator and not a
+  responder.
+  The names here are the tell. A responder kills 'xmrig' and greps for
+  'kinsing' because those are the names in the reporting; nobody types
+  'java.xnj.stak', 'gmm-est-fmllr' or '980336780515' from memory. A kill list
+  of obscure competitor process names is a list that was compiled by someone
+  who owns the box.
+  Deliberately does not match 'xmrig', 'kinsing' or 'kdevtmpfsi' on their own -
+  see commodity_linux_crimeware_names for that name space, and its own
+  falsepositives for why matching a famous name catches the cleanup rather
+  than the infection.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  rivals:
+    cmdline|contains:
+      - 'pkill -9 java.xnj.'
+      - 'pkill -9 java.xnk.'
+      - 'pkill -9 java8.aak.'
+      - 'pkill -9 meminitsrv'
+      - 'pkill -9 log_rotari2'
+      - 'pkill -9 suppoieup'
+      - 'pkill -9 solr.sh'
+      - 'pkill -9 redis.sh'
+      - 'pkill -9 solrd'
+      - 'pkill -9 dbused'
+      - 'pkill -9 kthreaddk'
+      - 'pkill -9 gmm-est-fmllr'
+      - 'pkill -9 bashirc'
+      - 'pkill -9 GEnHc'
+      - 'pkill -9 .GTK-unix'
+      - 'pkill -9 wget'
+      - 'pkill -9 curl'
+      - 'killall -9 java.xnj.'
+      - 'killall -9 meminitsrv'
+      - 'killall -9 kthreaddk'
+  rivals_raw:
+    message|contains:
+      - 'a0="pkill" a1="-9" a2="java.xn'
+      - 'a0="pkill" a1="-9" a2="java8.aak.'
+      - 'a0="pkill" a1="-9" a2="meminitsrv"'
+      - 'a0="pkill" a1="-9" a2="log_rotari2"'
+      - 'a0="pkill" a1="-9" a2="suppoieup"'
+      - 'a0="pkill" a1="-9" a2="solr.sh"'
+      - 'a0="pkill" a1="-9" a2="redis.sh"'
+      - 'a0="pkill" a1="-9" a2="solrd"'
+      - 'a0="pkill" a1="-9" a2="dbused"'
+      - 'a0="pkill" a1="-9" a2="kthreaddk"'
+      - 'a0="pkill" a1="-9" a2="gmm-est-fmllr"'
+      - 'a0="pkill" a1="-9" a2="bashirc"'
+      - 'a0="pkill" a1="-9" a2="GEnHc"'
+      - 'a0="pkill" a1="-9" a2="wget"'
+      - 'a0="pkill" a1="-9" a2="curl"'
+  crontab_wiped:
+    cmdline:
+      - 'crontab -r'
+  crontab_wiped_raw:
+    message|contains:
+      - 'a0="crontab" a1="-r"'
+  unlocked:
+    cmdline|contains:
+      - 'chattr -i /etc/crontab'
+      - 'chattr -R -i /var/spool/cron'
+      - 'chattr -i /var/spool/cron'
+      - 'chattr -i /etc/ld.so.preload'
+      - 'chattr -R -i /etc/cron'
+  unlocked_raw:
+    message|contains:
+      - 'a0="chattr" a1="-i" a2="/etc/crontab"'
+      - 'a0="chattr" a1="-R" a2="-i" a3="/var/spool/cron"'
+      - 'a0="chattr" a1="-i" a2="/etc/ld.so.preload"'
+  condition: 1 of rivals* or 1 of crontab_wiped* or 1 of unlocked*
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+falsepositives:
+  - A responder running 'crontab -r' once, by hand, after the crontab has been
+    captured. The malware form of this runs it every few seconds for as long
+    as the implant is up - read the count and the interval, not the row.
+  - Configuration management that rewrites crontabs by removing and replacing
+    them.
+level: high
+tags:
+  - attack.impact
+  - attack.t1489
+  - attack.defense_evasion
+  - attack.t1562.001

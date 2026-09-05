@@ -1,0 +1,108 @@
+title: Modern Linux crimeware and botnet families executing
+id: 72441b1e-6dd8-49ea-96d4-e2e88e56ab18
+status: experimental
+description: |
+  The families that have taken over from the 2021 generation. Same discipline
+  as commodity_linux_crimeware_names: the name must be the thing being run -
+  argv[0] of an execve, or a live process's comm or exe - never a name
+  appearing anywhere in a command line, because on an investigated host that
+  matches the responder grepping for it.
+    - perfctl - cryptomining and proxyjacking, three years undetected across
+      millions of servers; hides behind a rootkit, goes dormant whenever a
+      user logs in, and deletes its own binary after execution.
+    - Diicot - Romanian-speaking group, OpenSSH brute force, UPX headers with
+      deliberately corrupted checksums.
+    - RedTail - Monero miner turned SSH worm; the 2026 variant carries an
+      embedded credential dictionary, parses known_hosts to spread, and
+      installs a PAM backdoor that accepts one hard-coded password for any
+      account.
+    - Hadooken - drops Tsunami and a miner onto Oracle WebLogic servers.
+    - Sysrv - Go miner-and-worm in a single binary, self-spreading.
+    - XorDDoS - long-running DDoS trojan, spreads by SSH brute force.
+    - Muhstik, Migo, Prometei, SSH-Snake, Pumakit, Auto-color - the rest of
+      the current set, including two rootkits and one worm that spreads purely
+      by harvested SSH keys.
+  Not derived from evidence on the hosts in this repository - that host was
+  held by the previous generation. Written from published family analysis.
+references:
+  - https://www.aquasec.com/blog/perfctl-a-stealthy-malware-targeting-millions-of-linux-servers/
+  - https://www.wiz.io/blog/diicot-threat-group-malware-campaign
+  - https://malpedia.caad.fkie.fraunhofer.de/details/elf.redtail
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  running_comm:
+    comm:
+      - 'perfctl'
+      - 'perfcc'
+      - 'httpd_'
+      - 'redtail'
+      - 'hadooken'
+      - 'sysrv'
+      - 'sysrv-hello'
+      - 'xorddos'
+      - 'muhstik'
+      - 'migo'
+      - 'prometei'
+      - 'pumakit'
+      - 'diicot'
+      - 'tsunami'
+      - 'kthreadd_'
+      - 'sshd_'
+  running_exe:
+    exe|contains:
+      - '/perfctl'
+      - '/perfcc'
+      - '/redtail'
+      - '/hadooken'
+      - '/sysrv'
+      - '/xorddos'
+      - '/muhstik'
+      - '/prometei'
+      - '/pumakit'
+      - '/diicot'
+      - '/.diicot'
+      - '/ssh-snake'
+      - '/auto-color'
+  execve_argv0:
+    message|startswith:
+      - 'EXECVE argc=1 a0="/tmp/perfctl'
+      - 'EXECVE argc=1 a0="/tmp/redtail'
+      - 'EXECVE argc=1 a0="/tmp/sysrv'
+      - 'EXECVE argc=1 a0="/tmp/hadooken'
+      - 'EXECVE argc=1 a0="/tmp/.diicot'
+  execve_argv0_any:
+    message|contains:
+      - 'a0="perfctl"'
+      - 'a0="redtail"'
+      - 'a0="sysrv"'
+      - 'a0="hadooken"'
+      - 'a0="xorddos"'
+      - 'a0="muhstik"'
+      - 'a0="prometei"'
+      - 'a0="diicot"'
+      - 'a0="./diicot"'
+      - 'a0="ssh-snake"'
+  condition: 1 of running_* or 1 of execve_argv0*
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - exe
+  - cmdline
+falsepositives:
+  - Several of these families deliberately choose names that collide with real
+    system processes - perfctl is built from 'perf' plus a common suffix, and
+    the trailing-underscore comms here (kthreadd_, sshd_, httpd_) are
+    impersonations rather than real kernel threads. Check the exe path - a real
+    kthreadd has no backing file, and a real sshd is /usr/sbin/sshd.
+  - Tsunami is also the name of a Google vulnerability scanner. Read the path.
+level: high
+tags:
+  - attack.execution
+  - attack.impact
+  - attack.t1496
+  - attack.persistence

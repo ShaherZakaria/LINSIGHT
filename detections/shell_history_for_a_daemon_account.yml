@@ -1,0 +1,73 @@
+title: Shell history file belonging to a daemon account
+id: b36d4a0a-f5ad-4e28-9f95-4461af2c018b
+status: experimental
+description: |
+  A .bash_history or equivalent sitting somewhere that is not a human's home
+  directory. A history file is written by an interactive shell on exit, so its
+  existence under /var/mail, /var/www, /usr/sbin, /nonexistent or a service's
+  data directory means somebody had an interactive shell as that service
+  account and let it close cleanly.
+  It is a small artifact that survives well. The processes are gone, the
+  session records may have been trimmed, and the history file itself may be
+  empty or deleted - but the inode and its timestamps remain in the bodyfile,
+  and the mtime dates the session.
+  On VulnOSv2 the row is /var/mail/.bash_history: /var/mail is the mail
+  account's home, mail was the account brute-forced over SSH, and the file is
+  the record of the shell that ran there.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: file_event
+detection:
+  history_file:
+    path|contains:
+      - '.bash_history'
+      - '.zsh_history'
+      - '.sh_history'
+      - '.ash_history'
+      - '.ksh_history'
+      - '.python_history'
+  human_home:
+    path|contains:
+      - '/home/'
+      - '/root/'
+      - '/Users/'
+      - '/export/home/'
+  skeleton:
+    path|contains:
+      - '/etc/skel/'
+  distro_data:
+    path|contains:
+      - '/usr/share/'
+      - '/usr/lib/'
+      - '/var/lib/dpkg/'
+      - '/var/lib/rpm/'
+      - '/snap/'
+  condition: history_file and not (human_home or skeleton or distro_data)
+fields:
+  - path
+  - mode
+  - owner
+  - uid
+  - size
+  - mtime_utc
+  - ctime_utc
+falsepositives:
+  - A host whose administrators have home directories outside /home - some
+    sites use /opt or a mounted path - will match every one of them. Add the
+    site's home root to the human_home filter rather than lowering the level.
+  - Docker and build images sometimes carry a stray history file baked into a
+    layer under /usr or /opt.
+  - Two markers were dropped after testing. A bare '.history' suffix matched
+    /usr/share/calendar/calendar.history, a packaged data file; and the
+    database client histories '.psql_history' and '.mysql_history' matched
+    /var/lib/postgresql/.psql_history, which is what 'sudo -u postgres psql'
+    leaves behind on every database host there is. Only shell histories are
+    matched now, because the claim this rule makes is that somebody had an
+    interactive shell as the service account.
+level: high
+tags:
+  - attack.persistence
+  - attack.t1078.003
+  - attack.execution

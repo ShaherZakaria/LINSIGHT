@@ -1,0 +1,59 @@
+title: Fileless execution from an anonymous in-memory file
+id: e70f5145-b9b3-440d-8484-9ebc5db0c6c6
+status: experimental
+description: |
+  A process whose executable is an anonymous memory file rather than a path on
+  disk. memfd_create() returns a file descriptor backed by nothing; writing an
+  ELF to it and calling fexecve() runs a binary that was never written to the
+  filesystem, so there is no file to hash, no inode to timeline, and nothing
+  for a disk-based scan to find. The process's /proc/<pid>/exe reads as
+  '/memfd:<name> (deleted)'.
+  This is the technique behind most modern Linux loaders that describe
+  themselves as fileless, and it is what an implant does after it has been
+  fetched by a dropper that then exits. The deleted-binary rule in this
+  directory catches the neighbouring case - a real file unlinked after launch -
+  and this one catches the case where the file never existed.
+  Not derived from evidence on the hosts in this repository - written from the
+  technique. The AzurePot implant used the unlink form, not this one.
+references:
+  - https://attack.mitre.org/techniques/T1620/
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  memfd_exe:
+    exe|contains:
+      - '/memfd:'
+      - 'memfd:'
+  memfd_raw:
+    message|contains:
+      - 'name="/memfd:'
+      - 'exe="/memfd:'
+      - 'a0="/memfd:'
+      - 'a0="/proc/self/fd/'
+  condition: 1 of memfd*
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - exe
+  - cmdline
+falsepositives:
+  - systemd and some language runtimes use memfd for legitimate purposes -
+    sealed shared memory, JIT pages - but they do not execve out of it.
+    Match on exe, not on the syscall name, where the table carries exe.
+  - The bare syscall name 'memfd_create' was deliberately dropped from this
+    rule - during testing it matched a statx of memfd_create.2.gz, the man
+    page. Only the exe path and argv[0] forms are matched, which is the
+    difference between a process running from memory and a process reading
+    about it.
+  - The /proc/self/fd/N form is matched only as argv[0] of an execve, not
+    anywhere in a command line, because ordinary shell redirection and process
+    substitution name those descriptors constantly.
+level: high
+tags:
+  - attack.defense_evasion
+  - attack.t1620
+  - attack.execution

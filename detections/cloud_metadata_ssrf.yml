@@ -1,0 +1,73 @@
+title: Cloud instance metadata address reached through a web request
+id: 86a31cee-2e93-4a9a-8c65-b1a686cd1b83
+status: experimental
+description: |
+  169.254.169.254 or a cloud metadata hostname appearing in a request the web
+  server logged. The link-local metadata service answers any process on the
+  instance and hands back the instance role's credentials; an SSRF in the
+  application turns "the attacker can make the server fetch a URL" into "the
+  attacker has the instance's cloud identity".
+  On IMDSv1 this is a single unauthenticated GET. The role credentials it
+  returns are usually the shortest path from a web compromise to the rest of
+  the account, and they do not appear in any host artifact - which is why the
+  request line is worth a rule of its own.
+  Not derived from evidence on the hosts in this repository - the honeypot was
+  an Azure VM and no request ever reached its metadata endpoint. Negative-
+  tested against 511 K web-log rows, where it matches nothing.
+references:
+  - https://attack.mitre.org/techniques/T1552/005/
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  metadata_address:
+    resource|contains:
+      - '169.254.169.254'
+      - '169.254.170.2'
+      - '%31%36%39%2e%32%35%34'
+      - '0xa9fea9fe'
+      - '2852039166'
+      - '[::ffff:169.254.169.254]'
+  metadata_host:
+    resource|contains:
+      - 'metadata.google.internal'
+      - 'metadata.goog'
+      - '/computeMetadata/v1'
+      - '/latest/meta-data'
+      - '/latest/user-data'
+      - '/latest/api/token'
+      - '/metadata/instance'
+      - '/metadata/identity/oauth2/token'
+      - 'iam/security-credentials'
+  metadata_body:
+    message|contains:
+      - '169.254.169.254'
+      - 'metadata.google.internal'
+      - 'iam/security-credentials'
+      - '/metadata/identity/oauth2/token'
+  metadata_referer:
+    referer|contains:
+      - '169.254.169.254'
+      - '/latest/meta-data'
+  condition: 1 of metadata*
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - size
+  - user_agent
+falsepositives:
+  - Cloud-init, the instance agent and monitoring agents talk to the metadata
+    service constantly - but over loopback, not through the web server, so
+    they do not reach this table. A hit here means the address was in an HTTP
+    request the web server handled.
+  - Security scanners test for SSRF with exactly these strings.
+level: high
+tags:
+  - attack.credential_access
+  - attack.t1552.005
+  - attack.discovery
+  - attack.t1580
