@@ -5,6 +5,7 @@ from datetime import datetime
 from datetime import timezone
 import csv
 import html as htmllib
+import io
 import json
 import zlib
 import itertools
@@ -18,6 +19,8 @@ from .term import status
 from .common import NDJSON_TIME_COLUMNS, human_size
 from .tables import TableBuilder, _s
 from .gui import APP_CSS, APP_JS, ATTACK_ORDER, ATTACK_TACTICS, _triage_payload
+from .ask import ASK_URL
+from .serve import CaseDB, live_assets, serve
 
 
 
@@ -262,8 +265,16 @@ def _packed_rows(table, limit):
 PINNED_TABLES = ("HACKTOOL_HITS", "HACKTOOL_VARIANTS")
 
 
+def console_html(tables, html_cap=2000, meta=None, tri=None, opts=None,
+                 served=False, css=None, js=None):
+    """The console as a string, for --serve to hand out without a file."""
+    buf = io.StringIO()
+    _write_console(buf, tables, html_cap, meta, tri, opts, served, css, js)
+    return buf.getvalue()
+
+
 def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
-                      opts=None):
+                      opts=None, served=False):
     """The console: triage views and every artifact table in one page.
 
     Self-contained by design - no server, no CDN, no fetch. The box that reads
@@ -273,28 +284,34 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
     `tri` is optional: without it the page is the artifact browser alone, which
     is what a single-table export (--process-map p.html) should still produce.
     """
-    esc = htmllib.escape
-    index, tbls, packed = [], {}, {}
+    with open(path, "w", encoding="utf-8") as fh:
+        _write_console(fh, tables, html_cap, meta, tri, opts, served)
+
+
+def _write_console(fh, tables, html_cap, meta, tri, opts, served,
+                   css=None, js=None):
+    """Build the payload and emit the page - shared by the file and the server."""
+    esc, index, tbls, packed = htmllib.escape, [], {}, {}
     for t in tables:
         index.append({"name": t.name, "title": t.title,
                       "category": t.category or "Other", "rows": len(t)})
-        # 0 means every row: the page is meant to carry the whole export so
-        # that a search across all tables is a search across all the evidence
         limit = html_cap or None
-        rows, blob = _packed_rows(t, limit)
+        rows, blob = (None, "") if served else _packed_rows(t, limit)
         d = {"name": t.name, "title": t.title, "category": t.category,
              "description": t.description, "sources": t.sources,
              "columns": t.columns, "row_count": len(t),
              "rows_included": min(len(t), limit) if limit else len(t),
-             "cap": 500}         # rows rendered at once in the DOM
+             "cap": 500}
         if blob:
             packed[t.name] = blob
-        else:
+        elif rows is not None:
             d["rows"] = rows
+        # Served, the rows key is left off entirely rather than set to an
+        # empty list. The page treats "rows is undefined" as "not loaded yet"
+        # and asks the database; an empty list is a loaded table with nothing
+        # in it, so shipping one made all 47 tables look empty and nothing
+        # ever fetched.
         tbls[t.name] = d
-
-    # Which table each console view reads. A view whose table was not built -
-    # a single-table export - simply does not appear in the nav.
     views = {v: n for v, n in (("findings", "FINDINGS"),
                                ("timeline", "TIMELINE"))
              if n in tbls}
@@ -302,25 +319,38 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
                "version": VERSION, "index": index, "tables": tbls,
                "views": views,
                "pinned": [n for n in PINNED_TABLES if n in tbls],
-               # what the console reads a row's clock out of, in preference
-               # order. Shared with the NDJSON exporter rather than restated:
-               # two lists of time columns would disagree the first time one
-               # gained a column.
                "tcols": list(CONSOLE_TIME_COLUMNS),
-               "spancols": ["first_utc", "last_utc"]}
+               "spancols": ["first_utc", "last_utc"],
+               # Told to the page rather than sniffed by it: a console served
+               # by --serve keeps its marks in the case file over the API, and
+               # the same page opened from disk keeps them in localStorage.
+               "served": bool(served),
+               # A merged multi-collection export: which collections are in
+               # it, and the column every row carries saying which one. The
+               # page needs both told to it rather than sniffed - the rows
+               # are packed per table and decoded on demand, and scanning
+               # every one at boot to find out is the cost that design exists
+               # to avoid.
+               "hosts": list((meta or {}).get("hosts") or []),
+               "hostcol": (meta or {}).get("host_column") or ""}
     if tri is not None:
         payload.update(_triage_payload(tri, opts))
     elif meta:
         payload["meta"] = [[k, str(v)] for k, v in meta.items() if v]
-
-    host = (tri.meta.get("Hostname") if tri is not None else None) or            (meta or {}).get("Hostname") or "collection"
+    host = (tri.meta.get("Hostname") if tri is not None else None) or \
+           (meta or {}).get("Hostname") or "collection"
     src = tri.col.path if tri is not None else (meta or {}).get("Collection", "")
+    _emit_console(fh, esc, host, src, payload, packed, css, js)
 
-    with open(path, "w", encoding="utf-8") as fh:
+
+def _emit_console(fh, esc, host, src, payload, packed, css=None, js=None):
+    css = css or APP_CSS
+    js = js or APP_JS
+    if True:
         fh.write("<!doctype html><html><head><meta charset='utf-8'>"
                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                  "<title>linsight - %s</title><style>%s</style></head><body>"
-                 % (esc(str(host)), APP_CSS))
+                 % (esc(str(host)), css))
         fh.write("<header><div class='brand'><b>linsight</b>"
                  "<span>PARSE LINUX DEEP. HUNT THE MALICIOUS.</span></div>"
                  "<div class='host'><b>%s</b> &nbsp;<code>%s</code></div>"
@@ -334,6 +364,9 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
                  "YYYY-MM-DD HH:MM, -24h, -7d'>"
                  "<button class='clr' id='tclr' title='clear the time window'>"
                  "&times;</button></div>"
+                 "<button class='themebtn' id='theme' "
+                 "title='light / dark'>&#9681;</button>"
+                 "<div class='hf' id='hf'></div>"
                  "<div class='chips' id='chips'></div></header>"
                  "<div class='cal' id='cal'></div>"
                  % (esc(str(host)), esc(str(src))))
@@ -347,7 +380,7 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
         for i, (name, blob) in enumerate(sorted(packed.items())):
             fh.write('%s%s:"%s"' % ("," if i else "", json.dumps(name), blob))
         fh.write("};</script>")
-        fh.write("<script>%s</script></body></html>" % APP_JS)
+        fh.write("<script>%s</script></body></html>" % js)
 
 
 def write_single_table(table, path, html_cap=100000):
@@ -459,6 +492,44 @@ def export_tables(tri, col, opts, tb=None):
         write_tables_json(tables, json_path, meta)
         writer_times.append(("write JSON (combined)", time.perf_counter() - t0))
         print("[+] combined table JSON written to %s" % json_path, file=sys.stderr)
+    # A database without a server. --db asked for one; whether a server is
+    # also wanted is a separate question, and answering "no database" because
+    # --serve was absent is the sort of silent nothing this tool is supposed
+    # not to do.
+    if getattr(opts, "db", None) and not getattr(opts, "serve", None):
+        t0 = time.perf_counter()
+        CaseDB(opts.db).build(tables, tri.meta if tri is not None else meta)
+        writer_times.append(("write SQLite", time.perf_counter() - t0))
+    if getattr(opts, "serve", None):
+        # The server is the output. Building a page as well would write a
+        # second, immediately stale copy of the same console beside the live
+        # one, and leave the examiner unsure which of the two holds the marks.
+        case = (opts.case or (os.path.join(outdir, "case.json") if outdir
+                              else "case.json"))
+        def _page():
+            # Rebuilt per request so that a rebuilt linsight.py reaches an
+            # already-running server on a refresh. In served mode the payload
+            # carries no rows, so this is a few hundred kilobytes of string
+            # work rather than the whole export.
+            css, js = live_assets()
+            return console_html(tables, opts.html_rows, meta, tri, opts,
+                                served=True, css=css, js=js)
+        dbp = getattr(opts, "db", None)
+        if dbp is None:
+            dbp = os.path.join(outdir, "case.db") if outdir else "case.db"
+        # Print the breakdown before handing the process to the server:
+        # serve() blocks until Ctrl-C, so the report at the end of this
+        # function was unreachable and --timing silently did nothing with
+        # --serve - which is the one run where knowing the cost matters most,
+        # because it is the long one.
+        if getattr(opts, "timing", False):
+            print_timing(tb, writer_times)
+        serve(_page, case, opts.serve, tables=tables,
+              meta=(tri.meta if tri is not None else meta),
+              db_path=(dbp or None),
+              llm={"url": getattr(opts, "llm_url", None) or ASK_URL,
+                   "model": getattr(opts, "llm_model", None) or ""})
+        return writer_times
     if html_path:
         t0 = time.perf_counter()
         write_tables_html(tables, html_path, opts.html_rows, meta, tri, opts)
