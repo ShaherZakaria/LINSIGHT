@@ -6744,7 +6744,43 @@ class TableBuilder:
         ("SYSTEMD_UNITS", ("systemd", "service"), ""),
         ("KERNEL_MODULES", ("kernel", "modules"), ""),
         ("SOCKETS", ("network_connection", "network"), ""),
+        # Opt-in below this line - see SIGMA_OPT_IN_STREAMS. These are the
+        # state-of-the-host tables rather than the what-happened tables: what
+        # is on the filesystem, in the account files, in the configuration.
+        # A disk image is mostly these, and until they were routable no rule
+        # could be written for the majority of what a disk investigation
+        # actually finds.
+        ("BODYFILE", ("file_event", "file", "filesystem"), ""),
+        ("FILE_INVENTORY", ("file_event", "file", "filesystem"), ""),
+        ("DELETED_FILES", ("file_event", "file", "file_delete"), ""),
+        ("SUID_SGID", ("file_event", "file", "filesystem"), ""),
+        ("HIDDEN_PATHS", ("file_event", "file", "filesystem"), ""),
+        ("SENSITIVE_FILES", ("file_event", "file", "filesystem"), ""),
+        ("OPEN_FILES", ("file_event", "file"), ""),
+        ("SSH", ("ssh_config", "authorized_keys"), ""),
+        ("SUDOERS", ("sudoers_file", "sudoers"), ""),
+        ("USERS", ("user_account", "account", "passwd"), ""),
+        ("GROUPS", ("user_account", "group", "account"), ""),
+        ("ETC_CONFIGS", ("etc_config", "config"), ""),
+        ("WEB_CONFIG", ("web_config",), ""),
+        ("INIT_AND_PROFILE", ("init", "profile", "startup_script"), ""),
+        ("EDITOR_HISTORY", ("editor_history",), ""),
+        ("PACKAGES", ("package", "software"), ""),
+        ("PACKAGE_HISTORY", ("package", "software"), "timestamp_utc"),
     )
+
+    # Streams a rule reaches only by naming them. A bare 'product: linux' rule
+    # with no service or category runs against every stream, which is what it
+    # means - but BODYFILE and FILE_INVENTORY are a quarter of a million rows
+    # of path names on a disk image, and a keyword rule pointed at them both
+    # costs minutes and reports a filename as though it were an event. The
+    # what-happened tables stay open to a bare rule; these need asking for.
+    SIGMA_OPT_IN_STREAMS = frozenset((
+        "BODYFILE", "FILE_INVENTORY", "DELETED_FILES", "SUID_SGID",
+        "HIDDEN_PATHS", "SENSITIVE_FILES", "OPEN_FILES", "SSH", "SUDOERS",
+        "USERS", "GROUPS", "ETC_CONFIGS", "WEB_CONFIG", "INIT_AND_PROFILE",
+        "EDITOR_HISTORY", "PACKAGES", "PACKAGE_HISTORY",
+    ))
 
     # VAR_LOG and JOURNAL are every log on the host in one table, so routing a
     # rule to them by logsource is not enough: 'service: cron' means the cron
@@ -7185,7 +7221,8 @@ class TableBuilder:
             # rule to match a Linux ps row through the field synonyms.
             product_ok = rule.product.lower() in ("", "linux", "unix")
             streams = [(tn, ts) for tn, svc, ts in self.SIGMA_STREAMS
-                       if (not want or want in svc)
+                       if (want in svc if tn in self.SIGMA_OPT_IN_STREAMS
+                           else (not want or want in svc))
                        and by_name.get(tn) is not None and len(by_name[tn])]
             usable = []
             for tn, ts in streams if product_ok else []:
