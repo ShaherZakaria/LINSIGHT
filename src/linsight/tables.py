@@ -254,6 +254,25 @@ def _span_seconds(start, end):
     return secs if secs >= 0 else ""
 
 
+def _end_after(start, seconds):
+    """A 'YYYY-MM-DD HH:MM:SS' start plus a duration -> when it ended, or ''.
+
+    `last` prints the logout as a bare 'HH:MM' - 'Sun Jan  4 13:40 - 08:56'
+    is a session that ran 154 days, and the 08:56 is the clock on the day it
+    ended, not the day it began. So the printed end cannot be read as a time
+    on its own, and the duration printed beside it can: start plus duration is
+    the same instant, said a way that survives being sorted.
+    """
+    if not start or seconds in ("", None):
+        return ""
+    try:
+        dt = datetime.strptime(str(start)[:19], "%Y-%m-%d %H:%M:%S")
+        return (dt + timedelta(seconds=int(seconds))).strftime(
+            "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError, OverflowError):
+        return ""
+
+
 def _duration_seconds(text):
     """`last`'s own '(01:23)' or '(2+03:04)' -> seconds.
 
@@ -3447,11 +3466,135 @@ class TableBuilder:
                 sess["state"] = "still open at the end of this log"
         return out
 
+    # `last` prints a session three ways and the collector runs all three.
+    # The plain and -i forms put the origin third and date the row
+    # 'Thu Jun 11 11:15' - no year, no seconds; -F dates it in full and moves
+    # the origin to the end of the line. `who` is a fourth shape again. One
+    # regex fitted to the plain form is not enough for any of that. On a real
+    # collection it read 5,584 rows into an undated 'Thu Jun 11 11:15' and
+    # dropped the other 5,663 - every -F row, every 'still logged in' row,
+    # every 'gone - no logout' row, every `who` row - into a split() fallback
+    # that put the rest of the line in the start column. 508 of the 11,756
+    # starts in that table were timestamps, every one of them from wtmp or
+    # PAM, and the newest start of all - the row that answers "when did
+    # anyone last sign in" - was the string 'tty1 Jun 8 08:56'.
+    _TS_FULL = r"\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d:\d\d(?:\s+\S+)?\s+\d{4}"
+    _TS_SHORT = r"\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d"
+    # 'reboot   system boot  ...' is the one terminal with a space in it
+    _TTY = r"(?:system boot|\S+)"
+    # Both the terminal and the origin are optional: `lastb` writes neither
+    # for an attempt that never reached one, and the row is still a record of
+    # someone trying.
+    LAST_F_RE = re.compile(r"^(\S+)\s+(?:(%s)\s+)?(%s)\s*(.*)$"
+                           % (_TTY, _TS_FULL))
+    LAST_RE = re.compile(r"^(\S+)\s+(?:(%s)\s+)?(\S*?)\s+(%s)\s*(.*)$"
+                         % (_TTY, _TS_SHORT))
+    LAST_FULL_RE = re.compile(_TS_FULL)
+    LAST_DUR_RE = re.compile(r"\(([^)]*)\)")
+    WHO_RE = re.compile(r"^(\S+)\s+(?:[-+?]\s+)?(\S+)\s+"
+                        r"(\d{4}-\d\d-\d\d\s+\d\d:\d\d(?::\d\d)?"
+                        r"|\w{3}\s+\d{1,2}\s+\d\d:\d\d(?::\d\d)?)"
+                        r"\s*(?:\((.*)\))?\s*$")
+    LAST_NOTE_RE = re.compile(r"\b(down|crash)\b", re.I)
+    _NO_SECONDS_RE = re.compile(r"\d\d:\d\d$")
+    WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+    def _last_ts(self, text):
+        """A `last`/`who` stamp -> UTC, whichever of its shapes this is.
+
+        -F prints 'Thu Jun 11 11:15:38 2026', which dates itself. The others
+        print 'Thu Jun 11 11:15' and 'Jun  8 08:56' - no year, and no seconds.
+        Dropping the weekday and adding ':00' makes them the syslog shape, and
+        syslog is what every other undated line in the case is read as: the
+        collection year is the anchor, and a month later than the collection
+        month is read as the year before. The minute is what was printed; the
+        second is not, and a stamp that claims one it was never given would
+        be a worse answer than the one it replaces.
+        """
+        s = " ".join((text or "").split())
+        if not s:
+            return ""
+        out = self.ts_utc(s)
+        if out:
+            return out
+        if s.split(" ")[0][:3].lower() in self.WEEKDAYS:
+            s = s.partition(" ")[2]
+        if self._NO_SECONDS_RE.search(s):
+            s += ":00"
+        return self.ts_utc(s)
+
+    @classmethod
+    def _last_host(cls, text):
+        """The origin off the end of a -F row, which is where -a puts it."""
+        t = cls.LAST_DUR_RE.sub(" ", text or "").strip()
+        if t.startswith("-"):
+            t = t[1:]
+        for note in ("still logged in", "gone - no logout", "still running"):
+            t = t.replace(note, " ")
+        f = t.split()
+        return f[-1] if f else ""
+
+    @classmethod
+    def _last_state(cls, tail, end):
+        """How the session ended, in the vocabulary wtmp and PAM already use.
+
+        The same fact reaches this table from three readers, and a session
+        `last` calls 'gone - no logout' is the one the wtmp reader calls 'no
+        logout record'. Two spellings of one state is a column that cannot be
+        grouped on.
+        """
+        low = (tail or "").lower()
+        if "still logged in" in low or "still running" in low:
+            return "still open at the end of this log"
+        if "no logout" in low:
+            return "no logout record"
+        m = cls.LAST_NOTE_RE.search(low)
+        if m:
+            return ("ended at shutdown" if m.group(1).lower() == "down"
+                    else "ended at reboot")
+        return "closed" if end else ""
+
+    def _last_row(self, s):
+        """One `last`/`lastb` line -> user, tty, host, start, end, secs, state."""
+        m = self.LAST_F_RE.match(s)
+        if m:
+            user, tty, start_raw, tail = m.groups()
+            start = self._last_ts(start_raw)
+            tty = tty or ""
+            em = self.LAST_FULL_RE.search(tail)
+            end = self._last_ts(em.group(0)) if em else ""
+            dur = self.LAST_DUR_RE.search(tail)
+            secs = (_duration_seconds(dur.group(1)) if dur
+                    else _span_seconds(start, end))
+            host = self._last_host(tail[em.end():] if em else tail)
+            return (user, tty, host, start, end, secs,
+                    self._last_state(tail, end))
+        m = self.LAST_RE.match(s)
+        if m:
+            user, tty, host, start_raw, tail = m.groups()
+            start = self._last_ts(start_raw)
+            tty, host = tty or "", host or ""
+            dur = self.LAST_DUR_RE.search(tail)
+            secs = _duration_seconds(dur.group(1)) if dur else ""
+            end = _end_after(start, secs)
+            return (user, tty, host, start, end, secs,
+                    self._last_state(tail, end))
+        return None
+
+    def _who_row(self, s):
+        """One `who` line. Everything it lists is signed in right now."""
+        m = self.WHO_RE.match(s)
+        if not m:
+            return None
+        user, tty, when, host = m.groups()
+        return (user, tty, host or "", self._last_ts(when), "", "",
+                "open when the collector ran")
+
     def t_logins(self):
         t = self.table("LOGINS", "Login history",
                        ["user", "service", "terminal", "source_host", "start",
-                        "end", "duration", "duration_seconds", "state", "pid",
-                        "source"], "Authentication",
+                        "end", "duration", "duration_seconds", "result",
+                        "state", "pid", "source"], "Authentication",
                        "Every login session, from all three records of one: "
                        "last/lastb/who where the collector ran them, wtmp "
                        "paired login-to-logout by terminal, and PAM's own "
@@ -3465,32 +3608,61 @@ class TableBuilder:
                        "therefore appear more than once, from different "
                        "sources; the source column says which, and two "
                        "records of one session disagreeing is itself worth "
-                       "seeing. Duration is measured from the pair rather "
-                       "than reported, state says how the session ended "
-                       "because 'no logout record' and 'still open' otherwise "
-                       "both look like a blank end time, and duration_seconds "
-                       "is the same number unformatted so the table sorts on "
-                       "it.")
-        rx = re.compile(r"^(\S+)\s+(\S+)\s+(\S*)\s{2,}(\w{3}\s+\w{3}\s+\d+\s+[\d:]+)"
-                        r"\s*-?\s*(\S+)?\s*(\(.*\))?\s*$")
+                       "seeing. Every start is UTC: `last` prints its rows "
+                       "three ways and only -F carries a year, so the "
+                       "year-less forms are dated against the collection year "
+                       "the way every other year-less line in the case is, to "
+                       "the minute that was printed. `who` lists what was "
+                       "open when the collector ran and says so in state. "
+                       "result is whether the login was granted, and "
+                       "it is a column because one of those sources is not a "
+                       "session at all: lastb prints the attempts that were "
+                       "refused in the same shape last prints the ones that "
+                       "were accepted, so without it the newest row here is "
+                       "the last attempt rather than the last sign-in. wtmp, "
+                       "who, last and PAM's 'session opened' are logins that "
+                       "were granted and are 'success'; lastb is 'failure'. "
+                       "Duration is measured from the pair rather than "
+                       "reported, state says how the session ended because "
+                       "'no logout record' and 'still open' otherwise both "
+                       "look like a blank end time - it is not an outcome, a "
+                       "session that closed and a login that was refused are "
+                       "not the same fact - and duration_seconds is the same "
+                       "number unformatted so the table sorts on it.")
         for rel in sorted(self.col.glob("live_response/system/last*.txt")) + \
                    sorted(self.col.glob("live_response/system/who*.txt")):
+            base = os.path.basename(rel)
+            low = base.lower()
+            # last*.txt is lastb.txt and lastlog.txt as well, and neither of
+            # them is what the glob was written for. lastb prints the logins
+            # that were refused, in the same columns last prints the ones that
+            # were granted - which is why this table needs an outcome, and why
+            # without one the newest row in a login history is a failed
+            # attempt. lastlog is not a list of sessions at all: it is one line
+            # per account, most of them '**Never logged in**', and the binary
+            # it reads is already parsed into LASTLOG.
+            if low.startswith("lastlog"):
+                continue
+            outcome = "failure" if low.startswith("lastb") else "success"
+            read = self._who_row if low.startswith("who") else self._last_row
             for ln in self.lines(rel, "LOGINS"):
                 s = ln.rstrip()
                 if not s.strip() or s.startswith("wtmp begins") or s.startswith("btmp begins"):
                     continue
-                m = rx.match(s)
-                if m:
-                    dur = (m.group(6) or "").strip("()")
-                    t.add(m.group(1), "", m.group(2), m.group(3), m.group(4),
-                          m.group(5) or "", dur, _duration_seconds(dur),
-                          "", "", os.path.basename(rel))
-                else:
-                    f = s.split()
-                    if f:
-                        t.add(f[0], "", f[1] if len(f) > 1 else "", "",
-                              " ".join(f[2:]), "", "", "", "", "",
-                              os.path.basename(rel))
+                row = read(s)
+                if not row:
+                    # A line that fits none of the shapes is not a session,
+                    # and the old fallback - first token is the user, the
+                    # rest is the start - is what put a terminal name in the
+                    # start column. Better to leave it out than to record it
+                    # as a login that happened at 'tty1 Jun 8 08:56'. Across
+                    # the nine last/lastb/who files a real collection writes,
+                    # nothing reaches here but the banner lines already
+                    # skipped above.
+                    continue
+                user, tty, host, start, end, secs, state = row
+                t.add(user, "", tty, host, start, end,
+                      _human_duration(secs), secs, outcome, state, "", base)
 
         # And the sessions wtmp itself describes. On a disk image this is the
         # whole table; anywhere else it is the cross-check, measured from the
@@ -3506,15 +3678,15 @@ class TableBuilder:
                   sess["host"] or sess["ip"],
                   start.strftime("%Y-%m-%d %H:%M:%S") if start else "",
                   end.strftime("%Y-%m-%d %H:%M:%S") if end else "",
-                  _human_duration(secs), secs, sess["state"], sess["pid"],
-                  sess["source"])
+                  _human_duration(secs), secs, "success", sess["state"],
+                  sess["pid"], sess["source"])
 
         # and what PAM recorded, which covers the sessions wtmp never sees
         for sess in self._auth_sessions():
             secs = _span_seconds(sess["start"], sess["end"])
             t.add(sess["user"], sess["service"], sess["line"], sess["host"],
                   sess["start"], sess["end"], _human_duration(secs), secs,
-                  sess["state"], sess["pid"], sess["source"])
+                  "success", sess["state"], sess["pid"], sess["source"])
 
     # message shape -> (event label, regex whose named groups fill user/ip/port)
     # (event label, regex, class) - class 'priv' feeds PRIVILEGE_ACTIVITY.
