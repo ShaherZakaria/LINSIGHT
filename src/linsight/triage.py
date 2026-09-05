@@ -3816,22 +3816,96 @@ class Triage:
                       ".ttf", ".jar", ".class")
     PIVOT_MAX_FILE = 256 * 1024 * 1024
 
+    #: An indicator's shape, which decides what counts as a match.
+    #:
+    #: A raw substring search is wrong for every one of these. '5.191.32.19'
+    #: is inside '185.191.32.198', 'evil.com' is inside 'notevil.com', and a
+    #: truncated hash is inside the full one - so an indicator list assembled
+    #: from three feeds reports hits on addresses the host never contacted.
+    #: The keyword engine has the same bug and the same fix; here the boundary
+    #: has to know the shape, because what may follow an address is not what
+    #: may follow a hostname.
+    IOC_IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+    IOC_IPV6 = re.compile(r"^[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}$", re.I)
+    IOC_HASH = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", re.I)
+    IOC_DOMAIN = re.compile(
+        r"^(?!-)[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63})+$", re.I)
+
+    #: What may not sit against an indicator of each shape.
+    IOC_EDGES = {
+        "ipv4": ("0123456789.", "0123456789."),
+        "ipv6": ("0123456789abcdef:", "0123456789abcdef:"),
+        "hash": ("0123456789abcdefghijklmnopqrstuvwxyz",
+                 "0123456789abcdefghijklmnopqrstuvwxyz"),
+        "domain": ("abcdefghijklmnopqrstuvwxyz0123456789.-",
+                   "abcdefghijklmnopqrstuvwxyz0123456789-"),
+        # paths and names: the same one-sided rule the keyword engine uses -
+        # an indicator may be the prefix of a longer token but not its tail
+        "other": ("abcdefghijklmnopqrstuvwxyz0123456789_", ""),
+    }
+
+    @classmethod
+    def ioc_kind(cls, term):
+        """Which shape an indicator has, for boundary purposes."""
+        t = term.strip()
+        if cls.IOC_IPV4.match(t):
+            return "ipv4"
+        if cls.IOC_HASH.match(t):
+            return "hash"
+        if ":" in t and cls.IOC_IPV6.match(t):
+            return "ipv6"
+        if "/" not in t and cls.IOC_DOMAIN.match(t):
+            return "domain"
+        return "other"
+
+    #: Defanged forms, as threat-intelligence feeds actually ship them.
+    #:
+    #: A feed writes 185.191.32[.]198 so that nothing downstream turns it into
+    #: a link. An artifact never does. Pasting a feed straight into --pivot
+    #: therefore searches for a string that cannot occur, and answers "not
+    #: found" for every indicator in the list - which is the one answer a
+    #: pivot must never give wrongly.
+    IOC_DEFANGED = (
+        ("[.]", "."), ("(.)", "."), ("{.}", "."), ("[dot]", "."),
+        ("(dot)", "."), ("[:]", ":"), ("[://]", "://"), ("[at]", "@"),
+        ("(at)", "@"), ("hxxps://", "https://"), ("hxxp://", "http://"),
+        ("hxxps:", "https:"), ("hxxp:", "http:"),
+    )
+
+    @classmethod
+    def refang_ioc(cls, term):
+        """A defanged indicator as it would really appear. -> (term, changed)"""
+        out = term
+        for a, b in cls.IOC_DEFANGED:
+            if a in out.lower():
+                # case-insensitive replace, preserving the rest of the string
+                out = re.sub(re.escape(a), b, out, flags=re.I)
+        return out, out != term
+
     def _pivot_terms(self):
         """--pivot values, expanding '@file' into one term per line."""
-        terms = []
+        terms, refanged = [], 0
         for raw in self.opts.pivot or []:
             if raw.startswith("@"):
                 try:
                     with open(raw[1:], encoding="utf-8", errors="replace") as fh:
                         for line in fh:
                             t = line.strip()
-                            if t and not t.startswith("#"):
-                                terms.append(t)
+                            if not t or t.startswith("#"):
+                                continue
+                            t, changed = self.refang_ioc(t)
+                            if changed:
+                                refanged += 1
+                            terms.append(t)
                 except OSError as e:
                     self.add("MEDIUM", "Pivot", "IOC list could not be read",
                              str(e), source=raw[1:])
             else:
-                terms.append(raw)
+                t, changed = self.refang_ioc(raw)
+                refanged += 1 if changed else 0
+                terms.append(t)
+        if refanged:
+            status("[*] pivot: refanged %d defanged indicator(s)" % refanged)
         # auto-pivot on the strongest indicators found so far: anything
         # executing from a temp filesystem, plus every preloaded library
         for t in sorted(self.auto_pivot) + [
@@ -3879,6 +3953,22 @@ class Triage:
                 break
         return out
 
+    @classmethod
+    def ioc_edge_ok(cls, subject, start, end, kind):
+        """Is this match a whole indicator, or the middle of a longer one?
+
+        Called on every hit of the pivot trie. The trie is a fast candidate
+        finder and stays a substring search - correcting it here rather than
+        in the pattern keeps one pass over the collection, which is what makes
+        a thousand-indicator list affordable at all.
+        """
+        before, after = cls.IOC_EDGES.get(kind, cls.IOC_EDGES["other"])
+        if before and start > 0 and subject[start - 1].lower() in before:
+            return False
+        if after and end < len(subject) and subject[end].lower() in after:
+            return False
+        return True
+
     def sweep_terms(self, terms):
         """One pass over every text artifact, matching all terms at once.
 
@@ -3904,9 +3994,10 @@ class Triage:
         # The trie has no per-term groups, so a match is mapped back to its
         # term by the text it matched - which is why the terms are deduplicated
         # case-insensitively before they get here.
-        index = {}
+        index, kinds = {}, {}
         for i, t in enumerate(terms):
             index.setdefault(t.lower(), i)
+            kinds[i] = self.ioc_kind(t)
         try:
             rx = re.compile(trie_pattern(terms), re.I)
         except re.error as e:
@@ -3935,6 +4026,9 @@ class Triage:
             mp = rx.search(host)
             if mp:
                 idx = index.get(mp.group(0).lower())
+                if idx is not None and not self.ioc_edge_ok(
+                        host, mp.start(), mp.end(), kinds.get(idx, "other")):
+                    idx = None
                 if idx is not None:
                     counts[idx][host] += 1
                     if len(hits[idx]) < 60:
@@ -3957,6 +4051,9 @@ class Triage:
             for m in rx.finditer(text):
                 idx = index.get(m.group(0).lower())
                 if idx is None:
+                    continue
+                if not self.ioc_edge_ok(text, m.start(), m.end(),
+                                        kinds.get(idx, "other")):
                     continue
                 counts[idx][host] += 1
                 start = text.rfind("\n", 0, m.start()) + 1
@@ -4030,6 +4127,7 @@ class Triage:
             return
         hits, counts, spans = swept
         self.pivot_hits = []
+        found = set()
         for idx, term in enumerate(terms):
             ev = hits.get(idx)
             if not ev:
@@ -4039,6 +4137,7 @@ class Triage:
             self.pivot_artifacts[term] = sorted(counts[idx])
             for host, n, line in ev:
                 self.pivot_hits.append((term, host, n, line))
+            found.add(term)
             self.add("HIGH", "Pivot", "Cross-artifact hits for '%s'" % term,
                      "%d mention(s) in %d artifact(s) - the same indicator "
                      "followed through process, network, log, hash and "
@@ -4048,6 +4147,24 @@ class Triage:
                      source="(%d artifacts)" % len(counts[idx]), count=total,
                      times=spans[idx])
             self.ioc(term, "pivot")
+
+        # Say which indicators were searched for and not seen.
+        #
+        # A pivot that reports only its hits cannot be told apart from a pivot
+        # that silently failed to read the list, mis-parsed it, or was cut off
+        # by --pivot-limit. Naming the misses turns 'nothing was found' into a
+        # statement about this host rather than a gap in the run.
+        missed = [t for t in terms if t not in found]
+        if missed:
+            self.add("INFO", "Pivot",
+                     "%d of %d indicator(s) not seen anywhere"
+                     % (len(missed), len(terms)),
+                     "Searched every text artifact in the collection, "
+                     "including compressed rotations. These were not present "
+                     "- which is evidence about this host, not a failed "
+                     "search.",
+                     [trunc(t, 120) for t in missed[:200]],
+                     source="(%d searched)" % len(terms), count=len(missed))
 
     # -- run ----------------------------------------------------------------
     def run(self):
