@@ -347,7 +347,8 @@ def main(argv=None):
                     help="a collection (directory, .tar, .tar.gz, .zip) or a disk "
                          "(raw/dd, E01, qcow2, vmdk, vhdx, vhd, or /dev/sda). Which it "
                          "is, is detected. Repeatable: several are read one after "
-                         "another, each into its own directory under --out. Optional "
+                         "another into one merged export, or one export each under "
+                         "--split. Optional "
                          "only with --update-sigma on its own.")
     dg = ap.add_argument_group(
         "disks",
