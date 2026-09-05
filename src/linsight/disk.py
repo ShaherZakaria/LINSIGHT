@@ -8,7 +8,7 @@ fourth backend, whose members are the files on the imaged filesystem, mounted
 where they already live.
 
 That is the whole design, and it is what makes the feature worth having. The
-147 analyzers, the 88 tables, the Sigma and YARA engines, the timeline, the
+147 analyzers, the 94 tables, the Sigma and YARA engines, the timeline, the
 IOC extraction and the console all run over a disk image unchanged, because
 from where they sit a disk image and a UAC collection are the same thing.
 

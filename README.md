@@ -97,7 +97,7 @@ was never built.
 
 ### 2. Tables
 
-88 artifact types normalised into one grid each — processes, sockets, open files, cron, systemd units, auth log, journal, shell history, packages, persistence, the bodyfile, and so on. Every row keeps a `source` column naming the file it was parsed from.
+94 artifact types normalised into one grid each — processes, sockets, open files, cron, systemd units, auth log, journal, shell history, packages, persistence, the bodyfile, and so on. Every row keeps a `source` column naming the file it was parsed from.
 
 ```bash
 python linsight.py ./coll --export ./out       # csv/ + json/ + browser.html
@@ -127,7 +127,7 @@ Findings and the timeline always run over the whole collection; they exist to co
 
 ### 3. The console
 
-`--html` writes a document — a page you read top to bottom and hand to someone. The **browser** is the other thing an analyst wants from the same run: a console to work the case in, where the findings, the ATT&CK coverage, the timeline and all 88 tables sit behind one nav and one set of severity chips.
+`--html` writes a document — a page you read top to bottom and hand to someone. The **browser** is the other thing an analyst wants from the same run: a console to work the case in, where the findings, the ATT&CK coverage, the timeline and all 94 tables sit behind one nav and one set of severity chips.
 
 ```bash
 python linsight.py ./coll --export ./out        # csv/ + json/ + browser.html
@@ -294,7 +294,7 @@ sudo python linsight.py /dev/sda            # the disk still in the machine
 This is not a second tool bolted on. A disk holds `/etc/passwd`, `/var/log/auth.log*`
 and `/home/*/.bash_history` — the paths every parser here already asks for — so a
 disk is a fourth backend behind the same collection interface. The 147 analyzers,
-the 88 tables, Sigma and YARA, the timeline and the console all run over an image
+the 94 tables, Sigma and YARA, the timeline and the console all run over an image
 without knowing one is involved.
 
 Nothing is mounted, no loop device is created, no kernel driver touches the
@@ -732,7 +732,7 @@ python linsight.py --file capture-2311.txt:/var/log/auth.log
 
 This is not a second, smaller parser. Every file is mounted at the path its
 parser already looks for, and the whole pipeline then runs unchanged — the same
-analyzers, the same 88 tables, Sigma and YARA, the findings, the console. A
+analyzers, the same 94 tables, Sigma and YARA, the findings, the console. A
 file routed to `/var/log/auth.log` is parsed by exactly the code that parses an
 auth.log out of a UAC tar, because it *is* that code.
 
