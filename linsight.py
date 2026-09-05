@@ -89,9 +89,12 @@ care which tool collected them.
 from __future__ import annotations
 
 import argparse
+import ast
 import atexit
 import base64
 import bz2
+import calendar
+import copy
 import csv
 import fnmatch
 import gzip
@@ -105,15 +108,20 @@ import lzma
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import stat as statmod
 import struct
 import sys
 import tarfile
 import tempfile
+import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
+import webbrowser
 import zipfile
 import zlib
 from collections import OrderedDict
@@ -121,6 +129,8 @@ from collections import defaultdict
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
 
 VERSION = "1.0"
 AUTHOR = "Shaher Elrobaa"
@@ -581,6 +591,48 @@ def _trie_regex(node):
     return body + "?" if optional else body
 
 
+def _trie_alt(names):
+    """One alternation, factored so a shared prefix is scanned once.
+
+    A flat 'a|b|c' of 169 names makes the engine try each branch in turn at
+    every position of every log line, and the names overlap heavily -
+    'lazagne', 'linpeas', 'linenum' each re-scan 'l'. Factoring them into a
+    trie turns that into a single walk: 'l(?:azagne|inpeas|inenum)'. Same
+    language, same leftmost match, measured 2.8x faster over this collection's
+    log text - which is the whole cost of the sweep, since it is bytes scanned
+    and not names listed that drives it.
+
+    Longest-wins is preserved without sorting by length. Where one name is a
+    prefix of another the tail is made optional, and the regex engine is
+    greedy, so 'nmap(?:-ng)?' still prefers 'nmap-ng' where both could match.
+    """
+    root = {}
+    for w in names:
+        node = root
+        for ch in w:
+            node = node.setdefault(ch, {})
+        node[""] = True                       # a name ends here
+
+    def render(node):
+        if len(node) == 1 and "" in node:
+            return ""                         # leaf: nothing left to match
+        alts = []
+        optional = False
+        for ch in sorted(node):
+            if ch == "":
+                optional = True               # a shorter name stops here
+                continue
+            alts.append(re.escape(ch) + render(node[ch]))
+        if len(alts) == 1:
+            # '(?:...)?' round the whole tail, never 'xy?' - that would make
+            # only the last character optional and quietly match 'x' alone
+            return "(?:%s)?" % alts[0] if optional else alts[0]
+        body = "(?:%s)" % "|".join(alts)
+        return body + "?" if optional else body
+
+    return render(root)
+
+
 def _tool_regex(groups, loose=False):
     """One alternation for the whole tier, so a cell costs a single pass.
 
@@ -599,7 +651,7 @@ def _tool_regex(groups, loose=False):
     for cat, names in groups.items():
         for n in names:
             cats.setdefault(n.lower(), cat)
-    alt = "|".join(sorted((re.escape(n) for n in cats), key=len, reverse=True))
+    alt = _trie_alt(cats)
     # Case-sensitive against already-lowercased names, with the caller
     # lowercasing the cell once. re.I is not a free flag: it case-folds at
     # every position of every alternative, and measured on this collection's
@@ -2230,14 +2282,60 @@ class Collection:
                 and all(fnmatch.fnmatchcase(n, p)
                         for n, p in zip(nseg[len(nseg) - len(tail):], tail)))
 
+    #: Characters that make a path fragment a pattern rather than a literal.
+    GLOB_META = "*?["
+
+    def _dir_index(self):
+        """{parent directory -> [(lowercased name, real name)]}, built once.
+
+        glob() used to walk all of _names for every pattern. That is fine for
+        a handful of patterns and ruinous for the extractors that build one
+        per home directory: t_history asks for eleven filenames under every
+        home /etc/passwd declares, which on a host with twenty accounts is
+        220 full passes over 85,000 names - and measured 19.8s of a 143s run
+        for 366 rows of output.
+
+        Bucketing by parent directory turns the common case - a pattern whose
+        directory part is literal - into one dict lookup and a handful of
+        fnmatch calls. A pattern with a wildcard in the directory part still
+        has to try each directory, but there are far fewer directories than
+        files, so even that is an order of magnitude less work.
+        """
+        idx = getattr(self, "_dirs_cache", None)
+        if idx is None:
+            idx = {}
+            for low, real in self._names.items():
+                cut = low.rfind("/")
+                idx.setdefault(low[:cut] if cut >= 0 else "", []).append((low, real))
+            self._dirs_cache = idx
+        return idx
+
     def glob(self, pattern):
         """Shell-style match over collection-relative names (case-insensitive)."""
         pat = (self.escape_glob(self.prefix) + pattern.lstrip("/")).lower()
         plen = len(self.prefix)
         out = []
-        for low, real in self._names.items():
-            if self._match_path(low, pat):
-                out.append(real[plen:])
+
+        # '**' spans directories, so the bucket a name sits in says nothing
+        # about whether it matches - that case keeps the full scan.
+        if "**" in pat.split("/"):
+            for low, real in self._names.items():
+                if self._match_path(low, pat):
+                    out.append(real[plen:])
+            return sorted(out)
+
+        cut = pat.rfind("/")
+        dirpat, basepat = (pat[:cut], pat[cut + 1:]) if cut >= 0 else ("", pat)
+        index = self._dir_index()
+        if any(ch in dirpat for ch in self.GLOB_META):
+            buckets = [v for d, v in index.items()
+                       if self._match_path(d, dirpat)]
+        else:
+            buckets = [index.get(dirpat, ())]
+        for bucket in buckets:
+            for low, real in bucket:
+                if fnmatch.fnmatchcase(low[low.rfind("/") + 1:], basepat):
+                    out.append(real[plen:])
         return sorted(out)
 
     def rootfs_glob(self, pattern):
@@ -7905,7 +8003,7 @@ fourth backend, whose members are the files on the imaged filesystem, mounted
 where they already live.
 
 That is the whole design, and it is what makes the feature worth having. The
-147 analyzers, the 88 tables, the Sigma and YARA engines, the timeline, the
+147 analyzers, the 94 tables, the Sigma and YARA engines, the timeline, the
 IOC extraction and the console all run over a disk image unchanged, because
 from where they sit a disk image and a UAC collection are the same thing.
 
@@ -10134,7 +10232,8 @@ class Keywords:
         #   costs one pass over the haystack rather than ten.
         inners, always = [], False
         for v in self.values:
-            inner = _wildcard_re(str(v).lower(), True).pattern[1:-1]
+            low = str(v).lower()
+            inner = _wildcard_re(low, True).pattern[1:-1]
             # same wildcard-stripping as _anchored: an unanchored leading or
             # trailing .* is redundant under search() and is the quadratic
             # backtracking trap
@@ -10143,13 +10242,45 @@ class Keywords:
             while inner.endswith(".*"):
                 inner = inner[:-2]
             if inner:
-                inners.append(inner)
+                inners.append(self._left_bounded(low, inner))
             else:
                 always = True       # a bare '*' keyword matches any row
         self.always = always
         self.pat = (None if always or not inners else
                     re.compile("|".join("(?:%s)" % i for i in inners)))
 
+
+    # A keyword may not start in the middle of a word.
+    #
+    # Keyword blocks are substring searches over the whole row, and on a
+    # free-text log table that reads a keyword out of the middle of an
+    # unrelated token. The PROVENANCE fix below is one instance of this - 'rm'
+    # found inside 'SIGTERM'. The general case is worse: SigmaHQ's stable
+    # 'Remote File Copy' rule lists the keyword 'scp ', and on a 2016 Ubuntu
+    # build it matched the kernel line 'ACPI: Added _OSI(3.0 _SCP Extensions)'
+    # in every rotation of kern.log, syslog and dmesg - 80-odd rows of a
+    # firmware string reported as file transfer.
+    #
+    # So a keyword whose first character is a word character must not be
+    # preceded by one. Deliberately one-sided: requiring a boundary on the
+    # right as well would stop the keyword 'xmrig' matching 'xmrig_v2', and a
+    # keyword that is the *prefix* of a longer token is usually the hit you
+    # want. A keyword that is the *suffix* of one - the 'rm' of 'SIGTERM', the
+    # 'scp' of '_SCP' - essentially never is.
+    #
+    # This is also closer to what a real Sigma backend does. Elasticsearch and
+    # Splunk resolve a keyword to a full-text match over analysed tokens, not
+    # to a substring scan, and neither would return '_SCP Extensions' for
+    # 'scp'.
+    WORD_CHAR = "0123456789abcdefghijklmnopqrstuvwxyz_"
+
+    @classmethod
+    def _left_bounded(cls, low, inner):
+        """Forbid a word character immediately before a word-initial keyword."""
+        lead = low.lstrip("*")
+        if lead[:1] and lead[0] in cls.WORD_CHAR:
+            return "(?<![%s])%s" % (cls.WORD_CHAR, inner)
+        return inner
 
     # Columns this export adds to say where a row came from. They are not part
     # of the event, and folding them into the keyword haystack invents matches:
@@ -10291,6 +10422,165 @@ class SigmaCondParser:
         raise RuleError("empty condition")
 
 
+#: Modifiers whose values are not plain text in the row, so no literal can be
+#: read out of them for the gate below.
+_GATE_SKIP = frozenset(("re", "base64", "base64offset", "cidr", "expand",
+                        "windash", "utf16", "utf16le", "utf16be", "wide"))
+
+
+def _literal_of(value):
+    """The longest run of ordinary characters in a Sigma value, lowered.
+
+    A value is a literal with '*' and '?' as wildcards, so the longest stretch
+    between them is text that must appear verbatim if the value matches at
+    all. '/etc/cron.d/*' gives '/etc/cron.d/'; a bare '*' gives nothing.
+    """
+    best = ""
+    cur = []
+    i = 0
+    v = str(value).lower()
+    while i < len(v):
+        c = v[i]
+        if c == chr(92) and i + 1 < len(v):
+            cur.append(v[i + 1])
+            i += 2
+            continue
+        if c in "*?":
+            if len("".join(cur)) > len(best):
+                best = "".join(cur)
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if len("".join(cur)) > len(best):
+        best = "".join(cur)
+    return best
+
+
+def _gate_of_matcher(m):
+    """(selectivity, literals) one matcher insists on, or None for nothing.
+
+    A keyword block has no modifiers and searches the whole row, which is
+    exactly what this gate does - so it gates perfectly. A Matcher carries
+    modifiers, some of which mean the value is not plain text in the row at
+    all.
+    """
+    if _GATE_SKIP & set(getattr(m, "mods", ())):
+        return None
+    if getattr(m, "always", False):
+        return None                     # a bare '*' keyword matches anything
+    # The gate reads the whole-row haystack, and that haystack leaves out the
+    # columns this export adds to say where a row came from. A matcher on one
+    # of those - 'path' above all - can be satisfied by text the haystack
+    # never contains, so gating on its literal discards real matches. It cost
+    # the one row that named /tmp/apache-xTRhUVX, which is the payload the
+    # rule exists for.
+    if set(getattr(m, "candidates", ())) & Keywords.PROVENANCE:
+        return None
+    lits = []
+    for v in getattr(m, "values", ()):
+        if v is None:
+            return None                 # 'field: null' asks for an absence
+        lit = _literal_of(v)
+        if len(lit) < 4:                # too common to be worth testing
+            return None
+        lits.append(lit)
+    if not lits:
+        return None
+    if getattr(m, "all", False):
+        # every value must be present, so insisting on the longest one alone
+        # is both sound and the most selective single test available
+        best = max(lits, key=len)
+        return (len(best), [best])
+    return (min(len(x) for x in lits), lits)
+
+
+def _gate_and(a, b):
+    """Both must hold, so the more selective of the two is enough."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a[0] >= b[0] else b
+
+
+def _gate_or(a, b):
+    """Either may fire, so the row must hold something from either side.
+
+    A branch that insists on nothing sinks the whole gate: there would be a
+    way for the rule to match with none of the literals present.
+    """
+    if a is None or b is None:
+        return None
+    return (min(a[0], b[0]), a[1] + b[1])
+
+
+def _gate_of_selection(sel):
+    """A selection is an OR over its groups and an AND inside each one."""
+    out = None
+    for group in sel.groups:
+        best = None
+        for m in group:
+            best = _gate_and(best, _gate_of_matcher(m))
+        if best is None:
+            return None
+        out = best if out is None else _gate_or(out, best)
+    return out
+
+
+def _gate_node(node, sels):
+    """Walk the condition the way eval_sigma does, collecting what it forces."""
+    k = node.kind
+    if k == "sel":
+        sel = sels.get(node.name)
+        return _gate_of_selection(sel) if sel is not None else None
+    if k == "and":
+        return _gate_and(_gate_node(node.a, sels), _gate_node(node.b, sels))
+    if k == "or":
+        return _gate_or(_gate_node(node.a, sels), _gate_node(node.b, sels))
+    if k == "of":
+        if node.n <= 0:                 # '0 of them' is true of every row
+            return None
+        gates = [_gate_of_selection(sels[n]) if n in sels else None
+                 for n in node.names]
+        if node.n >= len(node.names):   # all of them: an AND
+            out = None
+            for g in gates:
+                out = _gate_and(out, g)
+            return out
+        out = None                      # any n of them: an OR
+        for g in gates:
+            if g is None:
+                return None
+            out = g if out is None else _gate_or(out, g)
+        return out
+    return None                         # 'not' forces nothing, nor does the
+                                        # unknown - both mean "no gate"
+
+
+def _gate_for(cond, sels):
+    """One OR-group of literals a row must contain, or None.
+
+    The point is to answer "could this rule possibly match this row" with a
+    handful of str.__contains__ calls instead of a regex per matcher. Python's
+    substring search is C and very fast; the rule engine underneath is not.
+
+    It is a pure skip: when the gate passes, the rule is evaluated exactly as
+    it was, so a match set cannot change. What makes that safe is that every
+    step above weakens rather than strengthens - an AND may keep either side,
+    an OR must keep both, and anything not understood gives up entirely. The
+    result is a necessary condition for the rule, never a sufficient one.
+
+    The first version of this only looked at selections an AND forced, and
+    gave up on 'sel_a or sel_b' and on any selection written as a list of
+    maps. That is how a rule comes to be evaluated against all 1.19M rows of
+    VAR_LOG: 31 of the 44 rules written for this collection are shaped that
+    way, and they cost more than the 334-rule SigmaHQ set put together.
+    """
+    got = _gate_node(cond, sels)
+    return got[1] if got else None
+
+
 def eval_sigma(node, sels, row):
     k = node.kind
     if k == "and":
@@ -10349,6 +10639,10 @@ class SigmaRule:
             self.selections[name] = Selection(spec, alias)
         self.cond = SigmaCondParser(self.condition_src,
                                     list(self.selections)).parse()
+        # A cheap "could this row possibly match" test, worked out once here
+        # rather than per row. None means the rule insists on nothing a
+        # substring search can check, and it is evaluated as before.
+        self.gate = _gate_for(self.cond, self.selections)
 
     def test(self, row):
         return eval_sigma(self.cond, self.selections, row)
@@ -10443,11 +10737,29 @@ def sigma_rule_wanted(text):
 
 
 def sigma_cache_dir(explicit=None):
-    """Where the fetched ruleset lives - outside any collection, by design."""
+    """Where the fetched ruleset lives - outside any collection, by design.
+
+    Defaults into the running user's own temporary directory, which resolves
+    per user with nothing to configure: tempfile.gettempdir() reads TMPDIR,
+    TEMP and TMP, so every account lands in its own temp - under AppData on
+    Windows, TMPDIR or /tmp on Unix.
+
+    An environment variable cannot express that. A machine-scope LINSIGHT_
+    SIGMA_DIR holding a percent-TEMP-percent reference expands against the
+    system environment, so every user would share the Windows temp directory,
+    which is the opposite of per-user; and a user-scope one has to be set once
+    per account, which is the thing being avoided.
+
+    The trade is that a temporary directory is one the operating system is
+    entitled to empty. Losing the cache costs a re-fetch and nothing else:
+    --sigma-cached refuses with "run --update-sigma once" rather than hunting
+    with an empty ruleset, so a cleared cache is a visible failure and not a
+    quiet one. Set LINSIGHT_SIGMA_DIR to somewhere durable to opt out.
+    """
     path = explicit or os.environ.get("LINSIGHT_SIGMA_DIR")
     if path:
         return os.path.abspath(os.path.expanduser(path))
-    return os.path.join(os.path.expanduser("~"), ".linsight", "sigma")
+    return os.path.join(tempfile.gettempdir(), "linsight", "sigma")
 
 
 def sigma_cache_manifest(dest):
@@ -10647,6 +10959,7 @@ def update_sigma_rules(dest, source=None, keep_all=False, timeout=60, quiet=Fals
     staging = dest.rstrip("/\\") + ".new"
     shutil.rmtree(_win_long(staging), ignore_errors=True)
     kept = seen = 0
+    carried = []
     try:
         for rel, text in _sigma_members(data, source_dir):
             seen += 1
@@ -10681,6 +10994,38 @@ def update_sigma_rules(dest, source=None, keep_all=False, timeout=60, quiet=Fals
         with open(os.path.join(staging, "manifest.json"), "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2, sort_keys=True)
 
+        # Carry across whatever the fetch did not produce.
+        #
+        # The swap below replaces the destination wholesale, which is right for
+        # rule trees - a rule deleted upstream must not linger - and wrong for
+        # everything else in the directory. A vendored snapshot keeps a README
+        # naming the licence its rules are under, and pointing --sigma-dir at
+        # it would delete that notice while keeping the rules it applies to.
+        # Someone who nests their own rules beside the fetched ones loses those
+        # instead. Neither is a thing to discover afterwards.
+        #
+        # So: a top-level entry the fetch did not create is copied into the new
+        # ruleset and survives the swap. Rule trees the fetch *did* create are
+        # still replaced entirely. Each carried entry is named on stderr, so
+        # the one case this reads wrong - a whole tree dropped upstream, which
+        # lingers rather than going - is visible rather than silent.
+        if os.path.isdir(dest):
+            for name in sorted(os.listdir(_win_long(dest))):
+                if name == "manifest.json" or os.path.exists(
+                        _win_long(os.path.join(staging, name))):
+                    continue
+                src = _win_long(os.path.join(dest, name))
+                dst = _win_long(os.path.join(staging, name))
+                try:
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                except OSError as e:
+                    status("[!] sigma: cannot preserve %s: %s" % (name, e))
+                    continue
+                carried.append(name)
+
         # swap: the old ruleset stays readable until the new one is complete
         backup = dest.rstrip("/\\") + ".old"
         shutil.rmtree(_win_long(backup), ignore_errors=True)
@@ -10703,6 +11048,10 @@ def update_sigma_rules(dest, source=None, keep_all=False, timeout=60, quiet=Fals
            % (kept, dest,
               " (of %d in the source; the rest target a platform this tool "
               "builds no table for)" % seen if kept < seen else ""))
+    if carried:
+        status("[*] sigma: kept %d existing entr%s the fetch does not provide: %s"
+               % (len(carried), "y" if len(carried) == 1 else "ies",
+                  ", ".join(carried)))
     return kept
 
 # -------------------------------------------------------------------------
@@ -10760,6 +11109,7 @@ class Triage:
         self.pivot_artifacts = {}     # indicator -> the artifacts naming it
         self.pivot_reported = set()   # the ones that earn a finding
         self.ww_paths = set()         # world-writable paths confirmed from the bodyfile
+        self.timestomp = {"rows": defaultdict(list), "n": defaultdict(int)}
         self.bodyfile_seen = False
         self.auto_pivot = set()       # indicators worth chasing across every artifact
         self.pivot_hits = []          # (term, artifact, line_no, line) for IOC_HITS
@@ -13487,6 +13837,208 @@ class Triage:
                      mitre="T1222 File and Directory Permissions Modification")
 
     # -- 16. bodyfile / timeline -------------------------------------------
+    #: What "timestomped" means when it is a fact rather than a suspicion.
+    #:
+    #: Three of the four Linux timestamps can be written from userspace:
+    #: utimensat sets atime and mtime to any value a caller likes, and crtime
+    #: is only ever as good as the filesystem that recorded it. ctime cannot
+    #: be - the kernel stamps it on every inode change and exposes no
+    #: interface to set it - and that asymmetry is what turns the comparisons
+    #: below into evidence rather than opinion. A forged stamp is not a value
+    #: that looks wrong on its own; it is a set of values that cannot all be
+    #: true at once.
+    #:
+    #: Which is also why this splits in two. Forward-dating breaks an
+    #: invariant - the same pair the AD1 reader leans on to identify its
+    #: unlabelled timestamp attributes, ctime >= mtime and crtime <= ctime -
+    #: so it is provable from the inode alone and needs no window, no
+    #: baseline and no corroboration. Backdating breaks nothing: "mtime much
+    #: older than ctime" is equally what every dpkg install, cp -p, tar -p
+    #: and rsync -t leaves behind, and on a Linux host those outnumber real
+    #: timestomps by orders of magnitude. The backdating rules are therefore
+    #: scoped to the incident window, demoted when they fire in bulk, and
+    #: worded as leads rather than as conclusions.
+    #:
+    #: rule -> (severity, title, what it means, what it means at volume)
+    TIMESTOMP_RULES = {
+        "mtime_ahead": (
+            "HIGH",
+            "Content timestamp later than the last metadata change",
+            "The kernel sets ctime every time it sets mtime, so on a "
+            "filesystem nobody has edited ctime is never earlier than mtime. "
+            "An mtime later than its own ctime means mtime was written "
+            "directly - touch -d, utimensat, or a stomper - to a moment after "
+            "the write it claims to describe. Nothing done through the normal "
+            "file interface produces this.",
+            "At this volume the host's clock stepped backwards, or the tree "
+            "was restored with its mtimes preserved and its metadata rewritten "
+            "afterwards. Both produce this on thousands of files at once; a "
+            "targeted timestomp does not."),
+        "pre_creation": (
+            "HIGH",
+            "Metadata changed before the file was created",
+            "crtime is when the inode came into existence and ctime is the "
+            "last time anything about it changed, so ctime cannot precede "
+            "crtime. When it does, one of the two was written into the inode "
+            "from outside the filesystem's own bookkeeping - debugfs, a raw "
+            "image edit, or a stomper that set crtime and did not think about "
+            "ctime.",
+            "This many means the crtime column itself is unreliable on this "
+            "image - a filesystem that does not record creation times, or a "
+            "collector that filled the field with something else - rather "
+            "than that every file was edited."),
+        "new_file_old_mtime": (
+            "MEDIUM",
+            "Created inside the incident window, timestamped long before it",
+            "The file was created during the window and claims an mtime from "
+            "long before it. That is the backdating case, and crtime is what "
+            "gives it away: the content date can be forged, the moment the "
+            "inode was allocated is much harder to. Confirm against the "
+            "package database before calling it - dpkg and rpm preserve the "
+            "package's build date as mtime and create the file at install "
+            "time, which looks identical.",
+            "A run this size is an install or an upgrade writing its own "
+            "build dates across the tree, not a file someone backdated. "
+            "Narrow --window past it, or read PACKAGE_HISTORY for the session "
+            "that caused it."),
+        "minute_aligned": (
+            "MEDIUM",
+            "Access and content timestamps set to an exact minute",
+            "atime and mtime are identical and land exactly on a minute "
+            "boundary while ctime does not. That is the shape `touch -t "
+            "YYYYMMDDhhmm` leaves: it writes both stamps to the value given, "
+            "which carries no seconds, and cannot touch ctime at all. A "
+            "genuine write lands on an arbitrary second - one in sixty of "
+            "them by chance.",
+            "At this volume it is a build system stamping its output to a "
+            "fixed date, or an archive unpacked with minute-resolution times, "
+            "rather than a file someone re-dated by hand."),
+        "stamp_missing": (
+            "MEDIUM",
+            "File with its content or metadata timestamp zeroed",
+            "The inode carries times, but the one named here is zero. A live "
+            "filesystem does not leave mtime or ctime unset on a regular "
+            "file; a wiper that could not set a convincing date and settled "
+            "for none does.",
+            "This many is a collector or a filesystem that did not record the "
+            "field at all - check whether the column is empty everywhere "
+            "before reading anything into it."),
+    }
+    TIMESTOMP_SKEW = timedelta(seconds=2)     # bodyfile rounding, coarse clocks
+    TIMESTOMP_BACKDATE = timedelta(days=180)  # a gap that stops being a build date
+    TIMESTOMP_BULK = 200        # above this the cause is systemic, not targeted
+    TIMESTOMP_ROW_CAP = 5000    # rows kept per rule; the count stays exact
+
+    @staticmethod
+    def _stomp_gap(delta):
+        """A timedelta as the coarsest unit that still says something."""
+        secs = abs(int(delta.total_seconds()))
+        if secs >= 172800:
+            return "%d days" % (secs // 86400)
+        if secs >= 7200:
+            return "%dh" % (secs // 3600)
+        if secs >= 120:
+            return "%dm" % (secs // 60)
+        return "%ds" % secs
+
+    def _timestomp(self, path, mode, inode, uid, size,
+                   atime, mtime, ctime, crtime, ws):
+        """Score one bodyfile entry against every timestamp rule.
+
+        Called for every regular file rather than for a pre-narrowed subset,
+        because there is nothing to narrow on: the whole test is this file's
+        four clocks compared against each other, and a forged stamp announces
+        itself nowhere else. That is one call and a handful of datetime
+        comparisons per entry, which over a bodyfile of a few hundred thousand
+        lines costs a fraction of a second - against a check that cannot be
+        run afterwards, because the console gets whole seconds and the answer
+        lives in the inode.
+
+        Counts stay exact while the retained rows are capped: a host whose
+        clock stepped backwards fails a rule on every file it has, and the
+        number is the interesting part of that answer rather than the list.
+        """
+        rows, n = self.timestomp["rows"], self.timestomp["n"]
+
+        def flag(rule, note):
+            n[rule] += 1
+            if len(rows[rule]) < self.TIMESTOMP_ROW_CAP:
+                rows[rule].append((path, mode, uid, size, inode,
+                                   atime, mtime, ctime, crtime, note))
+
+        if mtime and ctime:
+            if ctime < mtime - self.TIMESTOMP_SKEW:
+                flag("mtime_ahead", "mtime is %s ahead of ctime (m=%s c=%s)"
+                     % (self._stomp_gap(mtime - ctime),
+                        _ts_text(mtime), _ts_text(ctime)))
+            if atime and atime == mtime and atime != ctime \
+                    and atime.second == 0 and ctime.second != 0:
+                flag("minute_aligned", "a=m=%s exactly, ctime %s"
+                     % (_ts_text(mtime), _ts_text(ctime)))
+        elif atime or mtime or ctime or crtime:
+            flag("stamp_missing", "%s zero (a=%s m=%s c=%s b=%s)"
+                 % ("mtime and ctime" if not (mtime or ctime)
+                    else "mtime" if not mtime else "ctime",
+                    _ts_text(atime) or "-", _ts_text(mtime) or "-",
+                    _ts_text(ctime) or "-", _ts_text(crtime) or "-"))
+
+        if crtime:
+            if ctime and ctime < crtime - self.TIMESTOMP_SKEW:
+                flag("pre_creation", "ctime %s precedes crtime %s by %s"
+                     % (_ts_text(ctime), _ts_text(crtime),
+                        self._stomp_gap(crtime - ctime)))
+            # Backdating, and the only rule here that needs the window: the
+            # gap on its own is what a packaged file looks like, and it is
+            # the file having been created during the incident that makes an
+            # ancient content date worth reading at all.
+            if ws and mtime and crtime >= ws \
+                    and mtime < crtime - self.TIMESTOMP_BACKDATE \
+                    and ("x" in mode[1:]
+                         or path.startswith(SYSTEM_BIN_DIRS + SYSTEM_CFG_DIRS
+                                            + TMPFS_DIRS)):
+                flag("new_file_old_mtime",
+                     "created %s, mtime reads %s - %s earlier"
+                     % (_ts_text(crtime), _ts_text(mtime),
+                        self._stomp_gap(crtime - mtime)))
+
+    #: Report order: the two provable rules first, then the corroborating ones.
+    TIMESTOMP_ORDER = ("mtime_ahead", "pre_creation", "new_file_old_mtime",
+                       "minute_aligned", "stamp_missing")
+
+    def _timestomp_findings(self, src):
+        """Raise one finding per rule that fired, and date it by ctime.
+
+        ctime is the clock the forger could not set, so it is the one an entry
+        goes on the timeline under. Dating a stomped file by its own mtime
+        would file the finding exactly where the intruder asked for it to be
+        filed, which is the opposite of the point.
+
+        Per-file events only while a rule stays below the bulk threshold.
+        Above it the cause is a clock step or a package run, and one event
+        each would bury the rest of the timeline under a fact that is already
+        stated once as a finding.
+        """
+        rows, n = self.timestomp["rows"], self.timestomp["n"]
+        for rule in self.TIMESTOMP_ORDER:
+            hits = rows.get(rule) or []
+            if not hits:
+                continue
+            sev, title, detail, bulk_detail = self.TIMESTOMP_RULES[rule]
+            total = n[rule]
+            bulk = total > self.TIMESTOMP_BULK
+            when = [r[7] or r[6] or r[8] for r in hits]
+            self.add("INFO" if bulk else sev, "Anti-forensics",
+                     "%s: %d file(s)" % (title, total),
+                     "%s\n\n%s" % (detail, bulk_detail) if bulk else detail,
+                     evidence=["%-58s %s" % (trunc(r[0], 58), r[9])
+                               for r in hits[:30]],
+                     source=src, mitre="T1070.006 Timestomp",
+                     times=when, count=total)
+            if not bulk and rule in ("mtime_ahead", "pre_creation"):
+                for r in hits:
+                    self.event(r[7], "Anti-forensics",
+                               "%s: %s" % (title.lower(), r[0]), sev, src)
+
     def analyze_bodyfile(self):
         src = None
         for cand in ("bodyfile/bodyfile.txt", "bodyfile/bodyfile.csv"):
@@ -13527,6 +14079,15 @@ class Triage:
             if newest:
                 oldest = newest if oldest is None or newest < oldest else oldest
                 latest = newest if latest is None or newest > latest else latest
+
+            # Timestamp forgery, on the pass we are already making. Unlike
+            # everything else in this loop these rules need no window and no
+            # collection time - they compare the entry against itself - so
+            # they are the one part of the bodyfile analysis that still
+            # answers on a collection whose clock nothing recorded.
+            if is_reg:
+                self._timestomp(path, mode, inode, uid, size,
+                                atime, mtime, ctime, crtime, ws)
 
             # World-writable, but only for objects where it means anything:
             # symlinks are always lrwxrwxrwx, and sticky directories (/tmp) are
@@ -13617,6 +14178,7 @@ class Triage:
                       "remains when mtime is forged: ctime cannot be set from userspace."),
                      stomped[:25], source=src, mitre="T1070.006 Timestomp",
                      times=when["stomped"], count=len(stomped))
+        self._timestomp_findings(src)
         if suid_bodies:
             self.add("INFO", "Privilege", "%d setuid/setgid file(s) in the filesystem timeline" % len(suid_bodies),
                      evidence=suid_bodies[:40], source=src,
@@ -14282,22 +14844,96 @@ class Triage:
                       ".ttf", ".jar", ".class")
     PIVOT_MAX_FILE = 256 * 1024 * 1024
 
+    #: An indicator's shape, which decides what counts as a match.
+    #:
+    #: A raw substring search is wrong for every one of these. '5.191.32.19'
+    #: is inside '185.191.32.198', 'evil.com' is inside 'notevil.com', and a
+    #: truncated hash is inside the full one - so an indicator list assembled
+    #: from three feeds reports hits on addresses the host never contacted.
+    #: The keyword engine has the same bug and the same fix; here the boundary
+    #: has to know the shape, because what may follow an address is not what
+    #: may follow a hostname.
+    IOC_IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+    IOC_IPV6 = re.compile(r"^[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}$", re.I)
+    IOC_HASH = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", re.I)
+    IOC_DOMAIN = re.compile(
+        r"^(?!-)[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63})+$", re.I)
+
+    #: What may not sit against an indicator of each shape.
+    IOC_EDGES = {
+        "ipv4": ("0123456789.", "0123456789."),
+        "ipv6": ("0123456789abcdef:", "0123456789abcdef:"),
+        "hash": ("0123456789abcdefghijklmnopqrstuvwxyz",
+                 "0123456789abcdefghijklmnopqrstuvwxyz"),
+        "domain": ("abcdefghijklmnopqrstuvwxyz0123456789.-",
+                   "abcdefghijklmnopqrstuvwxyz0123456789-"),
+        # paths and names: the same one-sided rule the keyword engine uses -
+        # an indicator may be the prefix of a longer token but not its tail
+        "other": ("abcdefghijklmnopqrstuvwxyz0123456789_", ""),
+    }
+
+    @classmethod
+    def ioc_kind(cls, term):
+        """Which shape an indicator has, for boundary purposes."""
+        t = term.strip()
+        if cls.IOC_IPV4.match(t):
+            return "ipv4"
+        if cls.IOC_HASH.match(t):
+            return "hash"
+        if ":" in t and cls.IOC_IPV6.match(t):
+            return "ipv6"
+        if "/" not in t and cls.IOC_DOMAIN.match(t):
+            return "domain"
+        return "other"
+
+    #: Defanged forms, as threat-intelligence feeds actually ship them.
+    #:
+    #: A feed writes 185.191.32[.]198 so that nothing downstream turns it into
+    #: a link. An artifact never does. Pasting a feed straight into --pivot
+    #: therefore searches for a string that cannot occur, and answers "not
+    #: found" for every indicator in the list - which is the one answer a
+    #: pivot must never give wrongly.
+    IOC_DEFANGED = (
+        ("[.]", "."), ("(.)", "."), ("{.}", "."), ("[dot]", "."),
+        ("(dot)", "."), ("[:]", ":"), ("[://]", "://"), ("[at]", "@"),
+        ("(at)", "@"), ("hxxps://", "https://"), ("hxxp://", "http://"),
+        ("hxxps:", "https:"), ("hxxp:", "http:"),
+    )
+
+    @classmethod
+    def refang_ioc(cls, term):
+        """A defanged indicator as it would really appear. -> (term, changed)"""
+        out = term
+        for a, b in cls.IOC_DEFANGED:
+            if a in out.lower():
+                # case-insensitive replace, preserving the rest of the string
+                out = re.sub(re.escape(a), b, out, flags=re.I)
+        return out, out != term
+
     def _pivot_terms(self):
         """--pivot values, expanding '@file' into one term per line."""
-        terms = []
+        terms, refanged = [], 0
         for raw in self.opts.pivot or []:
             if raw.startswith("@"):
                 try:
                     with open(raw[1:], encoding="utf-8", errors="replace") as fh:
                         for line in fh:
                             t = line.strip()
-                            if t and not t.startswith("#"):
-                                terms.append(t)
+                            if not t or t.startswith("#"):
+                                continue
+                            t, changed = self.refang_ioc(t)
+                            if changed:
+                                refanged += 1
+                            terms.append(t)
                 except OSError as e:
                     self.add("MEDIUM", "Pivot", "IOC list could not be read",
                              str(e), source=raw[1:])
             else:
-                terms.append(raw)
+                t, changed = self.refang_ioc(raw)
+                refanged += 1 if changed else 0
+                terms.append(t)
+        if refanged:
+            status("[*] pivot: refanged %d defanged indicator(s)" % refanged)
         # auto-pivot on the strongest indicators found so far: anything
         # executing from a temp filesystem, plus every preloaded library
         for t in sorted(self.auto_pivot) + [
@@ -14345,6 +14981,22 @@ class Triage:
                 break
         return out
 
+    @classmethod
+    def ioc_edge_ok(cls, subject, start, end, kind):
+        """Is this match a whole indicator, or the middle of a longer one?
+
+        Called on every hit of the pivot trie. The trie is a fast candidate
+        finder and stays a substring search - correcting it here rather than
+        in the pattern keeps one pass over the collection, which is what makes
+        a thousand-indicator list affordable at all.
+        """
+        before, after = cls.IOC_EDGES.get(kind, cls.IOC_EDGES["other"])
+        if before and start > 0 and subject[start - 1].lower() in before:
+            return False
+        if after and end < len(subject) and subject[end].lower() in after:
+            return False
+        return True
+
     def sweep_terms(self, terms):
         """One pass over every text artifact, matching all terms at once.
 
@@ -14370,9 +15022,10 @@ class Triage:
         # The trie has no per-term groups, so a match is mapped back to its
         # term by the text it matched - which is why the terms are deduplicated
         # case-insensitively before they get here.
-        index = {}
+        index, kinds = {}, {}
         for i, t in enumerate(terms):
             index.setdefault(t.lower(), i)
+            kinds[i] = self.ioc_kind(t)
         try:
             rx = re.compile(trie_pattern(terms), re.I)
         except re.error as e:
@@ -14401,6 +15054,9 @@ class Triage:
             mp = rx.search(host)
             if mp:
                 idx = index.get(mp.group(0).lower())
+                if idx is not None and not self.ioc_edge_ok(
+                        host, mp.start(), mp.end(), kinds.get(idx, "other")):
+                    idx = None
                 if idx is not None:
                     counts[idx][host] += 1
                     if len(hits[idx]) < 60:
@@ -14423,6 +15079,9 @@ class Triage:
             for m in rx.finditer(text):
                 idx = index.get(m.group(0).lower())
                 if idx is None:
+                    continue
+                if not self.ioc_edge_ok(text, m.start(), m.end(),
+                                        kinds.get(idx, "other")):
                     continue
                 counts[idx][host] += 1
                 start = text.rfind("\n", 0, m.start()) + 1
@@ -14496,6 +15155,7 @@ class Triage:
             return
         hits, counts, spans = swept
         self.pivot_hits = []
+        found = set()
         for idx, term in enumerate(terms):
             ev = hits.get(idx)
             if not ev:
@@ -14505,6 +15165,7 @@ class Triage:
             self.pivot_artifacts[term] = sorted(counts[idx])
             for host, n, line in ev:
                 self.pivot_hits.append((term, host, n, line))
+            found.add(term)
             self.add("HIGH", "Pivot", "Cross-artifact hits for '%s'" % term,
                      "%d mention(s) in %d artifact(s) - the same indicator "
                      "followed through process, network, log, hash and "
@@ -14514,6 +15175,24 @@ class Triage:
                      source="(%d artifacts)" % len(counts[idx]), count=total,
                      times=spans[idx])
             self.ioc(term, "pivot")
+
+        # Say which indicators were searched for and not seen.
+        #
+        # A pivot that reports only its hits cannot be told apart from a pivot
+        # that silently failed to read the list, mis-parsed it, or was cut off
+        # by --pivot-limit. Naming the misses turns 'nothing was found' into a
+        # statement about this host rather than a gap in the run.
+        missed = [t for t in terms if t not in found]
+        if missed:
+            self.add("INFO", "Pivot",
+                     "%d of %d indicator(s) not seen anywhere"
+                     % (len(missed), len(terms)),
+                     "Searched every text artifact in the collection, "
+                     "including compressed rotations. These were not present "
+                     "- which is evidence about this host, not a failed "
+                     "search.",
+                     [trunc(t, 120) for t in missed[:200]],
+                     source="(%d searched)" % len(terms), count=len(missed))
 
     # -- run ----------------------------------------------------------------
     def run(self):
@@ -14776,6 +15455,25 @@ def _span_seconds(start, end):
     return secs if secs >= 0 else ""
 
 
+def _end_after(start, seconds):
+    """A 'YYYY-MM-DD HH:MM:SS' start plus a duration -> when it ended, or ''.
+
+    `last` prints the logout as a bare 'HH:MM' - 'Sun Jan  4 13:40 - 08:56'
+    is a session that ran 154 days, and the 08:56 is the clock on the day it
+    ended, not the day it began. So the printed end cannot be read as a time
+    on its own, and the duration printed beside it can: start plus duration is
+    the same instant, said a way that survives being sorted.
+    """
+    if not start or seconds in ("", None):
+        return ""
+    try:
+        dt = datetime.strptime(str(start)[:19], "%Y-%m-%d %H:%M:%S")
+        return (dt + timedelta(seconds=int(seconds))).strftime(
+            "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError, OverflowError):
+        return ""
+
+
 def _duration_seconds(text):
     """`last`'s own '(01:23)' or '(2+03:04)' -> seconds.
 
@@ -14812,6 +15510,48 @@ def _fs_ts(when):
         return when.strftime("%Y-%m-%d %H:%M:%S")
     except (AttributeError, ValueError):
         return ""
+
+
+def _netstat_hostport(addr):
+    """Split the way netstat prints, which is not the way ss does.
+
+    netstat never brackets an IPv6 address: it writes ":::80" for
+    every address on port 80, and "::1:631" for loopback on 631. The
+    last colon is the separator whatever the address looks like.
+    Read as a bare IPv6 address instead - which is what a general
+    splitter has to assume, because "::ffff:1.2.3.4" really is one -
+    the port is dropped, and this host's own IPv6 listeners on 80
+    and 22 were recorded as listening on nothing at all.
+    """
+    a = (addr or "").strip()
+    if not a:
+        return "", ""
+    if a.startswith("["):                 # [::]:80, if it ever appears
+        h, sep, p = a.rpartition("]:")
+        if sep:
+            return norm_ip(h.lstrip("[")), p
+        return norm_ip(a), ""
+    h, sep, p = a.rpartition(":")
+    if not sep:                           # a path, or a bare host
+        return norm_ip(a), ""
+    return (norm_ip(h) if h else "::"), p
+
+
+def _port_text(addr):
+    """The port field exactly as printed, a service name included.
+
+    split_hostport answers with a number or None, which is what
+    anything comparing ports wants. This is for recording what the
+    tool actually said.
+    """
+    a = (addr or "").strip()
+    if a.startswith("["):
+        _h, sep, p = a.rpartition("]:")
+        return p if sep else ""
+    h, sep, p = a.rpartition(":")
+    if not sep or h.count(":") >= 2:      # bare IPv6, no port
+        return ""
+    return p
 
 
 def _s(v):
@@ -14899,7 +15639,17 @@ class TableBuilder:
     # another table. These resolve the number once so every table can carry the
     # name beside it.
     def _procs(self):
-        if not self.tri.processes:
+        """The live process map, parsed once.
+
+        The guard is "has this been attempted", not "is the result empty".
+        A disk image has no live processes, so the parse yields {} - which is
+        falsy, so an emptiness check re-ran the whole parse on every call. It
+        is called once per row by t_cron, t_users, t_systemd_units and
+        t_file_hashes, and on a disk image that turned the cron table alone
+        into 104 seconds of re-parsing nothing for 604 rows: 40% of the run.
+        """
+        if not self.tri.processes and not getattr(self.tri, "_procs_parsed", False):
+            self.tri._procs_parsed = True
             self.tri._parse_process_tables()
         return self.tri.processes
 
@@ -15274,10 +16024,46 @@ class TableBuilder:
                           m.group(6).strip(), rel)
 
     def t_proc_environ(self):
-        t = self.table("PROC_ENVIRON", "Process environment variables",
+        """One row per process, and one per variable beside it.
+
+        PROC_ENVIRON is what an examiner opens, so it holds what an
+        examiner wants to read: a process and its whole environment, on
+        one line. Forty rows that have to be gathered back together by
+        eye before they mean anything is a table asking its reader to do
+        the work it exists to do.
+        The per-variable form is still built, because a search for a
+        tool name wants the value on its own rather than buried in a
+        line of them - that is what the hacktool sweep reads, and it is
+        pointed at PROC_ENVIRON_VARIABLES rather than here.
+        """
+        t = self.table("PROC_ENVIRON",
+                       "Process environments, one row per process",
+                       ["pid", "process", "user", "container", "variables",
+                        "ld_preload", "ld_library_path", "path", "pwd", "home",
+                        "shell", "environment", "source"], "Process",
+                       "/proc/<pid>/environ - LD_PRELOAD and friends "
+                       "live here. variables counts them; environment "
+                       "is every one of them in the order the file "
+                       "recorded, which is the order the kernel holds "
+                       "them, so a variable appended after the process "
+                       "started sits at the end. The variables worth reading "
+                       "on their own get their own column - LD_PRELOAD and "
+                       "LD_LIBRARY_PATH because they are how a library is "
+                       "forced into a process, PATH because a writable "
+                       "directory early in it is how a command is hijacked - "
+                       "and environment still holds all of them, in order, so "
+                       "nothing is only in a column. PROC_ENVIRON_VARIABLES "
+                       "carries the same data one row per variable, which is "
+                       "the shape to filter and sort on.")
+        v = self.table("PROC_ENVIRON_VARIABLES",
+                       "Process environment variables, one row each",
                        ["pid", "process", "user", "container", "variable",
                         "value", "source"], "Process",
-                       "/proc/<pid>/environ - LD_PRELOAD and friends live here.")
+                       "The same /proc/<pid>/environ files as "
+                       "PROC_ENVIRON, split so one variable is one row. "
+                       "Filter variable for LD_PRELOAD, sort by it, or "
+                       "search value for a path - none of which the "
+                       "rolled-up form can answer.")
         for rel in self.col.glob("live_response/process/proc/*/environ.txt"):
             parts = rel.split("/")
             try:
@@ -15286,11 +16072,29 @@ class TableBuilder:
                 continue
             i = self.proc_of(pid)
             raw = self.text(rel, "PROC_ENVIRON")
+            pairs = []
             for item in raw.replace("\x00", "\n").splitlines():
                 if "=" in item:
-                    k, v = item.split("=", 1)
-                    t.add(pid, i.get("name", ""), i.get("user", ""),
-                          i.get("container", ""), k.strip(), v.strip(), rel)
+                    k, val = item.split("=", 1)
+                    k, val = k.strip(), val.strip()
+                    pairs.append((k, val))
+                    v.add(pid, i.get("name", ""), i.get("user", ""),
+                          i.get("container", ""), k, val, rel)
+            if pairs:
+                # Read the named ones out rather than leaving an examiner to
+                # find LD_PRELOAD inside a hundred characters of one line.
+                # Last wins: a variable set twice in an environment is the
+                # later one, which is what the process actually sees.
+                seen = {}
+                for k, val in pairs:
+                    seen[k.upper()] = val
+                t.add(pid, i.get("name", ""), i.get("user", ""),
+                      i.get("container", ""), len(pairs),
+                      seen.get("LD_PRELOAD", ""),
+                      seen.get("LD_LIBRARY_PATH", ""),
+                      seen.get("PATH", ""), seen.get("PWD", ""),
+                      seen.get("HOME", ""), seen.get("SHELL", ""),
+                      " ".join("%s=%s" % kv for kv in pairs), rel)
 
     def t_proc_fds(self):
         t = self.table("PROC_FD", "Per-process file descriptors",
@@ -16334,8 +17138,16 @@ class TableBuilder:
             # driven off the section header rather than fixed offsets
             has_user = False
             unix_section = False
+            # State is optional - a DGRAM row has none - and is only ever a
+            # word. Left unconstrained it matched the I-Node instead, and the
+            # I-Node group then took the digits off the front of the next
+            # token: "unix 2 [ ] DGRAM 733323 602/systemd /run/..." recorded
+            # its inode as a state, the pid as an inode, and "/systemd
+            # /run/..." as the path. 38 rows of netstat_-anp.txt here.
+            # Letters for the state, and a whole token for the I-Node.
             unix_rx = re.compile(r"^(unix)\s+(\d+)\s+\[([^\]]*)\]\s+(\S+)"
-                                 r"(?:\s+(\S+))?\s+(\d+)\s*(.*)$")
+                                 r"(?:\s+([A-Z][A-Z_]*))?\s+(\d+)(?=\s|$)"
+                                 r"\s*(.*)$")
             for ln in lines:
                 s = ln.rstrip()
                 if not s.strip():
@@ -16387,8 +17199,13 @@ class TableBuilder:
                             pid = ""
                     elif tok.isdigit() and not inode:
                         inode = tok
-                la, lp = split_hostport(local)
-                pa, pp = split_hostport(peer)
+                # Split netstat's own way, and keep the port as printed: a
+                # service name where -n was not given, '*' for a wildcard.
+                # Both used to come back empty - '0.0.0.0:ssh' and ':::80'
+                # were recorded as listeners on no port at all, which is the
+                # sshd and the web server missing from the port column.
+                la, lp = _netstat_hostport(local)
+                pa, pp = _netstat_hostport(peer)
                 i = self.proc_of(pid)
                 # netstat -e prints the owner as a numeric uid; show the name
                 # when /etc/passwd resolves it, and fall back to the process's
@@ -17959,11 +18776,135 @@ class TableBuilder:
                 sess["state"] = "still open at the end of this log"
         return out
 
+    # `last` prints a session three ways and the collector runs all three.
+    # The plain and -i forms put the origin third and date the row
+    # 'Thu Jun 11 11:15' - no year, no seconds; -F dates it in full and moves
+    # the origin to the end of the line. `who` is a fourth shape again. One
+    # regex fitted to the plain form is not enough for any of that. On a real
+    # collection it read 5,584 rows into an undated 'Thu Jun 11 11:15' and
+    # dropped the other 5,663 - every -F row, every 'still logged in' row,
+    # every 'gone - no logout' row, every `who` row - into a split() fallback
+    # that put the rest of the line in the start column. 508 of the 11,756
+    # starts in that table were timestamps, every one of them from wtmp or
+    # PAM, and the newest start of all - the row that answers "when did
+    # anyone last sign in" - was the string 'tty1 Jun 8 08:56'.
+    _TS_FULL = r"\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d:\d\d(?:\s+\S+)?\s+\d{4}"
+    _TS_SHORT = r"\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d"
+    # 'reboot   system boot  ...' is the one terminal with a space in it
+    _TTY = r"(?:system boot|\S+)"
+    # Both the terminal and the origin are optional: `lastb` writes neither
+    # for an attempt that never reached one, and the row is still a record of
+    # someone trying.
+    LAST_F_RE = re.compile(r"^(\S+)\s+(?:(%s)\s+)?(%s)\s*(.*)$"
+                           % (_TTY, _TS_FULL))
+    LAST_RE = re.compile(r"^(\S+)\s+(?:(%s)\s+)?(\S*?)\s+(%s)\s*(.*)$"
+                         % (_TTY, _TS_SHORT))
+    LAST_FULL_RE = re.compile(_TS_FULL)
+    LAST_DUR_RE = re.compile(r"\(([^)]*)\)")
+    WHO_RE = re.compile(r"^(\S+)\s+(?:[-+?]\s+)?(\S+)\s+"
+                        r"(\d{4}-\d\d-\d\d\s+\d\d:\d\d(?::\d\d)?"
+                        r"|\w{3}\s+\d{1,2}\s+\d\d:\d\d(?::\d\d)?)"
+                        r"\s*(?:\((.*)\))?\s*$")
+    LAST_NOTE_RE = re.compile(r"\b(down|crash)\b", re.I)
+    _NO_SECONDS_RE = re.compile(r"\d\d:\d\d$")
+    WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+    def _last_ts(self, text):
+        """A `last`/`who` stamp -> UTC, whichever of its shapes this is.
+
+        -F prints 'Thu Jun 11 11:15:38 2026', which dates itself. The others
+        print 'Thu Jun 11 11:15' and 'Jun  8 08:56' - no year, and no seconds.
+        Dropping the weekday and adding ':00' makes them the syslog shape, and
+        syslog is what every other undated line in the case is read as: the
+        collection year is the anchor, and a month later than the collection
+        month is read as the year before. The minute is what was printed; the
+        second is not, and a stamp that claims one it was never given would
+        be a worse answer than the one it replaces.
+        """
+        s = " ".join((text or "").split())
+        if not s:
+            return ""
+        out = self.ts_utc(s)
+        if out:
+            return out
+        if s.split(" ")[0][:3].lower() in self.WEEKDAYS:
+            s = s.partition(" ")[2]
+        if self._NO_SECONDS_RE.search(s):
+            s += ":00"
+        return self.ts_utc(s)
+
+    @classmethod
+    def _last_host(cls, text):
+        """The origin off the end of a -F row, which is where -a puts it."""
+        t = cls.LAST_DUR_RE.sub(" ", text or "").strip()
+        if t.startswith("-"):
+            t = t[1:]
+        for note in ("still logged in", "gone - no logout", "still running"):
+            t = t.replace(note, " ")
+        f = t.split()
+        return f[-1] if f else ""
+
+    @classmethod
+    def _last_state(cls, tail, end):
+        """How the session ended, in the vocabulary wtmp and PAM already use.
+
+        The same fact reaches this table from three readers, and a session
+        `last` calls 'gone - no logout' is the one the wtmp reader calls 'no
+        logout record'. Two spellings of one state is a column that cannot be
+        grouped on.
+        """
+        low = (tail or "").lower()
+        if "still logged in" in low or "still running" in low:
+            return "still open at the end of this log"
+        if "no logout" in low:
+            return "no logout record"
+        m = cls.LAST_NOTE_RE.search(low)
+        if m:
+            return ("ended at shutdown" if m.group(1).lower() == "down"
+                    else "ended at reboot")
+        return "closed" if end else ""
+
+    def _last_row(self, s):
+        """One `last`/`lastb` line -> user, tty, host, start, end, secs, state."""
+        m = self.LAST_F_RE.match(s)
+        if m:
+            user, tty, start_raw, tail = m.groups()
+            start = self._last_ts(start_raw)
+            tty = tty or ""
+            em = self.LAST_FULL_RE.search(tail)
+            end = self._last_ts(em.group(0)) if em else ""
+            dur = self.LAST_DUR_RE.search(tail)
+            secs = (_duration_seconds(dur.group(1)) if dur
+                    else _span_seconds(start, end))
+            host = self._last_host(tail[em.end():] if em else tail)
+            return (user, tty, host, start, end, secs,
+                    self._last_state(tail, end))
+        m = self.LAST_RE.match(s)
+        if m:
+            user, tty, host, start_raw, tail = m.groups()
+            start = self._last_ts(start_raw)
+            tty, host = tty or "", host or ""
+            dur = self.LAST_DUR_RE.search(tail)
+            secs = _duration_seconds(dur.group(1)) if dur else ""
+            end = _end_after(start, secs)
+            return (user, tty, host, start, end, secs,
+                    self._last_state(tail, end))
+        return None
+
+    def _who_row(self, s):
+        """One `who` line. Everything it lists is signed in right now."""
+        m = self.WHO_RE.match(s)
+        if not m:
+            return None
+        user, tty, when, host = m.groups()
+        return (user, tty, host or "", self._last_ts(when), "", "",
+                "open when the collector ran")
+
     def t_logins(self):
         t = self.table("LOGINS", "Login history",
                        ["user", "service", "terminal", "source_host", "start",
-                        "end", "duration", "duration_seconds", "state", "pid",
-                        "source"], "Authentication",
+                        "end", "duration", "duration_seconds", "result",
+                        "state", "pid", "source"], "Authentication",
                        "Every login session, from all three records of one: "
                        "last/lastb/who where the collector ran them, wtmp "
                        "paired login-to-logout by terminal, and PAM's own "
@@ -17977,32 +18918,61 @@ class TableBuilder:
                        "therefore appear more than once, from different "
                        "sources; the source column says which, and two "
                        "records of one session disagreeing is itself worth "
-                       "seeing. Duration is measured from the pair rather "
-                       "than reported, state says how the session ended "
-                       "because 'no logout record' and 'still open' otherwise "
-                       "both look like a blank end time, and duration_seconds "
-                       "is the same number unformatted so the table sorts on "
-                       "it.")
-        rx = re.compile(r"^(\S+)\s+(\S+)\s+(\S*)\s{2,}(\w{3}\s+\w{3}\s+\d+\s+[\d:]+)"
-                        r"\s*-?\s*(\S+)?\s*(\(.*\))?\s*$")
+                       "seeing. Every start is UTC: `last` prints its rows "
+                       "three ways and only -F carries a year, so the "
+                       "year-less forms are dated against the collection year "
+                       "the way every other year-less line in the case is, to "
+                       "the minute that was printed. `who` lists what was "
+                       "open when the collector ran and says so in state. "
+                       "result is whether the login was granted, and "
+                       "it is a column because one of those sources is not a "
+                       "session at all: lastb prints the attempts that were "
+                       "refused in the same shape last prints the ones that "
+                       "were accepted, so without it the newest row here is "
+                       "the last attempt rather than the last sign-in. wtmp, "
+                       "who, last and PAM's 'session opened' are logins that "
+                       "were granted and are 'success'; lastb is 'failure'. "
+                       "Duration is measured from the pair rather than "
+                       "reported, state says how the session ended because "
+                       "'no logout record' and 'still open' otherwise both "
+                       "look like a blank end time - it is not an outcome, a "
+                       "session that closed and a login that was refused are "
+                       "not the same fact - and duration_seconds is the same "
+                       "number unformatted so the table sorts on it.")
         for rel in sorted(self.col.glob("live_response/system/last*.txt")) + \
                    sorted(self.col.glob("live_response/system/who*.txt")):
+            base = os.path.basename(rel)
+            low = base.lower()
+            # last*.txt is lastb.txt and lastlog.txt as well, and neither of
+            # them is what the glob was written for. lastb prints the logins
+            # that were refused, in the same columns last prints the ones that
+            # were granted - which is why this table needs an outcome, and why
+            # without one the newest row in a login history is a failed
+            # attempt. lastlog is not a list of sessions at all: it is one line
+            # per account, most of them '**Never logged in**', and the binary
+            # it reads is already parsed into LASTLOG.
+            if low.startswith("lastlog"):
+                continue
+            outcome = "failure" if low.startswith("lastb") else "success"
+            read = self._who_row if low.startswith("who") else self._last_row
             for ln in self.lines(rel, "LOGINS"):
                 s = ln.rstrip()
                 if not s.strip() or s.startswith("wtmp begins") or s.startswith("btmp begins"):
                     continue
-                m = rx.match(s)
-                if m:
-                    dur = (m.group(6) or "").strip("()")
-                    t.add(m.group(1), "", m.group(2), m.group(3), m.group(4),
-                          m.group(5) or "", dur, _duration_seconds(dur),
-                          "", "", os.path.basename(rel))
-                else:
-                    f = s.split()
-                    if f:
-                        t.add(f[0], "", f[1] if len(f) > 1 else "", "",
-                              " ".join(f[2:]), "", "", "", "", "",
-                              os.path.basename(rel))
+                row = read(s)
+                if not row:
+                    # A line that fits none of the shapes is not a session,
+                    # and the old fallback - first token is the user, the
+                    # rest is the start - is what put a terminal name in the
+                    # start column. Better to leave it out than to record it
+                    # as a login that happened at 'tty1 Jun 8 08:56'. Across
+                    # the nine last/lastb/who files a real collection writes,
+                    # nothing reaches here but the banner lines already
+                    # skipped above.
+                    continue
+                user, tty, host, start, end, secs, state = row
+                t.add(user, "", tty, host, start, end,
+                      _human_duration(secs), secs, outcome, state, "", base)
 
         # And the sessions wtmp itself describes. On a disk image this is the
         # whole table; anywhere else it is the cross-check, measured from the
@@ -18018,15 +18988,15 @@ class TableBuilder:
                   sess["host"] or sess["ip"],
                   start.strftime("%Y-%m-%d %H:%M:%S") if start else "",
                   end.strftime("%Y-%m-%d %H:%M:%S") if end else "",
-                  _human_duration(secs), secs, sess["state"], sess["pid"],
-                  sess["source"])
+                  _human_duration(secs), secs, "success", sess["state"],
+                  sess["pid"], sess["source"])
 
         # and what PAM recorded, which covers the sessions wtmp never sees
         for sess in self._auth_sessions():
             secs = _span_seconds(sess["start"], sess["end"])
             t.add(sess["user"], sess["service"], sess["line"], sess["host"],
                   sess["start"], sess["end"], _human_duration(secs), secs,
-                  sess["state"], sess["pid"], sess["source"])
+                  "success", sess["state"], sess["pid"], sess["source"])
 
     # message shape -> (event label, regex whose named groups fill user/ip/port)
     # (event label, regex, class) - class 'priv' feeds PRIVILEGE_ACTIVITY.
@@ -19082,6 +20052,49 @@ class TableBuilder:
                   target, f[3], f[4], self.uid_name(f[4]), f[5],
                   self.gid_name(f[5]), f[6],
                   ts(f[7]), ts(f[8]), ts(f[9]), ts(f[10]))
+
+    def t_timestomp(self):
+        """Every entry that failed a timestamp rule, with all four clocks.
+
+        A derived table, like FINDINGS and TIMELINE: the rules ran on the
+        bodyfile pass the analyzer already makes, and re-reading a few hundred
+        thousand inode records to render them again would be a second pass for
+        nothing.
+
+        The finding says how many and names thirty. This is the rest of them,
+        sortable by rule and filterable by path, which is the difference
+        between "eleven files are backdated" and knowing which eleven.
+        """
+        rows = self.tri.timestomp["rows"]
+        if not any(rows.get(r) for r in self.tri.TIMESTOMP_ORDER):
+            return
+        t = self.table("TIMESTOMP", "Timestamp anomalies",
+                       ["rule", "severity", "path", "directory", "basename",
+                        "mode", "uid", "owner", "size", "inode",
+                        "timestamp_utc", "atime_utc", "mtime_utc", "ctime_utc",
+                        "crtime_utc", "finding"],
+                       "Filesystem",
+                       "One row per file whose own four timestamps disagree "
+                       "with each other, and the rule that says how. "
+                       "timestamp_utc repeats ctime deliberately - it is the "
+                       "only one of the four the kernel will not let userspace "
+                       "write, so it is the clock this row is placed on: the "
+                       "console's time window and the activity chart then "
+                       "answer for the moment the metadata actually changed "
+                       "rather than the moment the file claims. Rows are "
+                       "capped at %d per rule; the count on the finding is "
+                       "exact either way."
+                       % Triage.TIMESTOMP_ROW_CAP)
+        for rule in self.tri.TIMESTOMP_ORDER:
+            sev, title = self.tri.TIMESTOMP_RULES[rule][0:2]
+            for (path, mode, uid, size, inode,
+                 atime, mtime, ctime, crtime, note) in rows.get(rule) or []:
+                t.add(rule, sev, path, os.path.dirname(path),
+                      os.path.basename(path), mode, uid,
+                      self.uid_name(uid) or "", size, inode,
+                      _ts_text(ctime), _ts_text(atime), _ts_text(mtime),
+                      _ts_text(ctime), _ts_text(crtime),
+                      "%s - %s" % (title, note))
 
     def t_file_hashes(self):
         t = self.table("FILE_HASHES", "Executable hashes",
@@ -21257,7 +22270,43 @@ class TableBuilder:
         ("SYSTEMD_UNITS", ("systemd", "service"), ""),
         ("KERNEL_MODULES", ("kernel", "modules"), ""),
         ("SOCKETS", ("network_connection", "network"), ""),
+        # Opt-in below this line - see SIGMA_OPT_IN_STREAMS. These are the
+        # state-of-the-host tables rather than the what-happened tables: what
+        # is on the filesystem, in the account files, in the configuration.
+        # A disk image is mostly these, and until they were routable no rule
+        # could be written for the majority of what a disk investigation
+        # actually finds.
+        ("BODYFILE", ("file_event", "file", "filesystem"), ""),
+        ("FILE_INVENTORY", ("file_event", "file", "filesystem"), ""),
+        ("DELETED_FILES", ("file_event", "file", "file_delete"), ""),
+        ("SUID_SGID", ("file_event", "file", "filesystem"), ""),
+        ("HIDDEN_PATHS", ("file_event", "file", "filesystem"), ""),
+        ("SENSITIVE_FILES", ("file_event", "file", "filesystem"), ""),
+        ("OPEN_FILES", ("file_event", "file"), ""),
+        ("SSH", ("ssh_config", "authorized_keys"), ""),
+        ("SUDOERS", ("sudoers_file", "sudoers"), ""),
+        ("USERS", ("user_account", "account", "passwd"), ""),
+        ("GROUPS", ("user_account", "group", "account"), ""),
+        ("ETC_CONFIGS", ("etc_config", "config"), ""),
+        ("WEB_CONFIG", ("web_config",), ""),
+        ("INIT_AND_PROFILE", ("init", "profile", "startup_script"), ""),
+        ("EDITOR_HISTORY", ("editor_history",), ""),
+        ("PACKAGES", ("package", "software"), ""),
+        ("PACKAGE_HISTORY", ("package", "software"), "timestamp_utc"),
     )
+
+    # Streams a rule reaches only by naming them. A bare 'product: linux' rule
+    # with no service or category runs against every stream, which is what it
+    # means - but BODYFILE and FILE_INVENTORY are a quarter of a million rows
+    # of path names on a disk image, and a keyword rule pointed at them both
+    # costs minutes and reports a filename as though it were an event. The
+    # what-happened tables stay open to a bare rule; these need asking for.
+    SIGMA_OPT_IN_STREAMS = frozenset((
+        "BODYFILE", "FILE_INVENTORY", "DELETED_FILES", "SUID_SGID",
+        "HIDDEN_PATHS", "SENSITIVE_FILES", "OPEN_FILES", "SSH", "SUDOERS",
+        "USERS", "GROUPS", "ETC_CONFIGS", "WEB_CONFIG", "INIT_AND_PROFILE",
+        "EDITOR_HISTORY", "PACKAGES", "PACKAGE_HISTORY",
+    ))
 
     # VAR_LOG and JOURNAL are every log on the host in one table, so routing a
     # rule to them by logsource is not enough: 'service: cron' means the cron
@@ -21273,11 +22322,50 @@ class TableBuilder:
     # firing on a request that returned 200 is a breach; the same request
     # returning 404 is a scanner being ignored, and the row read identically.
     SIGMA_SUMMARY_KEYS = {
-        "WEB_LOG": ("status", "method", "resource", "client_ip", "user_agent"),
+        # message last of the leaders but present: on an error row it is
+        # the whole of the evidence - the request body mod_dumpio wrote,
+        # or a CGI process's stderr - and it is the 18th column, so
+        # without naming it here the field cap dropped it every time.
+        "WEB_LOG": ("status", "method", "resource", "client_ip",
+                    "user_agent", "message"),
     }
 
+    @staticmethod
+    def _evidence(text, cap, anchors):
+        """`cap` characters of `text`, centred on what the rule fired on.
+
+        A long log line carries its boilerplate at the front. Apache's
+        mod_dumpio writes seventy characters of client address and hook name
+        before the request body starts, so the head of the line is the same
+        for every row and the interesting part - the command someone posted -
+        is past the cut. Measured on this collection: of the 303 error rows
+        naming a downloader, 94% have it beyond an 80-character head, the
+        median sits at 93 and the worst at 824. Those rows all read
+        'mod_dumpio.c(103): [client ...] mod_dumpio:  dumpio_in (data-HEAP)'
+        and nothing else, which is evidence of nothing.
+
+        The anchors are the rule's own gate literals - the text it insists a
+        row contains - so the window lands on the reason this row is in the
+        table. When none of them is in this particular field, or the field is
+        short enough anyway, the value is returned exactly as before.
+        """
+        if len(text) <= cap:
+            return text
+        low = text.lower()
+        at = -1
+        for a in anchors or ():
+            i = low.find(a)
+            if i >= 0 and (at < 0 or i < at):
+                at = i
+        if at < 0:
+            return trunc(text, cap)
+        start = max(0, at - cap // 4)      # a little context before the match
+        end = start + cap
+        return ("..." if start else "") + text[start:end] + (
+            "..." if end < len(text) else "")
+
     @classmethod
-    def _sigma_summary(cls, tname, d, limit=8):
+    def _sigma_summary(cls, tname, d, limit=8, anchors=()):
         """One matched row as 'key=value; ...' for SIGMA_MATCHES.matched_row.
 
         Fields named for this table lead and are never lost to the cap; the
@@ -21288,7 +22376,12 @@ class TableBuilder:
                 if d.get(k) not in (None, "")]
         rest = [k for k in d if k not in lead]
         keys = (lead + rest)[:max(limit, len(lead))]
-        return "; ".join("%s=%s" % (k, trunc(str(d[k]), 80)) for k in keys)
+        # _s, not str: a datetime rendered with str() carries '+00:00', which
+        # is not how the same value appears in the table this row came from -
+        # so the summary quoted a timestamp that matched nothing when it was
+        # read back to find the row it describes.
+        return "; ".join("%s=%s" % (k, cls._evidence(_s(d[k]), 80, anchors))
+                         for k in keys)
     SIGMA_SERVICE_HINTS = {
         "cron": ("cron", "anacron", "crond"),
         "sshd": ("sshd", "ssh"),
@@ -21327,7 +22420,7 @@ class TableBuilder:
         ("EDITOR_HISTORY", ("value",), "command"),
         ("PROCESS_MASTER", ("exe", "args", "comm"), "command"),
         ("PROCESSES", ("exe", "args"), "command"),
-        ("PROC_ENVIRON", ("value",), "command"),
+        ("PROC_ENVIRON_VARIABLES", ("value",), "command"),
         ("CRON", ("command",), "command"),
         ("SYSTEMD_UNITS", ("exec_start", "exec_start_pre"), "command"),
         ("INIT_AND_PROFILE", ("text",), "command"),
@@ -21698,7 +22791,8 @@ class TableBuilder:
             # rule to match a Linux ps row through the field synonyms.
             product_ok = rule.product.lower() in ("", "linux", "unix")
             streams = [(tn, ts) for tn, svc, ts in self.SIGMA_STREAMS
-                       if (not want or want in svc)
+                       if (want in svc if tn in self.SIGMA_OPT_IN_STREAMS
+                           else (not want or want in svc))
                        and by_name.get(tn) is not None and len(by_name[tn])]
             usable = []
             for tn, ts in streams if product_ok else []:
@@ -21738,19 +22832,36 @@ class TableBuilder:
             #   [rule, ts index, service filter, kept samples, hits, stopped,
             #    span]
             #
-            # A table-wide keyword prefilter was tried here and removed: one
-            # alternation over the 49 keyword patterns of a table's gated rules
-            # measured 153us per row against 101us for running those 49
-            # searches separately, for identical results. Python's engine
-            # optimises a small pattern with a literal prefix and cannot do
-            # that for a 10KB alternation full of .* branches, so combining
-            # them past a handful inverts the win. Alternation helps for many
-            # short literals (the hacktool sweep); it hurts here.
+            # A table-wide prefilter was tried here once and removed, over the
+            # rules' keyword *patterns* - a 10KB alternation full of '.*'
+            # branches, which measured slower than running the searches
+            # separately. What is built below is a different thing and wins:
+            # an alternation over the gate *literals*, which are plain text
+            # with no wildcards left in them, factored into a trie so a shared
+            # prefix is walked once. It answers "could any gated rule match
+            # this row" in one C call, where the loop underneath asks the same
+            # question once per rule in Python - and on this collection 71% of
+            # rows contain no gate literal at all, so that one call replaces
+            # 233 of them. Measured 310us -> 105us per row, identical
+            # survivors. The rows it does not settle fall through to exactly
+            # the loop that was there before, so a match cannot be lost: the
+            # scan only ever skips rows where no gated rule had a literal to
+            # find.
             prepared = [[rule, cols.index(ts_col) if ts_col in cols else -1,
                          (self._service_filter(rule.service or rule.category)
                           if tname in self.SIGMA_MIXED_STREAMS else None),
-                         [], 0, False, ["", ""]]
+                         [], 0, False, ["", ""], getattr(rule, "gate", None)]
                         for rule, ts_col in entries]
+            gated = [e for e in prepared if e[7]]
+            plain = [e for e in prepared if not e[7]]
+            # Only where it pays for itself: building and compiling the pattern
+            # costs tens of milliseconds, which a forty-row table would never
+            # earn back.
+            pre = None
+            if len(gated) >= 8 and len(tb) >= 5000:
+                pre = re.compile(_trie_alt(sorted({l for e in gated
+                                                   for l in e[7]})))
+            stopped_n = 0
             for rn, row in enumerate(tb.iter_rows()):
                 if not rn & 0x3FFF:            # every 16k rows, not every row
                     sig_prog.step("%s (%d rule%s)"
@@ -21759,14 +22870,30 @@ class TableBuilder:
                                   n=seen_rows + rn)
                 d = Row((cols[i], row[i]) for i in range(min(ncol, len(row)))
                         if row[i] not in (None, ""))
-                live = False
-                for e in prepared:
+                # Nothing a gated rule insists on is anywhere in this row,
+                # so only the ungated ones are worth walking.
+                batch = prepared
+                if pre is not None and pre.search(d.hay_lower()) is None:
+                    batch = plain
+                for e in batch:
                     if e[5]:
                         continue
-                    live = True
                     rule, ts_i, keep = e[0], e[1], e[2]
                     if keep is not None and not keep(d):
                         continue
+                    # The literal gate: one or two str.__contains__ calls
+                    # against the row's own text, answering "could this rule
+                    # match at all" before a single regex is compiled into
+                    # action. A rule whose required literal is absent cannot
+                    # match, so skipping it changes nothing but the clock.
+                    gate = e[7]
+                    if gate:
+                        hay = d.hay_lower()
+                        for lit in gate:
+                            if lit in hay:
+                                break
+                        else:
+                            continue
                     if not rule.test(d):
                         continue
                     e[4] += 1
@@ -21779,13 +22906,14 @@ class TableBuilder:
                     span_add(e[6], _ts_text(when))
                     if e[4] > 200:          # one noisy rule cannot flood
                         e[5] = True
+                        stopped_n += 1
                         continue
-                    summary = self._sigma_summary(tname, d)
+                    summary = self._sigma_summary(tname, d, anchors=gate)
                     e[3].append((when, summary))
-                if not live:                # every rule here has had its fill
+                if stopped_n >= len(prepared):   # all of them have had their fill
                     break
             seen_rows += len(tb)
-            for rule, _ts_i, _keep, kept, hits, stopped, span in prepared:
+            for rule, _ts_i, _keep, kept, hits, stopped, span, _gate in prepared:
                 for when, summary in kept:
                     t.add(rule.title, rule.severity, rule.level, tname,
                           hits, span[0], span[1], when,
@@ -22791,7 +23919,7 @@ class TableBuilder:
         "t_suid", "t_getcap", "t_mac_policy",
         "t_writable", "t_hidden_files", "t_unknown_owner",
         "t_socket_files",
-        "t_dev_files", "t_bodyfile", "t_deleted_files",
+        "t_dev_files", "t_bodyfile", "t_timestomp", "t_deleted_files",
         "t_file_hashes",
         "t_user_artifacts",
         "t_packages", "t_package_logs", "t_chkrootkit",
@@ -22874,7 +24002,7 @@ class TableBuilder:
         "t_editor_history", "t_ld_preload",
         "t_suid", "t_getcap", "t_mac_policy", "t_writable", "t_hidden_files",
         "t_unknown_owner", "t_socket_files", "t_dev_files", "t_bodyfile",
-        "t_deleted_files", "t_disk_layout", "t_sensitive_files",
+        "t_timestomp", "t_deleted_files", "t_disk_layout", "t_sensitive_files",
         "t_file_hashes", "t_user_artifacts", "t_package_logs",
         "t_journal", "t_audit_log", "t_login_records", "t_wtmpdb", "t_lastlog",
         "t_web_logs", "t_web_config", "t_samba_logs", "t_firewall_log",
@@ -23031,9 +24159,141 @@ ATTACK_ORDER = [
 ]
 
 APP_CSS = """
+/* Two themes, one set of names. Every colour in this page is a token, so a
+   theme is a block that redefines the tokens rather than a second stylesheet
+   to keep in step with the first. The examiner's choice is remembered because
+   a console that reverts to dark on every reload is one they stop switching. */
+html[data-theme="light"]{--bg:#f6f8fa;--panel:#ffffff;--panel2:#eef1f5;
+--line:#d3dae2;--fg:#1c2330;--dim:#5b6775;--accent:#0969da;--gold:#9a6700;
+--edge:#5b6775;--edgehot:#0969da;
+--CRITICAL:#cf222e;--HIGH:#bc4c00;--MEDIUM:#9a6700;--LOW:#0a7c8c;--INFO:#5b6775;
+--key:#cf222e;--interesting:#9a6700;--suspect:#bc4c00;--benign:#1a7f37;--sunk:#f6f8fa;--selbg:#ddeaff;--onbg:#ddeaff;--zebra:#f2f5f8;--hover:#e7edf4;--shadow:rgba(31,45,61,.16)}
+.themebtn{border:1px solid var(--line);background:var(--panel2);color:var(--fg);
+border-radius:4px;padding:2px 9px;cursor:pointer;font-size:12px}
 :root{--bg:#0f1419;--panel:#161b22;--panel2:#1c2330;--line:#2b3440;--fg:#d7dee7;
 --dim:#8b98a8;--accent:#58a6ff;--gold:#f5d067;
---CRITICAL:#ff5f56;--HIGH:#ff9f43;--MEDIUM:#ffd93d;--LOW:#5ad1e6;--INFO:#8b98a8}
+--CRITICAL:#ff5f56;--HIGH:#ff9f43;--MEDIUM:#ffd93d;--LOW:#5ad1e6;--INFO:#8b98a8;--key:#ff5f56;--interesting:#f5d067;--suspect:#ff9f43;--benign:#3fb950;--edge:#7f90a6;--edgehot:#8fc7ff;--sunk:#0d1117;--selbg:#233043;--onbg:#10243d;--zebra:#12171e;--hover:#1a212b;--shadow:rgba(0,0,0,.45)}
+/* A marked row is coloured along its leading edge rather than washed
+   through: the severity colours already carry meaning in these grids,
+   and tinting the whole row would put the examiner's opinion and the
+   tool's finding in the same visual channel. */
+tr.mk{box-shadow:inset 3px 0 0 0 var(--mkc)}
+tr.mk td:first-child{background:color-mix(in srgb,var(--mkc) 12%,transparent)}
+tr.mk-key{--mkc:var(--key)}tr.mk-interesting{--mkc:var(--interesting)}
+tr.mk-suspect{--mkc:var(--suspect)}tr.mk-benign{--mkc:var(--benign);opacity:.55}
+.ntc{width:62px;text-align:center;cursor:pointer;user-select:none}
+.ntc .g{opacity:.16;font-size:12px}.ntc:hover .g{opacity:.8}
+.ntc .hasnote{color:var(--accent);font-size:12px}
+tr.mk .mkc .g{opacity:1;color:var(--mkc)}
+/* the note editor, opened in place under its row */
+tr.noterow td{background:var(--panel2);padding:8px 10px}
+tr.noterow textarea{width:100%;min-height:52px;background:var(--panel);
+border:1px solid var(--line);color:var(--fg);border-radius:4px;
+padding:6px 8px;font:12px/1.4 inherit}
+.noterow .hint{color:var(--dim);font-size:11px;margin-top:4px}
+tr.pivot,tbody.pivot tr[data-r]{cursor:pointer}
+tr.pivot:hover>td,tbody.pivot tr[data-r]:hover>td{background:var(--panel2)}
+/* Under the row it belongs to, and outside the table's layout. Reading a
+   match means reading it where it sits, so the panel is anchored to the row
+   that was clicked - but it is positioned rather than inserted, so the grid
+   never reflows around it. Inserted as a row, a real click cost 283ms of
+   layout in a grid of a thousand; positioned, the same click costs half a
+   millisecond and the table is not touched at all. */
+#pvpane{position:absolute;z-index:6;
+background:var(--panel2);border:1px solid var(--accent);border-radius:5px;
+box-shadow:0 8px 22px rgba(0,0,0,.34);
+padding:9px 12px;max-height:46vh;overflow:auto;display:none}
+#pvpane.on{display:block}
+#pvpane .x{float:right;cursor:pointer;color:var(--dim);font-size:15px;
+line-height:1;padding:0 3px}
+#pvpane .x:hover{color:var(--fg)}
+.pvbody{overflow:auto}
+#askq{width:100%;min-height:60px;background:var(--panel);color:var(--fg);
+border:1px solid var(--line);border-radius:5px;padding:8px 10px;
+font:13px/1.5 inherit;resize:vertical}
+.askrow{display:flex;gap:8px;align-items:center;margin:9px 0;flex-wrap:wrap}
+.askans{background:var(--panel2);border:1px solid var(--line);border-radius:5px;
+padding:11px 13px;margin-top:11px;white-space:pre-wrap;line-height:1.55}
+.askstep{font-size:11.5px;color:var(--dim);padding:2px 0;
+border-left:2px solid var(--line);padding-left:9px;margin:3px 0}
+.askstep b{color:var(--accent);font-weight:600}
+.asksql{color:var(--fg);white-space:pre-wrap;word-break:break-word}
+.skills{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px}
+.skill{background:var(--panel);border:1px solid var(--line);border-radius:5px;
+padding:5px 9px;font-size:12px;color:var(--fg);cursor:pointer;text-align:left}
+.skill:hover{border-color:var(--accent);color:var(--accent)}
+.skill.thin{opacity:.55}
+.skill b{font-weight:600}
+.skill i{font-style:normal;color:var(--dim);font-size:11px}
+.askbad{background:rgba(255,95,86,.10);border:1px solid #ff5f56;
+border-radius:5px;padding:9px 12px;margin-top:11px;font-size:12.5px;
+line-height:1.5;color:var(--fg)}
+.askbad b{color:#ff5f56}
+.askturn{border-left:2px solid var(--line);padding-left:11px;margin:14px 0}
+.askq{color:var(--dim);font-size:12px;margin-bottom:6px}
+.askq b{color:var(--fg);font-weight:600}
+.evkv{width:100%;border-collapse:collapse;font-size:11.5px}
+.evkv th{text-align:left;color:var(--dim);font-weight:normal;width:132px;
+padding:1px 10px 1px 0;white-space:nowrap;vertical-align:top}
+.evkv td{padding:1px 0;color:var(--fg);vertical-align:top;
+word-break:break-all;white-space:pre-wrap;overflow-wrap:anywhere}
+.evsrc{color:var(--accent);font-size:11px;margin:2px 0 4px}
+.evgo{margin-top:9px;display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.mkc{width:104px;text-align:center;cursor:pointer;user-select:none}
+.mkc .g{opacity:.18;font-size:13px}tr.mk .mkc .g{opacity:1;color:var(--mkc)}
+.mkc:hover .g{opacity:.75}
+.mkbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:8px 0}
+.mkbtn{border:1px solid var(--line);background:var(--panel2);color:var(--fg);
+border-radius:4px;padding:3px 9px;cursor:pointer;font-size:12px}
+.mkbtn.on{border-color:var(--mkc,var(--accent));color:var(--mkc,var(--accent))}
+.lbl-chip{background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+padding:1px 8px;font-size:11px;color:var(--dim);margin-right:4px;cursor:pointer}
+.lbl-chip.on{color:var(--accent);border-color:var(--accent)}
+.score{display:inline-block;min-width:34px;text-align:right;font-variant-numeric:tabular-nums}
+.sbar{display:inline-block;height:7px;border-radius:3px;background:var(--accent);
+vertical-align:middle;margin-left:6px}
+.gt{width:100%;overflow-x:auto;background:var(--panel);border:1px solid var(--line);
+border-radius:6px;padding:10px}
+.gt svg{display:block}
+.gt .lane{fill:var(--dim);font-size:10px}
+.gt rect.ev{cursor:pointer}
+.casebar{display:flex;gap:8px;align-items:center;margin:0 0 10px}
+.casebar input{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+border-radius:4px;padding:4px 8px}
+.mkcard{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+padding:10px 12px;margin:0 0 12px}
+.mkcard.mk{box-shadow:inset 4px 0 0 0 var(--mkc)}
+.mkhead{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.mkstate{font-weight:600;color:var(--mkc,var(--fg))}
+.grow{flex:1}
+#hdr th.mkc,#hdr th.ntc{cursor:default;color:var(--dim)}
+table.rkv{width:100%;border-collapse:collapse;margin:4px 0 8px}
+table.rkv th{text-align:left;color:var(--dim);font-weight:500;width:150px;
+vertical-align:top;padding:2px 8px 2px 0;white-space:nowrap;font-size:12px}
+table.rkv td{padding:2px 0;vertical-align:top;word-break:break-word;
+font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;font-size:12px}
+.lbl-in{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+border-radius:4px;padding:3px 8px;font-size:12px;min-width:240px}
+.mkmeta{margin:6px 0;color:var(--dim);font-size:12px}
+/* the panel grid: compact cards that answer one question each */
+.panels{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+gap:12px;margin:10px 0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+padding:10px 12px;min-height:90px}
+.panel h4{margin:0 0 8px;font-size:12px;color:var(--dim);font-weight:600;
+text-transform:uppercase;letter-spacing:.04em}
+.panel .big{font-size:26px;font-weight:600;line-height:1.1}
+.panel .sub{color:var(--dim);font-size:12px;margin-top:2px}
+.panel ol{margin:0;padding-left:18px;font-size:12px}
+.panel li{margin:2px 0;word-break:break-all}
+.panel .rowline{display:flex;justify-content:space-between;gap:8px;
+font-size:12px;padding:2px 0;border-bottom:1px solid var(--line)}
+.panel .rowline:last-child{border-bottom:0}
+.panel .v{color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+.pbar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:6px}
+.pbar i{display:block;height:100%;background:var(--accent)}
+.note-in{width:100%;background:var(--panel2);border:1px solid var(--line);
+color:var(--fg);border-radius:4px;padding:6px 8px;font:12px/1.4 inherit}
 *{box-sizing:border-box}
 body{margin:0;font:13px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
 background:var(--bg);color:var(--fg);overflow:hidden}
@@ -23061,6 +24321,15 @@ font-variant-numeric:tabular-nums;user-select:none}
 .chip.on.LOW{color:var(--LOW);border-color:var(--LOW)}
 .chip.on.INFO{color:var(--INFO);border-color:var(--INFO)}
 .chip.off{opacity:.42;text-decoration:line-through}
+/* The collection picker, for an export merged from several images. Beside
+   the window and the chips because it is the same kind of control: one choice
+   that narrows every grid at once, rather than a per-table box. */
+.hf{display:flex;align-items:center;gap:5px;flex:0 0 auto}
+.hf .lb{color:var(--dim);font-size:10px;letter-spacing:.6px;text-transform:uppercase}
+.hf select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+border-radius:4px;padding:2px 6px;font:11px/1.6 inherit;outline:none;max-width:190px}
+.hf select:focus{border-color:var(--accent)}
+.hf select.on{border-color:var(--gold);color:var(--gold)}
 /* the time window, beside the chips: the other filter that bites everywhere */
 .tf{display:flex;align-items:center;gap:4px;flex:0 0 auto}
 .tf input{width:104px;background:var(--panel2);color:var(--fg);border:1px solid var(--line);
@@ -23077,7 +24346,7 @@ border-radius:4px;padding:2px 6px;font:11px/1.6 inherit;outline:none}
    picking one. A collection is mostly empty days and three loud ones. */
 .cal{display:none;position:fixed;z-index:40;background:var(--panel);
 border:1px solid var(--line);border-radius:8px;padding:10px;width:246px;
-box-shadow:0 10px 30px rgba(0,0,0,.45)}
+box-shadow:0 10px 30px var(--shadow)}
 .cal.open{display:block}
 .cal .hd{display:flex;align-items:center;justify-content:space-between;
 margin-bottom:8px}
@@ -23121,7 +24390,7 @@ nav a.active{background:var(--panel2);border-left-color:var(--gold);color:var(--
 nav a .n{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
 nav .foot{margin-top:auto;padding:10px 14px;color:var(--dim);font-size:10.5px;
 border-top:1px solid var(--line)}
-main{flex:1;overflow:auto;padding:16px 18px;min-width:0}
+main{flex:1;overflow:auto;padding:16px 18px;min-width:0;position:relative}
 h2{margin:0 0 12px;font-size:14px;font-weight:600;letter-spacing:.3px}
 h3{margin:22px 0 9px;font-size:12px;font-weight:600;color:var(--dim);
 text-transform:uppercase;letter-spacing:1px}
@@ -23160,7 +24429,7 @@ padding:4px 2px 0}
 background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px}
 .heat .d{color:var(--dim);font-size:10px;line-height:15px;text-align:right;
 padding-right:5px}
-.heat .c{height:15px;border-radius:2px;background:#1a212b}
+.heat .c{height:15px;border-radius:2px;background:var(--hover)}
 .heat .c.on{cursor:default}
 .heat .c.on:hover{outline:1px solid var(--gold);outline-offset:1px}
 .heat .hx{grid-column:2/26;display:flex;justify-content:space-between;
@@ -23179,7 +24448,7 @@ font-size:17px;line-height:1}
 .detail .x:hover{color:var(--fg)}
 .pills{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 9px}
 .pills:empty{display:none}
-.tbl tbody tr.sel td{background:#233043;box-shadow:inset 3px 0 0 var(--gold)}
+.tbl tbody tr.sel td{background:var(--selbg);box-shadow:inset 3px 0 0 var(--gold)}
 .detail h4{margin:0 0 6px;font-size:14px;font-weight:600}
 .detail .d{color:var(--dim);margin-bottom:12px}
 .detail pre{background:var(--bg);border:1px solid var(--line);border-radius:5px;
@@ -23248,7 +24517,7 @@ nav a.tbl span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:no
    right for an artifact grid and wrong for those. */
 .desc{color:var(--dim);margin:0 0 12px;font-size:12px}
 .controls{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
-.badge{background:#0d1117;border:1px solid var(--line);border-radius:11px;padding:2px 9px;
+.badge{background:var(--sunk);border:1px solid var(--line);border-radius:11px;padding:2px 9px;
 color:var(--dim);font-size:11px;white-space:nowrap}
 .warn{color:var(--HIGH)}
 /* fixed layout so the <colgroup> widths computed from the data are what the
@@ -23264,7 +24533,7 @@ overflow-wrap:anywhere}
 .tbl td .c{white-space:pre-wrap;max-height:8.5em;overflow-y:auto}
 .tbl td.nw .c{white-space:nowrap;overflow-x:hidden;text-overflow:ellipsis}
 .tbl td.nw:hover .c{overflow-x:auto;text-overflow:clip}
-.tbl th{background:#1c2330;position:sticky;top:0;z-index:4;cursor:pointer;user-select:none;
+.tbl th{background:var(--panel2);position:sticky;top:0;z-index:4;cursor:pointer;user-select:none;
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tbl th:hover{color:var(--accent)}
 /* the per-column filter row sits directly under the labels; its offset is set
@@ -23272,15 +24541,15 @@ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
    glued together when the body scrolls under them */
 .tbl tr.f th{background:var(--panel);padding:3px 4px;cursor:auto;z-index:3}
 .tbl tr.f th:hover{color:inherit}
-.tbl tr.f input{width:100%;background:#0d1117;border:1px solid var(--line);color:var(--fg);
+.tbl tr.f input{width:100%;background:var(--sunk);border:1px solid var(--line);color:var(--fg);
 border-radius:3px;padding:2px 5px;font:11px/1.5 inherit}
 .tbl tr.f input:focus{outline:none;border-color:var(--accent)}
-.tbl tr.f input.on{border-color:var(--accent);background:#10243d;color:#fff}
-button.clr{background:#0d1117;border:1px solid var(--line);color:var(--dim);
+.tbl tr.f input.on{border-color:var(--accent);background:var(--onbg);color:var(--fg)}
+button.clr{background:var(--sunk);border:1px solid var(--line);color:var(--dim);
 border-radius:11px;padding:2px 9px;font-size:11px;cursor:pointer}
 button.clr:hover{color:var(--accent);border-color:var(--accent)}
-.tbl tbody tr:nth-child(even){background:#12171e}
-.tbl tbody tr:hover{background:#1a212b}
+.tbl tbody tr:nth-child(even){background:var(--zebra)}
+.tbl tbody tr:hover{background:var(--hover)}
 .tbl td.num{text-align:right;font-variant-numeric:tabular-nums}
 .sev-CRITICAL{color:var(--CRITICAL);font-weight:600}
 .sev-HIGH{color:var(--HIGH);font-weight:600}
@@ -23316,9 +24585,25 @@ function ensure(names){
  var want=[];
  (names||[]).forEach(function(n){
   var t=TB[n];
-  if(!t||t.rows!==undefined||!PACK[n])return;
+  if(!t||t.rows!==undefined)return;
+  if(!PACK[n]&&!D.served)return;
   if(want.indexOf(n)<0)want.push(n);});
  if(!want.length)return Promise.resolve();
+ /* Served, the rows live in the database rather than in this page. Asked for
+    when a table is opened and not before, which is what lets the served
+    console start in a moment instead of carrying the whole export. */
+ if(D.served){
+  return Promise.all(want.map(function(n){
+   if(!PENDING[n]){
+    PENDING[n]=fetch('/api/rows?table='+encodeURIComponent(n))
+     .then(function(r){return r.json();})
+     .then(function(j){
+      TB[n].rows=(j&&j.rows)||[];
+      if(j&&j.columns&&j.columns.length)TB[n].columns=j.columns;
+     },function(err){
+      TB[n].rows=[];TB[n].decode_error=String(err&&err.message||err);});}
+   return PENDING[n];}));
+ }
  if(!GZ_OK){
   want.forEach(function(n){TB[n].rows=[];TB[n].no_gzip=true;});
   return Promise.resolve();
@@ -23347,12 +24632,1324 @@ function needs(){
 /* The offensive-tool grid the overview reads and the nav pins. Named once:
    the console asks for it in four places and a typo would fail silently. */
 var HT='HACKTOOL_HITS';
-var st={view:null,sev:{},cat:'',tech:'',sel:null,table:null,tq:'',gq:'',
+/* The cross-host tables, strongest claim first. A shared indicator or a shared
+   key says these collections are one incident; a shared technique says they
+   were worked the same way, which is weaker and much more often innocent. */
+var CROSS=['CROSS_SESSIONS','CROSS_COMMANDS','CROSS_IOCS','CROSS_HASHES',
+           'CROSS_KEYS','CROSS_ACCOUNTS','CROSS_PERSISTENCE','CROSS_FINDINGS',
+           'CROSS_TECHNIQUES','HOSTS'];
+function crossTables(){
+ return CROSS.filter(function(n){return TB[n]&&TB[n].row_count;});
+}
+function haveCross(){return crossTables().length>0;}
+var st={view:null,sev:{},cat:'',tech:'',sel:null,table:null,tq:'',gq:'',host:'',
         t0:null,t1:null};   /* t0/t1: the time window, epoch seconds, inclusive */
 SEV.forEach(function(s){st.sev[s]=true;});
 var VIEWS=[['overview','Overview'],['findings','Findings'],['attack','ATT&CK'],
-           ['timeline','Timeline'],['search','Search all']];
+           ['timeline','Timeline'],['correlation','Correlation'],
+           ['graph','Graph'],['entities','Relationships'],['context','Context'],
+           ['panels','Panels'],
+           ['iocs','IOC score'],
+           ['marked','Case'],['search','Search all'],['ask','Ask']];
 
+
+/* ------------------------------------------------------------------ marks
+   An investigation is the findings plus what the examiner decided about
+   them, and until now the second half had nowhere to live. A mark is a
+   state, any number of labels and a note, attached to one row of one table.
+
+   The row is identified by its content, not its position: a re-run that
+   reorders a table keeps its marks, and a row whose values changed loses
+   them - which is correct both ways round, because the mark belongs to the
+   evidence rather than to the offset it sat at.
+
+   Served by --serve, marks go to the case file over the API and survive the
+   browser. Opened as a file, they go to localStorage and survive a reload.
+   The same page does both so that neither mode is a different product. */
+var MK_GLYPH={key:'<span class="g">\u2605</span>',interesting:'<span class="g">\u25c6</span>',suspect:'<span class="g">\u25b2</span>',benign:'<span class="g">\u2713</span>'};
+var MK_STATES=[['key','Key evidence'],['interesting','Interesting'],
+               ['suspect','Suspicious'],['benign','Reviewed - benign']];
+var marks={}, caseInfo={}, served=false;
+
+function h32(str){                       /* FNV-1a, enough to name a row */
+ var h=0x811c9dc5;
+ for(var i=0;i<str.length;i++){h^=str.charCodeAt(i);h=(h*0x01000193)>>>0;}
+ return h.toString(16);
+}
+function mkKey(tname,row){
+ var parts=[];
+ for(var i=0;i<row.length;i++){var v=row[i];parts.push(v==null?'':String(v));}
+ return tname+'|'+h32(parts.join(String.fromCharCode(1)));
+}
+function mkGet(tname,row){return marks[mkKey(tname,row)]||null;}
+/* What a mark carries with it.
+   A mark that stored only "FINDINGS, row 41" is worth nothing the moment the
+   table is rebuilt, and worth little even now - the examiner reading the case
+   back wants the evidence, not a reference to it. So the whole row travels
+   into the case: its columns, its values and the clock it was placed on.
+   Long values are capped rather than dropped, because a case file that grew
+   to the size of the export would stop being something you can hand over. */
+var MK_CELL_CAP=4000;
+function rowRef(t,row,when){
+ var cols=[],vals=[];
+ for(var i=0;i<t.columns.length;i++){
+  var v=row[i];if(v===undefined||v===null||v==='')continue;
+  v=String(v);
+  cols.push(t.columns[i]);
+  vals.push(v.length>MK_CELL_CAP?v.slice(0,MK_CELL_CAP)+'\u2026':v);}
+ return {table:t.name,columns:cols,row:vals,when:when||'',
+         what:vals.slice(0,3).join(' ')};
+}
+function mkClass(m){return m&&m.state?' mk mk-'+m.state:'';}
+
+function mkSave(key,entry,where){
+ if(entry&&!entry.state&&!(entry.note||'')&&!(entry.labels||[]).length)entry=null;
+ /* The row travels with the mark in memory, not only in the request.
+    Sending 'where' to the server while storing an entry without it meant the
+    case file was right and the page was wrong: the Case view read
+    marks[k].where, found nothing, and showed a mark with a note and no
+    evidence until the console was reloaded. */
+ if(entry)entry.where=where||entry.where||null;
+ if(entry)marks[key]=entry; else delete marks[key];
+ if(served){
+  try{
+   fetch('/api/mark',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:key,state:entry?entry.state:'',
+     note:entry?entry.note:'',labels:entry?entry.labels:[],where:where||null})});
+  }catch(e){}
+ }else{
+  try{localStorage.setItem(mkStoreKey(),JSON.stringify(marks));}catch(e){}
+ }
+}
+function mkStoreKey(){
+ var m=(D.meta||[]),host='';
+ for(var i=0;i<m.length;i++)if(m[i][0]==='Hostname')host=m[i][1];
+ return 'linsight.case.'+h32(host+'|'+(D.version||''));
+}
+function mkLoad(cb){
+ served=!!D.served;
+ if(served){
+  fetch('/api/case').then(function(r){return r.json();}).then(function(j){
+   marks=(j&&j.marks)||{};caseInfo=(j&&j.case)||{};cb&&cb();
+  }).catch(function(){served=false;mkLoadLocal();cb&&cb();});
+ }else{mkLoadLocal();cb&&cb();}
+}
+function mkLoadLocal(){
+ try{marks=JSON.parse(localStorage.getItem(mkStoreKey())||'{}')||{};}catch(e){marks={};}
+}
+function mkCycle(tname,row,where){       /* click a row's marker to advance it */
+ var key=mkKey(tname,row),cur=marks[key],at=-1;
+ for(var i=0;i<MK_STATES.length;i++)if(cur&&cur.state===MK_STATES[i][0])at=i;
+ var next=at+1>=MK_STATES.length?null:MK_STATES[at+1][0];
+ var entry=next?{state:next,note:cur?cur.note||'':'',labels:cur?cur.labels||[]:[]}:null;
+ mkSave(key,entry,where);
+ return entry;
+}
+function mkAllLabels(){
+ var seen={},out=[];
+ for(var k in marks){(marks[k].labels||[]).forEach(function(l){
+  if(!seen[l]){seen[l]=1;out.push(l);}});}
+ return out.sort();
+}
+
+/* --------------------------------------------------------------- scoring
+   Which indicators deserve the next hour. Frequency alone ranks the noisiest
+   string on the host - a distribution path mentioned in every log - so it is
+   only one term of four, and the analyst's own marks outweigh all of them.
+
+   Deliberately transparent rather than clever: every component is printed
+   beside the score, because a ranking an examiner cannot audit is a ranking
+   they are right to ignore. */
+function iocScores(){
+ var t=T('IOCS'),rows=t?t.rows:[],out=[];
+ if(!t)return out;
+ var ci_=function(n){return t.columns.indexOf(n);};
+ var iInd=ci_('indicator'),iType=ci_('type'),iCount=ci_('count'),
+     iWhy=ci_('why'),iFirst=ci_('first_utc'),iSrc=ci_('source');
+ var fin=T('FINDINGS'),fsev=fin?fin.columns.indexOf('severity'):-1,
+     fev=fin?fin.columns.indexOf('evidence'):-1,
+     fti=fin?fin.columns.indexOf('title'):-1;
+ var sevW={CRITICAL:40,HIGH:25,MEDIUM:12,LOW:5,INFO:1};
+ /* one pass over the findings, not one per indicator */
+ var hay=[];
+ if(fin)fin.rows.forEach(function(r){
+  hay.push([String(r[fev]||'')+' '+String(r[fti]||''),sevW[r[fsev]]||0]);});
+ rows.forEach(function(r){
+  var ind=String(r[iInd]==null?'':r[iInd]);
+  if(!ind||ind.length<4)return;
+  var n=parseInt(r[iCount],10)||0;
+  var freq=n>0?Math.min(20,Math.round(Math.log(1+n)*5)):0;
+  var sev=0,hits=0;
+  for(var i=0;i<hay.length;i++){
+   if(hay[i][0].indexOf(ind)>=0){sev=Math.max(sev,hay[i][1]);hits++;}}
+  var type=String(r[iType]||'');
+  var kind=/ip|domain|url|hash/i.test(type)?12:/path|file/i.test(type)?6:3;
+  var m=marks['IOC|'+h32(ind)];
+  var mk=m?(m.state==='key'?60:m.state==='interesting'?30:
+            m.state==='suspect'?40:m.state==='benign'?-100:0):0;
+  var score=freq+sev+kind+mk+Math.min(12,hits*2);
+  out.push({ind:ind,type:type,count:n,score:score,freq:freq,sev:sev,
+            kind:kind,mk:mk,hits:hits,why:String(r[iWhy]||''),
+            first:String(r[iFirst]||''),src:String(r[iSrc]||''),state:m?m.state:''});
+ });
+ out.sort(function(a,b){return b.score-a.score;});
+ return out;
+}
+function T(name){
+ /* Rows arrive gzipped and are unpacked per table on first use. A view that
+    needs one it has not seen asks for it, returns nothing this paint, and is
+    redrawn when the rows land - which is why every caller handles null. */
+ var t=TB[name];
+ if(!t)return null;
+ if(t.rows!==undefined)return t;
+ T._p=T._p||{};
+ if(!T._p[name]){T._p[name]=1;
+  ensure([name]).then(function(){T._p[name]=0;draw();});}
+ return null;
+}
+
+/* --------------------------------------------------- the graph timeline
+   The table timeline answers "what happened at 03:14". This answers "what
+   does the whole intrusion look like", which is the question you ask before
+   you know which minute matters.
+
+   One lane per category, one rect per event, severity as colour and the
+   examiner's marks drawn on top - so an afternoon of marking becomes a shape
+   rather than a list. Drawn as SVG by hand: a charting library would be a
+   network fetch, and this page has to open on a machine that has none. */
+function viewGraph(){
+ var src=T('TIMELINE')||T('FINDINGS');
+ if(!src)return '<div class="pad">Loading the timeline…</div>';
+ var ci_=function(n){return src.columns.indexOf(n);};
+ var iT=ci_('timestamp_utc'),iC=ci_('category'),iS=ci_('severity'),
+     iW=ci_('what')>=0?ci_('what'):ci_('detail');
+ if(iT<0)return '<div class="pad">The timeline has no timestamp column.</div>';
+ var ev=[],lo=null,hi=null;
+ src.rows.forEach(function(r){
+  var e=ts(r[iT]);if(e===null)return;
+  if(lo===null||e<lo)lo=e; if(hi===null||e>hi)hi=e;
+  ev.push({t:e,c:String(r[iC]||'other'),s:String(r[iS]||'INFO'),
+           w:String(r[iW]||''),row:r});});
+ if(!ev.length)return '<div class="pad">No dated events.</div>';
+ if(hi===lo)hi=lo+60;
+ var lanes=[],seen={};
+ ev.forEach(function(e){if(!seen[e.c]){seen[e.c]=1;lanes.push(e.c);}});
+ lanes.sort();
+ var W=Math.max(900,lanes.length?1100:900),LH=26,PAD=140,H=lanes.length*LH+42;
+ var x=function(tt){return PAD+(W-PAD-20)*(tt-lo)/(hi-lo);};
+ var h='<div class="pad"><h3>Intrusion shape</h3>'+
+   '<div class="dim" style="margin-bottom:8px">'+ev.length.toLocaleString()+
+   ' dated event(s), '+lanes.length+' categor'+(lanes.length===1?'y':'ies')+
+   ', '+fmtT(lo)+' to '+fmtT(hi)+
+   ' &mdash; click any event to mark it</div><div class="gt"><svg width="'+W+
+   '" height="'+H+'" viewBox="0 0 '+W+' '+H+'">';
+ /* hour/day gridlines, whichever the span justifies */
+ var span=hi-lo,step=span>86400*8?86400*Math.ceil(span/86400/10):
+                     span>3600*8?3600*Math.ceil(span/3600/10):600;
+ for(var g=Math.ceil(lo/step)*step;g<hi;g+=step){
+  h+='<line x1="'+x(g).toFixed(1)+'" y1="16" x2="'+x(g).toFixed(1)+'" y2="'+
+     (H-14)+'" stroke="var(--line)" stroke-width="1"/>';
+  h+='<text x="'+(x(g)+3).toFixed(1)+'" y="12" class="lane">'+
+     esc(fmtT(g).slice(5,16))+'</text>';}
+ lanes.forEach(function(c,i){
+  var y=24+i*LH;
+  h+='<text x="6" y="'+(y+13)+'" class="lane">'+esc(c.slice(0,20))+'</text>';
+  h+='<line x1="'+PAD+'" y1="'+(y+LH-1)+'" x2="'+(W-20)+'" y2="'+(y+LH-1)+
+     '" stroke="var(--line)" stroke-width="1" opacity=".4"/>';});
+ ev.forEach(function(e,i){
+  var li=lanes.indexOf(e.c),y=24+li*LH+4,m=mkGet(src.name,e.row);
+  var col=m&&m.state?'var(--'+m.state+')':'var(--'+e.s+')';
+  var w=m&&m.state?5:3;
+  h+='<rect class="ev" data-i="'+i+'" x="'+(x(e.t)-w/2).toFixed(1)+'" y="'+y+
+     '" width="'+w+'" height="'+(LH-9)+'" rx="1.5" fill="'+col+
+     '" opacity="'+(m&&m.state==='benign'?.3:m&&m.state?1:.72)+'"><title>'+
+     esc(fmtT(e.t)+'  ['+e.s+'] '+e.c+' | '+e.w.slice(0,160))+'</title></rect>';});
+ h+='</svg></div>';
+ h+='<div class="mkbar" style="margin-top:10px">';
+ MK_STATES.forEach(function(st_){
+  h+='<span class="lbl-chip" style="border-color:var(--'+st_[0]+
+     ');color:var(--'+st_[0]+')">'+esc(st_[1])+'</span>';});
+ h+='<span class="dim">severity colours where unmarked</span></div></div>';
+ GEV=ev;GSRC=src;
+ return h;
+}
+var GEV=[],GSRC=null;
+
+/* ------------------------------------------------------------ IOC score */
+function viewIocs(){
+ if(!T('IOCS'))return '<div class="pad">Loading indicators…</div>';
+ var sc=iocScores();
+ if(!sc.length)return '<div class="pad">No indicators were extracted. '+
+   'Run with --count-iocs to count every one across the collection.</div>';
+ var top=sc.slice(0,300),max=top[0].score||1;
+ var h='<div class="pad"><h3>Indicators by score</h3>'+
+  '<div class="dim" style="margin-bottom:10px">'+sc.length.toLocaleString()+
+  ' indicator(s) ranked by how much they look like the thing worth chasing: '+
+  'how often they appear, the worst severity of a finding that names them, '+
+  'what kind of indicator they are, and how you have marked them. '+
+  'Every term is shown - a ranking you cannot audit is one you should '+
+  'ignore. Click a row to mark it.</div>';
+ h+='<table class="grid"><thead><tr><th>score</th><th>indicator</th>'+
+    '<th>type</th><th>seen</th><th>why</th><th>first</th></tr></thead><tbody>';
+ top.forEach(function(r,i){
+  var m=marks['IOC|'+h32(r.ind)];
+  h+='<tr class="ioc'+mkClass(m)+'" data-ioc="'+esc(r.ind)+'">'+
+   '<td class="num"><span class="score">'+r.score+'</span>'+
+   '<span class="sbar" style="width:'+Math.max(2,Math.round(46*r.score/max))+
+   'px"></span></td>'+
+   '<td><code>'+esc(r.ind.slice(0,90))+'</code></td>'+
+   '<td>'+esc(r.type)+'</td>'+
+   '<td class="num" title="frequency '+r.freq+' + severity '+r.sev+
+   ' + kind '+r.kind+' + marks '+r.mk+' + findings '+r.hits+'">'+
+   (r.count||'')+'</td>'+
+   '<td>'+esc(r.why.slice(0,80))+'</td><td class="nw">'+esc(r.first)+'</td></tr>';});
+ h+='</tbody></table></div>';
+ return h;
+}
+
+/* ------------------------------------------------- the relationship graph
+   The time ribbon answers "when". This answers "who touched what", which is
+   the question that turns a list of events into an intrusion you can follow:
+   an address reaches an account, that account escalates to another, and
+   something owned by one of them is sitting in a temp directory.
+
+   Edges are only drawn where an artifact actually recorded the relation -
+   nothing here is inferred - and every node carries the count of rows that
+   put it there, so a thick edge is evidence and not a guess.
+
+   The layout is a small force simulation run to a fixed iteration count
+   rather than animated: it has to settle the same way twice so that a
+   screenshot in a report matches what the examiner saw. */
+var NODE_KIND={ip:'#58a6ff',user:'#f5d067',file:'#ff9f43',rule:'#ff5f56',cmd:'#a371f7',url:'#3fb950',tool:'#ff7b72',host:'#79c0ff',collection:'#79c0ff'};
+var EGN=44;        /* how many circles to draw - the examiner's choice */
+var EGISO=null;    /* the node the picture is narrowed to, by key */
+/* Which kinds of thing are drawn. All of them to start, because the first
+   question is "what is here"; the second is always "show me fewer", and
+   before this the only answer was the circle count - which drops the
+   *smallest* nodes rather than the kind you did not want. Twelve command
+   nodes crowding out two addresses is the common case, and no number of
+   circles fixes it. */
+var EGKIND={ip:1,user:1,file:1,cmd:1,url:1,tool:1,rule:1,collection:1};
+/* The rows behind the last picture, so the caption can say what it was drawn
+   from. A filter that changes little still has to look applied. */
+var EGSRC={rows:0,tables:0};
+/* Whether to draw a circle per collection. On by default in a merged export,
+   because that is the picture worth opening one for - but a switch, because
+   a hub joined to twenty entities is a hub, and on a busy host it is the
+   thing standing between the reader and everything else. */
+var EGHUBS=true;
+/* Whether to write what each line means along it. On below a threshold and
+   off above it, because "ip -> account" with no verb on it is a picture of
+   connections rather than of activity - and a hundred labels at once is a
+   picture of nothing. */
+var EGLBL=null;        /* null = decide from the edge count */
+function egLabels(){
+ return EGLBL===null?(EG&&EG.edges.length<=34):EGLBL;
+}
+function egHubs(){
+ return !!(EGHUBS&&HOSTS.length>1&&HOSTCOL&&!hostOn()&&EGKIND.collection);
+}
+/* Rows the graph is allowed to draw from. The collection picker reaches here
+   like it reaches every grid - a picture still drawn over three hosts while
+   the rest of the console shows one would be answering a question nobody
+   asked. */
+function egRows(t){
+ if(!t)return [];
+ var rows=hostFilter(t.rows,t);
+ EGSRC.rows+=rows.length;
+ if(rows.length)EGSRC.tables++;
+ return rows;
+}
+/* Which activity wins when one pair of entities did several things. Success
+   outranks failure because it is the answer to a different question - not
+   "was this address trying" but "did it get in". */
+function _egRank(why){
+ var w=String(why||'').toLowerCase();
+ if(w.indexOf('accepted')>=0||w.indexOf('success')>=0)return 4;
+ if(w.indexOf('privilege')>=0||w.indexOf('sudo')>=0)return 3;
+ if(w.indexOf('failed')>=0)return 1;
+ return w?2:0;
+}
+/* An activity that succeeded is drawn differently from one that did not.
+   Colour rather than a footnote, because on a busy picture the question is
+   always which of these lines mattered. */
+function egEdgeColour(e){
+ if(e.kind==='move')return 'var(--gold)';
+ if(e.kind==='in')return NODE_KIND.collection;
+ var w=String(e.why||'').toLowerCase();
+ if(w.indexOf('accepted')>=0||w.indexOf('success')>=0)return 'var(--HIGH)';
+ if(w.indexOf('privilege')>=0||w.indexOf('sudo')>=0)return 'var(--MEDIUM)';
+ return 'var(--edge)';
+}
+function egBuild(){
+ var nodes={},edges={},order=[];
+ EGSRC={rows:0,tables:0};
+ /* Six rows kept per node and per edge, so hovering can show the evidence
+    rather than a count of it. Six because that is what fits in the panel -
+    the full set is one click away in the table it names. */
+ var KEEP=6;
+ function node(kind,id,extra){
+  if(!EGKIND[kind])return null;
+  var k=kind+':'+id;
+  if(!nodes[k]){nodes[k]={k:k,kind:kind,id:id,n:0,extra:extra||'',ev:[]};
+   order.push(nodes[k]);}
+  nodes[k].n++;return nodes[k];}
+ function evid(o,ctx){
+  if(ctx&&o.ev.length<KEEP)o.ev.push(ctx);}
+ /* `why` is the activity, and it is now the edge's own property rather than
+    a string hidden in a tooltip: it is drawn on the line, it colours the
+    line, and it is what the legend of relations counts. `kind` separates the
+    three sorts of line the picture holds - an observed activity, an entity
+    being present in a collection, and one collection reached after another,
+    which are three different claims and were all one grey line. */
+ function edge(a,b,why,ctx,kind){
+  if(!a||!b||a===b)return null;
+  var k=a.k+'>'+b.k;
+  if(!edges[k])edges[k]={a:a,b:b,n:0,why:why||'',ev:[],
+                         kind:kind||'act',whys:{}};
+  var e=edges[k];
+  e.n++;
+  if(why)e.whys[why]=(e.whys[why]||0)+1;
+  /* A pair seen doing several things keeps the most telling one: a source
+     that failed forty times and succeeded once is a source that got in, and
+     an edge labelled 'failed password' would say the opposite. */
+  if(_egRank(why)>_egRank(e.why))e.why=why;
+  evid(e,ctx);evid(a,ctx);evid(b,ctx);
+  seen(a,ctx);seen(b,ctx);
+  return e;}
+ /* Which collections a node was observed in. Read off the row rather than
+    tracked per source, because one node is reached from several tables and
+    the answer has to be the union of all of them. */
+ function seen(o,ctx){
+  if(!HOSTCOL||!ctx||!ctx.c)return;
+  var i=ctx.c.indexOf(HOSTCOL);
+  if(i<0)return;
+  var v=ctx.r[i];
+  if(v){if(!o.hosts)o.hosts={};o.hosts[v]=1;}}
+
+ /* an address that authenticated, and the account it reached */
+ var au=T('AUTH_LOG');
+ if(au){
+  var ei=au.columns.indexOf('event'),ui=au.columns.indexOf('user'),
+      si=au.columns.indexOf('source_ip');
+  egRows(au).forEach(function(r){
+   var ev=String(r[ei]||'');
+   if(ev.indexOf('accepted')<0&&ev.indexOf('failed')<0)return;
+   var ip=String(r[si]||''),us=String(r[ui]||'');
+   if(!ip||!us)return;
+   edge(node('ip',ip),node('user',us),ev,{t:'AUTH_LOG',c:au.columns,r:r});});}
+
+ /* an account that became another account */
+ var pa=T('PRIVILEGE_ACTIVITY');
+ if(pa){
+  var ai=pa.columns.indexOf('actor'),ti=pa.columns.indexOf('target_user');
+  egRows(pa).forEach(function(r){
+   var a=String(r[ai]||''),b=String(r[ti]||'');
+   if(!a||!b)return;
+   edge(node('user',a),node('user',b),'privilege',
+        {t:'PRIVILEGE_ACTIVITY',c:pa.columns,r:r});});}
+
+ /* something an account owns, sitting where payloads are dropped */
+ var bf=T('BODYFILE');
+ if(bf){
+  var pi=bf.columns.indexOf('path'),oi=bf.columns.indexOf('owner'),
+      mi=bf.columns.indexOf('mode');
+  egRows(bf).forEach(function(r){
+   var p=String(r[pi]||'');
+   if(p.indexOf('/tmp/')<0&&p.indexOf('/var/tmp/')<0&&p.indexOf('/dev/shm/')<0)return;
+   if(String(r[mi]||'').indexOf('x')<0)return;
+   if(String(r[mi]||'').charAt(0)==='d')return;
+   var o=String(r[oi]||'');if(!o)return;
+   edge(node('user',o),node('file',p),'owns an executable in tmp',
+        {t:'BODYFILE',c:bf.columns,r:r});});}
+
+ /* a rule that fired, tied to the table it fired on */
+ var sm=T('SIGMA_MATCHES');
+ if(sm){
+  var ri=sm.columns.indexOf('rule'),mr=sm.columns.indexOf('matched_row');
+  egRows(sm).forEach(function(r){
+   var rule=String(r[ri]||''),row=String(r[mr]||'');
+   if(!rule)return;
+   var m=row.match(/(?:user|actor|owner)=([A-Za-z0-9_.-]+)/);
+   if(m)edge(node('rule',rule.slice(0,44)),node('user',m[1]),'rule',
+            {t:'SIGMA_MATCHES',c:sm.columns,r:r});
+   var ipm=row.match(/([0-9]{1,3}(?:[.][0-9]{1,3}){3})/);
+   if(ipm)edge(node('rule',rule.slice(0,44)),node('ip',ipm[1]),'rule',
+              {t:'SIGMA_MATCHES',c:sm.columns,r:r});});}
+
+ /* what a scheduled job runs, and as whom */
+ var cr=T('CRON');
+ if(cr){
+  var ri2=cr.columns.indexOf('run_as'),ci2=cr.columns.indexOf('command');
+  egRows(cr).forEach(function(r){
+   var who=String(r[ri2]||''),cmd=String(r[ci2]||'');
+   if(!who||!cmd)return;
+   edge(node('user',who),node('cmd',cmd.slice(0,46)),'scheduled job',
+        {t:'CRON',c:cr.columns,r:r});});}
+
+ /* what somebody typed, and as whom */
+ var sh=T('SHELL_HISTORY');
+ if(sh){
+  var ui2=sh.columns.indexOf('user'),cc=sh.columns.indexOf('command');
+  egRows(sh).forEach(function(r){
+   var who=String(r[ui2]||''),cmd=String(r[cc]||'');
+   if(!who||!cmd||cmd.length<4)return;
+   edge(node('user',who),node('cmd',cmd.slice(0,46)),'shell history',
+        {t:'SHELL_HISTORY',c:sh.columns,r:r});});}
+
+ /* what the web server actually answered, and to whom */
+ var wl=T('WEB_LOG');
+ if(wl){
+  var wi=wl.columns.indexOf('client_ip'),rs=wl.columns.indexOf('resource'),
+      sti=wl.columns.indexOf('status');
+  egRows(wl).forEach(function(r){
+   if(String(r[sti]||'').charAt(0)!=='2')return;      /* answered, not probed */
+   var ip=String(r[wi]||''),res=String(r[rs]||'');
+   if(!ip||!res)return;
+   edge(node('ip',ip),node('url',res.slice(0,46)),'answered 2xx',
+        {t:'WEB_LOG',c:wl.columns,r:r});});}
+
+ /* offensive tooling, tied to the table that named it */
+ var hk=T('HACKTOOL_HITS');
+ if(hk){
+  var hti=hk.columns.indexOf('tool'),hwi=hk.columns.indexOf('table');
+  egRows(hk).forEach(function(r){
+   var tool=String(r[hti]||''),where=String(r[hwi]||'');
+   if(!tool||!where)return;
+   edge(node('tool',tool),node('file',where),'named in',
+        {t:'HACKTOOL_HITS',c:hk.columns,r:r});});}
+
+ /* ---- the correlation, drawn ----
+    An entity observed in more than one collection gets an edge to each of
+    them. Only those: linking every node to its collection would double the
+    picture and say nothing, since most nodes belong to exactly one. What is
+    left is the shape an examiner opens three disks to see - the collection
+    hubs with the addresses, accounts and files that bridge them strung
+    between, and everything private to one host hanging off its own side.
+    Skipped when a single collection is picked: there is then nothing to
+    bridge, and the rows have already been filtered to it. */
+ if(egHubs()){
+  order.slice().forEach(function(nd){
+   if(nd.kind==='collection'||!nd.hosts)return;
+   var hs=[],hh;
+   for(hh in nd.hosts)hs.push(hh);
+   if(hs.length<2)return;
+   hs.forEach(function(hn){
+    edge(node('collection',hn),nd,'seen in this collection',null,'in');});});
+
+  /* ---- lateral movement ----
+     The one relation in this picture that is about time rather than about
+     structure: an indicator observed on one collection before another, drawn
+     from the correlation's own CROSS_IOCS - first_host to last_host, with an
+     arrow, because "web01 and db02 share an address" and "it reached db02
+     forty minutes after web01" are different sentences and only the second
+     one says which way the intrusion travelled.
+
+     Read from the table rather than recomputed here: the correlation already
+     did this arithmetic against each run's resolved UTC offset, and a second
+     implementation of it would be a second chance to get it wrong. */
+  var xi=T('CROSS_IOCS');
+  if(xi){
+   var ai=xi.columns.indexOf('first_host'),bi=xi.columns.indexOf('last_host'),
+       ii=xi.columns.indexOf('indicator'),gi=xi.columns.indexOf('spread');
+   if(ai>=0&&bi>=0)xi.rows.forEach(function(r){
+    var a=String(r[ai]||''),b=String(r[bi]||''),gap=String(r[gi]||'');
+    if(!a||!b||a===b)return;
+    var e=edge(node('collection',a),node('collection',b),
+               String(r[ii]||'')+(gap?' after '+gap:''),
+               {t:'CROSS_IOCS',c:xi.columns,r:r},'move');
+    if(e&&gap&&!e.gap)e.gap=gap;});}}
+
+ /* Narrowed to one thing and what it touches. Done here rather than by
+    dimming the rest, because dimming leaves every unrelated circle taking up
+    its space and the layout unchanged - and the question "what does this file
+    touch" is answered by a picture of that and nothing else. The neighbours'
+    edges to each other are kept: they are part of the neighbourhood, and
+    dropping them would draw a star where the artifacts recorded a mesh. */
+ if(EGISO&&nodes[EGISO]){
+  var hub=nodes[EGISO],near={};
+  near[hub.k]=1;
+  for(var ik in edges){
+   var ie=edges[ik];
+   if(ie.a===hub)near[ie.b.k]=1;
+   if(ie.b===hub)near[ie.a.k]=1;}
+  order=order.filter(function(nd){return near[nd.k];});}
+
+ /* keep it readable: the busiest nodes and any edge between two survivors */
+ order.sort(function(a,b){return b.n-a.n;});
+ var keep={},top=order.slice(0,EGN);
+ top.forEach(function(nd){keep[nd.k]=1;});
+ var es=[];
+ for(var k in edges){
+  var e=edges[k];
+  if(keep[e.a.k]&&keep[e.b.k])es.push(e);}
+ return {nodes:top,edges:es};
+}
+/* Which declared arrowhead goes with which stroke colour. */
+var EGMK={'var(--edge)':0,'var(--HIGH)':1,'var(--MEDIUM)':2,
+          'var(--gold)':3,'var(--edgehot)':4};
+/* A line from the edge of one circle to the edge of the next, leaving room
+   for the arrowhead. Centre-to-centre buries the head under the target. */
+function egSeg(e){
+ var dx=e.b.x-e.a.x,dy=e.b.y-e.a.y,d=Math.sqrt(dx*dx+dy*dy)||1;
+ var ux=dx/d,uy=dy/d,ar=(e.a.r||8)+2,br=(e.b.r||8)+7;
+ if(ar+br>d-4){ar=Math.max(0,(d-4)/2);br=ar;}
+ return {x1:e.a.x+ux*ar,y1:e.a.y+uy*ar,
+         x2:e.b.x-ux*br,y2:e.b.y-uy*br};
+}
+function egLayout(g,W,H){
+ var i,j,n=g.nodes.length;
+ if(!n)return;
+ g.nodes.forEach(function(nd,ix){          /* deterministic ring start */
+  var a=2*Math.PI*ix/n;
+  nd.x=W/2+Math.cos(a)*Math.min(W,H)*0.34;
+  nd.y=H/2+Math.sin(a)*Math.min(W,H)*0.34;});
+ for(var step=0;step<220;step++){
+  for(i=0;i<n;i++){
+   var A=g.nodes[i],fx=0,fy=0;
+   for(j=0;j<n;j++){                       /* repulsion */
+    if(i===j)continue;
+    var B=g.nodes[j],dx=A.x-B.x,dy=A.y-B.y,d2=dx*dx+dy*dy||1;
+    var f=2400/d2;fx+=dx*f;fy+=dy*f;}
+   fx+=(W/2-A.x)*0.012;fy+=(H/2-A.y)*0.012;   /* gravity */
+   A.vx=fx;A.vy=fy;}
+  g.edges.forEach(function(e){              /* springs */
+   var dx=e.b.x-e.a.x,dy=e.b.y-e.a.y,d=Math.sqrt(dx*dx+dy*dy)||1;
+   var f=(d-110)*0.02;
+   e.a.vx+=dx/d*f;e.a.vy+=dy/d*f;
+   e.b.vx-=dx/d*f;e.b.vy-=dy/d*f;});
+  for(i=0;i<n;i++){
+   var N=g.nodes[i];
+   N.x=Math.max(60,Math.min(W-60,N.x+Math.max(-9,Math.min(9,N.vx))));
+   N.y=Math.max(26,Math.min(H-26,N.y+Math.max(-9,Math.min(9,N.vy))));}}
+}
+var EG=null;          /* the laid-out graph, kept so handlers can move it */
+var EGHUB=null;       /* the narrowed-to node, once it has been found */
+function viewEntities(){
+ if(!panelsReady())return '<div class="pad"><h3>Relationships</h3>'+
+   '<div class="dim">Unpacking the artifact tables\u2026</div></div>';
+ EG=egBuild();
+ EGHUB=null;
+ EG.nodes.forEach(function(nd){if(nd.k===EGISO)EGHUB=nd;});
+ /* Narrowed to something this data no longer holds - the circle count moved
+    it out, or a table was unpacked since. Rather than an empty canvas, widen
+    back out and say nothing is narrowed. */
+ if(EGISO&&!EGHUB){EGISO=null;EG=egBuild();}
+ if(!EG.nodes.length)return '<div class="pad"><h3>Relationships</h3>'+
+   '<div class="dim">Nothing in this collection records a relation between '+
+   'an address, an account and a file.</div></div>';
+ var W=1180,H=620;
+ egLayout(EG,W,H);
+ EG.W=W;EG.H=H;EG.view=[0,0,W,H];EG.focus=null;
+ var maxn=EG.edges.reduce(function(m,e){return Math.max(m,e.n);},1);
+ /* Sized before the edges are drawn, not with them: a line has to stop short
+    of the circle it points at or the arrowhead lands underneath it. */
+ EG.nodes.forEach(function(nd){
+  nd.r=7+Math.min(12,Math.log(1+nd.n)*2.6);});
+ var kinds=[['ip','address'],['user','account'],['file','file'],
+            ['cmd','command'],['url','answered URL'],['tool','tool'],
+            ['rule','rule']];
+ if(egHubs())kinds.push(['collection','collection']);
+ var h='<div class="pad"><h3>Relationships</h3>'+
+  '<div class="mkbar">';
+ /* The legend is the filter. It was a colour key and nothing else, which
+    meant the only way to get a readable picture out of a busy host was to
+    turn the circle count down and lose the small nodes - including the two
+    addresses the whole question was about. Clicking a kind now drops it. */
+ kinds.forEach(function(k){
+  var on=!!EGKIND[k[0]];
+  h+='<span class="lbl-chip'+(on?'':' off')+'" data-egk="'+k[0]+
+     '" style="cursor:pointer;border-color:'+NODE_KIND[k[0]]+';color:'+
+     (on?NODE_KIND[k[0]]:'var(--dim)')+(on?'':';opacity:.45')+
+     '" title="show or hide '+esc(k[1])+' circles">'+esc(k[1])+'</span>';});
+ h+='<span class="grow"></span>';
+ if(HOSTS.length>1&&HOSTCOL&&!hostOn())
+  h+='<button class="mkbtn'+(EGHUBS?' on':'')+'" id="eg_hubs" '+
+     'title="draw a circle per collection, joined to whatever was seen in '+
+     'more than one of them">collections</button>';
+ h+='<button class="mkbtn'+(egLabels()?' on':'')+'" id="eg_lbls" '+
+    'title="write what each line means along it">labels</button>';
+ [25,50,100,200].forEach(function(n){
+  h+='<button class="mkbtn'+(EGN===n?' on':'')+'" data-egn="'+n+'">'+n+
+     '</button>';});
+ h+='<span class="dim">circles</span>'+
+   '<button class="mkbtn" id="eg_reset">reset</button>'+
+   (EGISO&&EGHUB
+    ?'<button class="mkbtn on" id="eg_all">show everything</button>'+
+     '<span class="dim">showing <b>'+esc(EGHUB.id)+'</b> and what it touches'+
+     '</span>'
+    :'')+
+   '<span class="dim">drag a node \u00b7 hover to isolate \u00b7 click one to see only it '+
+   '\u00b7 wheel to zoom</span></div>';
+ h+='<div class="dim" style="margin-bottom:6px">'+EG.nodes.length+
+   ' entities, '+EG.edges.length+' observed relation(s), drawn from '+
+   EGSRC.rows.toLocaleString()+' row(s) in '+EGSRC.tables+' table(s)'+
+   (hostOn()?' of collection <b>'+esc(st.host)+'</b>'
+    :HOSTS.length>1?' across all '+HOSTS.length+' collections':'')+
+   '. Arrows point the way the activity went - an address to the account it '+
+   'reached, an account to the one it became, a collection to the one an '+
+   'indicator reached after it. Thickness is how many rows recorded the '+
+   'relation; <b style="color:var(--HIGH)">orange</b> is an authentication '+
+   'that succeeded and <b style="color:var(--MEDIUM)">yellow</b> a privilege '+
+   'change. Nothing here is inferred.'+
+   (egHubs()
+    ?' The pale-blue circles are the collections themselves: a dashed line '+
+     'means the thing was observed in that collection, and a '+
+     '<b style="color:var(--gold)">gold arrow between two of them</b> is '+
+     'lateral movement - an indicator that reached the second one after the '+
+     'first, labelled with how long it took.'
+    :'')+
+   (kinds.some(function(k){return !EGKIND[k[0]];})
+    ?' <b>'+kinds.filter(function(k){return !EGKIND[k[0]];})
+      .map(function(k){return esc(k[1]);}).join(', ')+
+     '</b> hidden \u2014 click the labels to bring them back.'
+    :'')+'</div>';
+ h+='<div class="gt" id="eg_wrap"><svg id="eg" width="100%" height="'+H+
+    '" viewBox="0 0 '+W+' '+H+'">';
+ /* One arrowhead per colour the edges use. SVG markers cannot inherit the
+    line's stroke in every browser this has to open in, so they are declared
+    rather than derived. */
+ h+='<defs>';
+ ['var(--edge)','var(--HIGH)','var(--MEDIUM)','var(--gold)','var(--edgehot)']
+  .forEach(function(c,ci){
+  h+='<marker id="egar'+ci+'" viewBox="0 0 10 10" refX="9" refY="5" '+
+     'markerWidth="5" markerHeight="5" orient="auto-start-reverse">'+
+     '<path d="M0,0 L10,5 L0,10 z" fill="'+c+'"/></marker>';});
+ h+='</defs>';
+ h+='<g id="eg_edges">';
+ EG.edges.forEach(function(e,i){
+  var p=egSeg(e),c=egEdgeColour(e),move=(e.kind==='move');
+  h+='<line data-e="'+i+'" x1="'+p.x1.toFixed(1)+'" y1="'+p.y1.toFixed(1)+
+     '" x2="'+p.x2.toFixed(1)+'" y2="'+p.y2.toFixed(1)+
+     '" stroke="'+c+'" stroke-width="'+
+     (e.kind==='in'?1:move?2.6:(1.4+3*e.n/maxn)).toFixed(2)+
+     (e.kind==='in'?'" stroke-dasharray="4 4':'')+
+     '" marker-end="url(#egar'+EGMK[c]+')"'+
+     ' opacity="'+(e.kind==='in'?'.35':'.9')+'"><title>'+
+     esc(e.a.id+' \u2192 '+e.b.id+'  ('+e.n+' row(s), '+
+         (e.kind==='move'?'reached after ':'')+e.why+')')+
+     '</title></line>';});
+ h+='</g><g id="eg_lbl">';
+ if(egLabels())EG.edges.forEach(function(e,i){
+  if(e.kind==='in')return;                 /* 'seen in' on every line is noise */
+  var p=egSeg(e);
+  h+='<text data-l="'+i+'" x="'+((p.x1+p.x2)/2).toFixed(1)+'" y="'+
+     (((p.y1+p.y2)/2)-3).toFixed(1)+'" text-anchor="middle" '+
+     'style="font-size:9.5px;fill:'+egEdgeColour(e)+
+     ';paint-order:stroke;stroke:var(--bg);stroke-width:3px;pointer-events:none"'+
+     '>'+esc(String(e.why||'').slice(0,34))+'</text>';});
+ h+='</g><g id="eg_nodes">';
+ EG.nodes.forEach(function(nd,i){
+  h+='<g class="egn" data-n="'+i+'" style="cursor:grab">';
+  h+='<circle cx="'+nd.x.toFixed(1)+'" cy="'+nd.y.toFixed(1)+'" r="'+
+     nd.r.toFixed(1)+'" fill="'+NODE_KIND[nd.kind]+'" stroke="var(--bg)" '+
+     'stroke-width="2"><title>'+esc(nd.kind+' '+nd.id+' \u2014 '+nd.n+
+     ' row(s)')+'</title></circle>';
+  h+='<text x="'+(nd.x+nd.r+4).toFixed(1)+'" y="'+(nd.y+4).toFixed(1)+
+     '" class="lane" style="font-size:11px;paint-order:stroke;stroke:var(--bg);'+
+     'stroke-width:3px">'+esc(String(nd.id).slice(0,30))+'</text>';
+  h+='</g>';});
+ h+='</g></svg></div>';
+ h+=egPanels(EG);
+ h+='<div id="eg_det" class="mkcard" style="margin-top:10px">'+
+   '<div class="dim">Hover a node or a line to see the rows that put it there.</div></div>';
+ h+='</div>';
+ return h;
+}
+/* Three questions the picture alone does not answer: what kinds of thing are
+   in it, which of them sit at the centre, and what the lines actually mean.
+   Computed from the graph that was just laid out, so they can never disagree
+   with what is on screen. */
+function egPanels(g){
+ var byKind={},deg={},byWhy={};
+ g.nodes.forEach(function(n){byKind[n.kind]=(byKind[n.kind]||0)+1;deg[n.k]=0;});
+ g.edges.forEach(function(e){
+  deg[e.a.k]=(deg[e.a.k]||0)+e.n;deg[e.b.k]=(deg[e.b.k]||0)+e.n;
+  byWhy[e.why||'relation']=(byWhy[e.why||'relation']||0)+e.n;});
+ var top=g.nodes.slice().sort(function(a,b){
+  return (deg[b.k]||0)-(deg[a.k]||0);}).slice(0,7);
+ var h='<div class="panels" style="margin-top:12px">';
+ h+='<div class="panel"><h4>Entity mix</h4>';
+ Object.keys(byKind).sort(function(a,b){return byKind[b]-byKind[a];})
+  .forEach(function(k){
+   h+='<div class="rowline"><span><span style="color:'+NODE_KIND[k]+
+      '">\u25cf</span> '+esc(k)+'</span><span class="v">'+byKind[k]+
+      '</span></div>';});
+ h+='</div>';
+ h+='<div class="panel"><h4>Most connected</h4>';
+ top.forEach(function(n){
+  h+='<div class="rowline"><span><span style="color:'+NODE_KIND[n.kind]+
+     '">\u25cf</span> '+esc(String(n.id).slice(0,30))+'</span>'+
+     '<span class="v">'+(deg[n.k]||0)+'</span></div>';});
+ h+='</div>';
+ h+='<div class="panel"><h4>Relations by kind</h4>';
+ Object.keys(byWhy).sort(function(a,b){return byWhy[b]-byWhy[a];}).slice(0,7)
+  .forEach(function(w){
+   h+='<div class="rowline"><span>'+esc(w)+'</span><span class="v">'+
+      byWhy[w]+'</span></div>';});
+ h+='</div></div>';
+ return h;
+}
+/* Dragging, hovering and focusing, done against the SVG that is already on
+   the page rather than by re-rendering it: a graph that jumps back to its
+   starting positions every time it is touched is one an examiner stops
+   touching. */
+function egWire(){
+ var svg=document.getElementById('eg');
+ if(!svg||!EG)return;
+ var nodes=[].slice.call(svg.querySelectorAll('.egn'));
+ var lines=[].slice.call(svg.querySelectorAll('#eg_edges line'));
+ var drag=null;
+
+ function place(i){
+  var nd=EG.nodes[i],g=nodes[i];
+  g.querySelector('circle').setAttribute('cx',nd.x.toFixed(1));
+  g.querySelector('circle').setAttribute('cy',nd.y.toFixed(1));
+  var t=g.querySelector('text');
+  t.setAttribute('x',(nd.x+nd.r+4).toFixed(1));
+  t.setAttribute('y',(nd.y+4).toFixed(1));
+  EG.edges.forEach(function(e,ei){
+   if(e.a!==nd&&e.b!==nd)return;
+   var L=lines[ei],p=egSeg(e);
+   L.setAttribute('x1',p.x1.toFixed(1));L.setAttribute('y1',p.y1.toFixed(1));
+   L.setAttribute('x2',p.x2.toFixed(1));L.setAttribute('y2',p.y2.toFixed(1));
+   var lb=svg.querySelector('#eg_lbl [data-l="'+ei+'"]');
+   if(lb){lb.setAttribute('x',((p.x1+p.x2)/2).toFixed(1));
+          lb.setAttribute('y',(((p.y1+p.y2)/2)-3).toFixed(1));}});
+ }
+ function svgPoint(ev){
+  var r=svg.getBoundingClientRect(),v=EG.view;
+  return {x:v[0]+(ev.clientX-r.left)/r.width*v[2],
+          y:v[1]+(ev.clientY-r.top)/r.height*v[3]};
+ }
+ function neighbours(nd){
+  var set={};set[nd.k]=1;
+  EG.edges.forEach(function(e){
+   if(e.a===nd)set[e.b.k]=1;
+   if(e.b===nd)set[e.a.k]=1;});
+  return set;
+ }
+ function highlight(nd){
+  if(!nd){
+   nodes.forEach(function(g){g.style.opacity=1;});
+   lines.forEach(function(L,i){
+    var e=EG.edges[i],c=egEdgeColour(e);
+    L.style.opacity=(e.kind==='in')?0.35:0.9;
+    L.setAttribute('stroke',c);
+    L.setAttribute('marker-end','url(#egar'+EGMK[c]+')');});
+   return;}
+  var keep=neighbours(nd);
+  EG.nodes.forEach(function(n2,i){
+   nodes[i].style.opacity=keep[n2.k]?1:0.12;});
+  EG.edges.forEach(function(e,i){
+   var on=(e.a===nd||e.b===nd),c=on?'var(--edgehot)':egEdgeColour(e);
+   lines[i].style.opacity=on?1:0.07;
+   lines[i].setAttribute('stroke',c);
+   lines[i].setAttribute('marker-end','url(#egar'+EGMK[c]+')');});
+ }
+ function evHtml(title,sub,ev){
+  var h='<div class="mkhead"><span class="mkstate">'+esc(title)+
+        '</span><span class="dim">'+esc(sub)+'</span></div>';
+  if(!ev||!ev.length)return h+'<div class="dim">No sample rows kept.</div>';
+  ev.forEach(function(x){
+   h+='<div class="dim" style="margin:6px 0 2px"><span class="badge">'+
+      esc(x.t)+'</span></div><table class="rkv">';
+   for(var i=0;i<x.c.length;i++){
+    var v=x.r[i];
+    if(v===undefined||v===null||v==='')continue;
+    h+='<tr><th>'+esc(x.c[i])+'</th><td>'+esc(String(v).slice(0,300))+
+       '</td></tr>';}
+   h+='</table>';});
+  return h;
+ }
+ function detail(html){
+  var d=document.getElementById('eg_det');
+  if(d)d.innerHTML=html;
+ }
+ lines.forEach(function(L,i){
+  L.onmouseenter=function(){
+   var e=EG.edges[i];
+   detail(evHtml(e.a.id+'  \u2192  '+e.b.id,
+     e.n+' row(s) recorded this - '+e.why,e.ev));};});
+ nodes.forEach(function(g,i){
+  g.onmouseenter=function(){
+   if(!drag&&!EG.focus)highlight(EG.nodes[i]);
+   var nd=EG.nodes[i];
+   detail(evHtml(nd.kind+'  '+nd.id,nd.n+' row(s) name it',nd.ev));};
+  g.onmouseleave=function(){if(!drag&&!EG.focus)highlight(null);};
+  g.onmousedown=function(ev){
+   ev.preventDefault();drag={i:i,moved:false};g.style.cursor='grabbing';};
+  g.onclick=function(ev){
+   ev.stopPropagation();
+   if(drag&&drag.moved)return;          /* a drag that happened to end here */
+   var nd=EG.nodes[i];
+   /* clicking the one already narrowed to widens back out; clicking any
+      other narrows to it, which is what makes a run of clicks a walk */
+   EGISO=(EGISO===nd.k)?null:nd.k;
+   draw();};});
+ svg.onmousemove=function(ev){
+  if(!drag)return;
+  var p=svgPoint(ev),nd=EG.nodes[drag.i];
+  nd.x=p.x;nd.y=p.y;drag.moved=true;place(drag.i);};
+ svg.onmouseup=function(){
+  if(drag)nodes[drag.i].style.cursor='grab';
+  drag=null;};
+ svg.onmouseleave=function(){drag=null;};
+ svg.onclick=function(){EG.focus=null;highlight(null);};
+ svg.onwheel=function(ev){
+  ev.preventDefault();
+  var v=EG.view,f=ev.deltaY>0?1.12:0.89,p=svgPoint(ev);
+  var w=Math.max(200,Math.min(EG.W*3,v[2]*f)),hh=w*EG.H/EG.W;
+  EG.view=[p.x-(p.x-v[0])*(w/v[2]),p.y-(p.y-v[1])*(hh/v[3]),w,hh];
+  svg.setAttribute('viewBox',EG.view.join(' '));};
+ [].forEach.call(document.querySelectorAll('button[data-egn]'),function(b){
+  b.onclick=function(){EGN=+b.getAttribute('data-egn');draw();};});
+ [].forEach.call(document.querySelectorAll('[data-egk]'),function(b){
+  b.onclick=function(ev){
+   var k=b.getAttribute('data-egk');
+   /* Alt-click isolates one kind, the way the severity chips do - "only the
+      addresses and what they touch" is otherwise six clicks. */
+   if((ev||window.event).altKey){
+    for(var x in EGKIND)EGKIND[x]=(x===k)||(x==='collection'&&EGKIND.collection);
+    EGKIND[k]=1;}
+   else EGKIND[k]=EGKIND[k]?0:1;
+   EGISO=null;draw();};});
+ var hub=document.getElementById('eg_hubs');
+ if(hub)hub.onclick=function(){EGHUBS=!EGHUBS;EGISO=null;draw();};
+ var lbl=document.getElementById('eg_lbls');
+ if(lbl)lbl.onclick=function(){EGLBL=!egLabels();draw();};
+ var all=document.getElementById('eg_all');
+ if(all)all.onclick=function(){EGISO=null;draw();};
+ var rst=document.getElementById('eg_reset');
+ if(rst)rst.onclick=function(){
+  EGISO=null;EGHUBS=true;EGLBL=null;
+  for(var x in EGKIND)EGKIND[x]=1;
+  draw();};
+}
+
+/* ------------------------------------------------------------- panels
+   One question per panel, each computed from a table that already exists.
+   The overview answers "how bad and when"; these answer the questions an
+   examiner asks next - who was hitting it, which account, what persists,
+   what was touched in the window, and how much of it has been looked at. */
+function pTop(t,col,n,pred){
+ if(!t)return [];
+ var i=t.columns.indexOf(col);if(i<0)return [];
+ var c={},k;
+ t.rows.forEach(function(r){
+  if(pred&&!pred(r))return;
+  var v=r[i];if(v===undefined||v===null||v==='')return;
+  v=String(v);c[v]=(c[v]||0)+1;});
+ var out=[];for(k in c)out.push([k,c[k]]);
+ out.sort(function(a,b){return b[1]-a[1];});
+ return out.slice(0,n||6);
+}
+function panelList(title,pairs,empty){
+ var h='<div class="panel"><h4>'+esc(title)+'</h4>';
+ if(!pairs.length)return h+'<div class="dim">'+esc(empty||'nothing here')+'</div></div>';
+ var max=pairs[0][1]||1;
+ pairs.forEach(function(p){
+  h+='<div class="rowline"><span>'+esc(String(p[0]).slice(0,42))+
+     '</span><span class="v">'+p[1].toLocaleString()+'</span></div>';});
+ return h+'</div>';
+}
+function panelBig(title,value,sub,frac){
+ var h='<div class="panel"><h4>'+esc(title)+'</h4><div class="big">'+
+   esc(String(value))+'</div><div class="sub">'+esc(sub||'')+'</div>';
+ if(frac!==undefined)h+='<div class="pbar"><i style="width:'+
+   Math.round(Math.max(0,Math.min(1,frac))*100)+'%"></i></div>';
+ return h+'</div>';
+}
+/* Every table a panel reads, requested together and waited for.
+
+   A panel that renders before its table is unpacked prints 0, and 0 is a
+   number an examiner will believe: "0 cron entries" on a host with 604 of
+   them is not a slow page, it is a wrong answer. So the view asks for all of
+   them at once and says it is loading until it can answer honestly - the same
+   rule the rest of this tool follows about silence. */
+var PANEL_TABLES=['FINDINGS','FAILED_LOGINS','AUTH_LOG','USERS','CRON',
+                  'PRIVILEGE_ACTIVITY','BODYFILE',
+                  'SYSTEMD_UNITS','INIT_AND_PROFILE','WEB_LOG','DELETED_FILES',
+                  'HACKTOOL_HITS','SIGMA_MATCHES'];
+function panelsReady(){
+ var missing=[];
+ PANEL_TABLES.forEach(function(n){
+  var t=TB[n];
+  if(t&&t.rows===undefined)missing.push(n);});
+ if(!missing.length)return true;
+ if(!panelsReady._p){
+  panelsReady._p=1;
+  ensure(missing).then(function(){panelsReady._p=0;draw();});}
+ return false;
+}
+function viewPanels(){
+ if(!panelsReady())return '<div class="pad"><h3>Panels</h3>'+
+   '<div class="dim">Unpacking the artifact tables\u2026 '+
+   'the panels wait rather than report a zero they cannot stand behind.</div></div>';
+ var h='<div class="pad"><h3>Panels</h3><div class="dim">'+
+  'Each panel is computed from an artifact table - nothing here is a second '+
+  'copy of the evidence. Numbers are for the whole collection unless a time '+
+  'window is set.</div><div class="panels">';
+
+ /* how much of the case has been looked at */
+ var fin=T('FINDINGS');
+ var marked=Object.keys(marks).length,states={};
+ for(var k in marks){var st_=marks[k].state||'?';states[st_]=(states[st_]||0)+1;}
+ h+=panelBig('Triaged',marked.toLocaleString(),
+   Object.keys(states).map(function(x){
+     return states[x]+' '+stateLabel(x).toLowerCase();}).join(', ')||
+   'nothing marked yet',
+   fin?marked/Math.max(1,fin.rows.length):0);
+
+ /* severity mix */
+ if(fin){
+  var si=fin.columns.indexOf('severity'),cnt={};
+  fin.rows.forEach(function(r){var v=r[si];cnt[v]=(cnt[v]||0)+1;});
+  var pairs=SEV.filter(function(x){return cnt[x];}).map(function(x){
+    return [x,cnt[x]];});
+  h+=panelList('Findings by severity',pairs,'no findings');}
+
+ /* who was hitting it */
+ var fl=T('FAILED_LOGINS');
+ h+=panelList('Top sources - failed auth',pTop(fl,'source_ip',6),
+   'no failed logins recorded');
+ var au=T('AUTH_LOG');
+ if(au){
+  var ei=au.columns.indexOf('event');
+  h+=panelList('Accepted logins by user',
+    pTop(au,'user',6,function(r){
+      return String(r[ei]||'').indexOf('accepted')>=0;}),
+    'no accepted logins');}
+
+ /* which accounts exist to be abused */
+ var us=T('USERS');
+ if(us){
+  var pi=us.columns.indexOf('privileged_groups'),
+      li=us.columns.indexOf('login_capable');
+  var priv=us.rows.filter(function(r){return String(r[pi]||'').trim();}).length;
+  var able=us.rows.filter(function(r){
+    return String(r[li]||'').toLowerCase()==='yes';}).length;
+  h+=panelBig('Accounts',us.rows.length,
+    priv+' in a privileged group, '+able+' able to log in',
+    priv/Math.max(1,us.rows.length));}
+
+ /* what runs without being asked */
+ var cr=T('CRON'),su=T('SYSTEMD_UNITS'),ip=T('INIT_AND_PROFILE');
+ h+=panelBig('Persistence surface',
+   ((cr?cr.rows.length:0)+(su?su.rows.length:0)+
+    (ip?ip.rows.length:0)).toLocaleString(),
+   (cr?cr.rows.length:0)+' cron, '+(su?su.rows.length:0)+' unit, '+
+   (ip?ip.rows.length:0)+' init/profile line(s)');
+
+ /* what the web was asked for */
+ var wl=T('WEB_LOG');
+ if(wl){
+  var sti=wl.columns.indexOf('status');
+  var ok=wl.rows.filter(function(r){
+    return String(r[sti]||'').charAt(0)==='2';}).length;
+  h+=panelBig('Web requests',wl.rows.length.toLocaleString(),
+    ok.toLocaleString()+' answered 2xx',ok/Math.max(1,wl.rows.length));
+  h+=panelList('Most requested',pTop(wl,'resource',6),'no requests');}
+
+ /* what was deleted, and what is hidden */
+ var df=T('DELETED_FILES');
+ if(df)h+=panelBig('Deleted inodes',df.rows.length.toLocaleString(),
+   'recovered from the inode tables - dated and sized, not named');
+ var hk=T('HACKTOOL_HITS');
+ if(hk)h+=panelList('Offensive tooling named',pTop(hk,'tool',6),'none named');
+
+ /* the rules that fired */
+ var sm=T('SIGMA_MATCHES');
+ if(sm)h+=panelList('Rules fired',pTop(sm,'rule',6),'no rule matched');
+
+ h+='</div></div>';
+ return h;
+}
+
+/* ----------------------------------------------------------- the case view
+   Everything marked, in time order, with its note. This is the view an
+   examiner writes the report out of, so it carries the note and the label
+   rather than only the colour. */
+function viewMarked(){
+ var keys=Object.keys(marks);
+ var h='<div class="pad"><h3>Case</h3>';
+ h+='<div class="casebar"><input id="cs_name" placeholder="case name" value="'+
+   esc(caseInfo.name||'')+'"><input id="cs_an" placeholder="examiner" value="'+
+   esc(caseInfo.examiner||'')+'"><span class="dim">'+
+   (served?'saved to the case file':'saved in this browser')+'</span></div>';
+ var vs=caseInfo.views||[];
+ if(vs.length){
+  h+='<div class="mkbar">saved views: ';
+  vs.forEach(function(v){
+   h+='<button class="mkbtn" data-view="'+esc(v.name)+'">'+esc(v.name)+
+      '</button>';});
+  h+='</div>';}
+ if(!keys.length){
+  h+='<p class="dim">Nothing marked yet. Click the marker in the first '+
+     'column of any grid, or an event on the Graph, to cycle it through '+
+     MK_STATES.map(function(x){return x[1];}).join(' &rarr; ')+'.</p></div>';
+  return h;}
+ var labels=mkAllLabels();
+ if(labels.length){
+  h+='<div class="mkbar">labels: ';
+  labels.forEach(function(l){
+   h+='<span class="lbl-chip'+(st.label===l?' on':'')+'" data-lbl="'+esc(l)+
+      '">'+esc(l)+'</span>';});
+  h+='</div>';}
+ var items=keys.map(function(k){
+  var m=marks[k];return {k:k,m:m,w:m.where||{}};}).filter(function(it){
+  return !st.label||(it.m.labels||[]).indexOf(st.label)>=0;});
+ items.sort(function(a,b){
+  var A=(a.w.when||a.m.updated||''),B=(b.w.when||b.m.updated||'');
+  return A<B?-1:A>B?1:0;});
+ h+='<div class="dim" style="margin:6px 0">'+items.length+' marked item(s)</div>';
+ items.forEach(function(it){
+  var w=it.w,cols=w.columns||[],vals=w.row||[];
+  h+='<div class="mkcard mk mk-'+esc(it.m.state||'interesting')+'" data-k="'+
+     esc(it.k)+'">';
+  h+='<div class="mkhead"><span class="mkstate">'+esc(stateLabel(it.m.state))+
+     '</span><span class="badge">'+esc(w.table||it.k.split('|')[0])+'</span>'+
+     (w.when?'<span class="dim nw">'+esc(w.when)+'</span>':'')+
+     '<span class="grow"></span>'+
+     (w.when?'<button class="mkbtn" data-ctx="'+esc(w.when)+
+      '">context</button>':'')+
+     '<button class="mkbtn" data-cycle="'+esc(it.k)+'">state</button>'+
+     '<button class="mkbtn" data-del="'+esc(it.k)+'">remove</button></div>';
+  if(cols.length){
+   h+='<table class="rkv">';
+   for(var i=0;i<cols.length;i++){
+    h+='<tr><th>'+esc(cols[i])+'</th><td>'+esc(vals[i])+'</td></tr>';}
+   h+='</table>';
+  }else{h+='<div class="dim">'+esc(String(w.what||''))+'</div>';}
+  h+='<div class="mkmeta">labels: <input class="lbl-in" data-lbl-for="'+
+     esc(it.k)+'" value="'+esc((it.m.labels||[]).join(' '))+
+     '" placeholder="space separated"></div>';
+  h+='<textarea class="note-in" data-note-for="'+esc(it.k)+
+     '" placeholder="why this matters, what it links to">'+
+     esc(it.m.note||'')+'</textarea>';
+  h+='</div>';});
+ h+='<div class="mkbar" style="margin-top:12px">'+
+   '<button class="mkbtn" id="cs_save">Save current view</button>'+
+   '<button class="mkbtn" id="cs_rep">Write report (Markdown)</button>'+
+   '<button class="mkbtn" id="cs_dl">Export case JSON</button>'+
+   '<span class="dim">the marks, the labels and the notes - '+
+   'for the report, or to hand to the next examiner</span></div></div>';
+ return h;
+}
+/* ------------------------------------------------------------ the report
+   What every investigation platform ends with, and the reason to mark
+   anything at all: the case as a document somebody else can read.
+
+   Markdown rather than a rendered page, because the next thing that happens
+   to it is that a human edits it. Ordered by the clock, not by when the
+   examiner happened to click, and each entry carries the whole row - a report
+   that says "see FINDINGS row 41" is a report that cannot be checked.
+
+   Indicators are defanged on the way out. A report is a document that gets
+   mailed, and a live URL in a mailed document is a link somebody clicks. */
+function defang(v){
+ return String(v)
+  .replace(/https?:[/][/]/gi,function(m){return m.replace('t','x').replace('t','x');})
+  .replace(/([0-9]{1,3})[.]([0-9]{1,3})[.]([0-9]{1,3})[.]([0-9]{1,3})/g,
+           '$1[.]$2[.]$3[.]$4')
+  .replace(/[.](com|net|org|ru|cn|io|tech|xyz|top|info)(?![a-z])/gi,'[.]$1');
+}
+function caseReport(){
+ var host='',src='';
+ (D.meta||[]).forEach(function(m){
+  if(m[0]==='Hostname')host=m[1];
+  if(/collection|disk image/i.test(m[0])&&!src)src=m[1];});
+ var L=[];
+ L.push('# '+(caseInfo.name||'Investigation')+' \u2014 '+(host||'host'));
+ L.push('');
+ if(caseInfo.examiner)L.push('Examiner: '+caseInfo.examiner);
+ L.push('Evidence: `'+(src||'')+'`');
+ L.push('Generated by linsight '+(D.version||'')+' from '+
+        Object.keys(marks).length+' marked item(s).');
+ L.push('');
+ L.push('Indicators below are defanged.');
+ L.push('');
+
+ var items=Object.keys(marks).map(function(k){
+  return {k:k,m:marks[k],w:marks[k].where||{}};});
+ items.sort(function(a,b){
+  var A=a.w.when||a.m.updated||'',B=b.w.when||b.m.updated||'';
+  return A<B?-1:A>B?1:0;});
+
+ /* the summary an incident lead reads first */
+ var byState={};
+ items.forEach(function(it){
+  var st_=it.m.state||'interesting';
+  (byState[st_]=byState[st_]||[]).push(it);});
+ L.push('## Summary');
+ L.push('');
+ MK_STATES.forEach(function(ms){
+  var n=(byState[ms[0]]||[]).length;
+  if(n)L.push('- **'+ms[1]+'**: '+n+' item(s)');});
+ var labs=mkAllLabels();
+ if(labs.length)L.push('- Labels used: '+labs.join(', '));
+ L.push('');
+
+ /* the timeline of what was marked */
+ L.push('## Timeline of marked evidence');
+ L.push('');
+ items.forEach(function(it){
+  var w=it.w;
+  L.push('### '+(w.when||'(undated)')+' \u2014 '+stateLabel(it.m.state));
+  L.push('');
+  L.push('Source: `'+(w.table||'')+'`'+
+    ((it.m.labels||[]).length?'  \u00b7 labels: '+it.m.labels.join(', '):''));
+  L.push('');
+  if(it.m.note){L.push('> '+it.m.note.split(String.fromCharCode(10)).join(' '));L.push('');}
+  var cols=w.columns||[],vals=w.row||[];
+  if(cols.length){
+   L.push('| field | value |');
+   L.push('|---|---|');
+   for(var i=0;i<cols.length;i++){
+    L.push('| '+cols[i]+' | `'+defang(vals[i]).replace(/[|]/g,'\\|').slice(0,400)+'` |');}
+   L.push('');}
+ });
+
+ /* what the tool found, whether or not anybody marked it */
+ var fin=T('FINDINGS');
+ if(fin){
+  var si=fin.columns.indexOf('severity'),ti=fin.columns.indexOf('title'),
+      ci_=fin.columns.indexOf('count');
+  var crit=fin.rows.filter(function(r){
+   return r[si]==='CRITICAL'||r[si]==='HIGH';});
+  if(crit.length){
+   L.push('## Unmarked findings at HIGH or above');
+   L.push('');
+   L.push('Listed so the report says what was *not* triaged as well as what was.');
+   L.push('');
+   crit.forEach(function(r){
+    if(mkGet('FINDINGS',r))return;
+    L.push('- **'+r[si]+'** '+String(r[ti]).replace(/[|]/g,'')+
+      (r[ci_]?' ('+r[ci_]+')':''));});
+   L.push('');}}
+ return L.join(String.fromCharCode(10));
+}
+/* ------------------------------------------------------------- context
+   Timesketch calls it context search and it is the move an examiner makes
+   the moment anything looks wrong: not "what does this table say" but "what
+   else was this host doing at that second".
+
+   Served, this is one query across every table that carries a clock, which
+   is the thing the database is for. Without a database there is nothing to
+   ask, so the button is simply not offered. */
+var CTX=null,CTXQ=null;
+function ctxOpen(when,mins){
+ if(!when)return;
+ st.ctx={when:String(when).slice(0,19),minutes:mins||15};
+ CTX=null;st.view='context';draw();
+}
+function ctxForm(v){
+ return '<div class="casebar"><input id="ctx_when" style="min-width:260px" '+
+  'placeholder="YYYY-MM-DD HH:MM:SS" value="'+esc(v||'')+'">'+
+  '<button class="mkbtn" id="ctx_go">show what happened around it</button>'+
+  '<span class="dim">paste a timestamp from any grid</span></div>';
+}
+function viewContext(){
+ var c=st.ctx;
+ if(!c)return '<div class="pad"><h3>Context</h3>'+
+  '<div class="dim" style="margin-bottom:10px">What else was this host doing '+
+  'at one moment - asked of every table that carries a clock, in one query. '+
+  'Type a time below, or press <b>context</b> on any item in the Case '+
+  'view.</div>'+ctxForm('')+'</div>';
+ if(!D.served)return '<div class="pad"><h3>Context</h3><div class="dim">'+
+  'Context is a database query - run with --serve to use it.</div></div>';
+ var key=c.when+'|'+c.minutes;
+ if(!CTX||CTXQ!==key){
+  if(CTXQ!==key){
+   CTXQ=key;
+   fetch('/api/context?when='+encodeURIComponent(c.when)+'&minutes='+c.minutes)
+    .then(function(r){return r.json();}).then(function(j){CTX=j;draw();},
+     function(){CTX={tables:[],total:0,error:1};draw();});}
+  return '<div class="pad"><h3>Context</h3><div class="dim">Asking every '+
+   'table what happened around '+esc(c.when)+'\u2026</div></div>';
+ }
+ var h='<div class="pad"><h3>Context</h3>'+ctxForm(c.when)+
+  '<div class="mkbar"><span>around <b>'+esc(c.when)+'</b></span>';
+ [5,15,60,240].forEach(function(m){
+  h+='<button class="mkbtn'+(c.minutes===m?' on':'')+'" data-ctxm="'+m+
+     '">\u00b1'+m+'m</button>';});
+ h+='<span class="dim">'+CTX.total+' row(s) across '+CTX.tables.length+
+    ' table(s)</span></div>';
+ CTX.tables.forEach(function(t){
+  h+='<div class="mkcard"><div class="mkhead"><span class="badge">'+
+     esc(t.table)+'</span><span class="dim">'+t.rows.length+
+     ' row(s) by '+esc(t.time_column)+'</span></div>';
+  h+='<table class="grid"><thead><tr>';
+  t.columns.forEach(function(c2){h+='<th>'+esc(c2)+'</th>';});
+  h+='</tr></thead><tbody>';
+  t.rows.forEach(function(r){
+   h+='<tr>';
+   for(var i=0;i<t.columns.length;i++){
+    h+='<td><div class="c">'+esc(r[i]==null?'':r[i])+'</div></td>';}
+   h+='</tr>';});
+  h+='</tbody></table></div>';});
+ return h+'</div>';
+}
+
+/* --------------------------------------------------------- saved views
+   The other half of what makes Timesketch a workspace: a filter you reached
+   once and can return to, by name, and that somebody else can open. Saved
+   into the case rather than the browser, so it travels with the marks. */
+function viewState(){
+ return {view:st.view,table:st.table,tq:st.tq||'',cat:st.cat||'',
+         tech:st.tech||'',sev:JSON.parse(JSON.stringify(st.sev||{})),
+         t0:(el('t0')||{}).value||'',t1:(el('t1')||{}).value||'',
+         cols:(typeof colFilters!=='undefined')?colFilters.slice():[]};
+}
+function saveView(name){
+ if(!name)return;
+ caseInfo.views=caseInfo.views||[];
+ caseInfo.views=caseInfo.views.filter(function(v){return v.name!==name;});
+ caseInfo.views.push({name:name,at:new Date().toISOString().slice(0,19)
+   .replace('T',' '),state:viewState()});
+ pushCase();draw();
+}
+function loadView(name){
+ var v=(caseInfo.views||[]).filter(function(x){return x.name===name;})[0];
+ if(!v)return;
+ var q=v.state||{};
+ st.view=q.view||'overview';st.table=q.table||st.table;
+ st.tq=q.tq||'';st.cat=q.cat||'';st.tech=q.tech||'';
+ if(q.sev)st.sev=q.sev;
+ if(typeof colFilters!=='undefined')colFilters=(q.cols||[]).slice();
+ if(el('t0'))el('t0').value=q.t0||'';
+ if(el('t1'))el('t1').value=q.t1||'';
+ if(typeof readWin==='function')readWin();
+ draw();
+}
+function pushCase(){
+ if(!D.served){try{localStorage.setItem(mkStoreKey()+'.case',
+   JSON.stringify(caseInfo));}catch(e){}return;}
+ try{fetch('/api/case',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(caseInfo)});}catch(e){}
+}
+function stateLabel(k){
+ for(var i=0;i<MK_STATES.length;i++)if(MK_STATES[i][0]===k)return MK_STATES[i][1];
+ return k||'';
+}
+
+function themeInit(){
+ var v='dark';
+ try{v=localStorage.getItem('linsight.theme')||'dark';}catch(e){}
+ themeSet(v);
+ var b=document.getElementById('theme');
+ if(b)b.onclick=function(){
+  themeSet(document.documentElement.getAttribute('data-theme')==='light'
+   ?'dark':'light');};
+}
+function themeSet(v){
+ document.documentElement.setAttribute('data-theme',v);
+ try{localStorage.setItem('linsight.theme',v);}catch(e){}
+ var b=document.getElementById('theme');
+ if(b)b.innerHTML=(v==='light')?'&#9681;':'&#9680;';
+ if(st&&st.view==='entities')draw();     /* the graph paints its own colours */
+}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function el(id){return document.getElementById(id);}
@@ -23373,7 +25970,15 @@ function ci(t,name){return t?t.columns.indexOf(name):-1;}
    (every clock is normalised before it reaches a table), so it is read as UTC
    rather than through the examiner's timezone. */
 function ts(s){
- var d=Date.parse(String(s||'').replace(' ','T')+'Z');
+ /* Every clock in these tables is already UTC, so a bare stamp gets its Z.
+    A stamp that already carries an offset keeps it - appending Z to
+    '...11:04:14+00:00' produced an unparseable string and, before the
+    database was taught to use the shared formatter, silently emptied the
+    graph of all 2,411 of its events. */
+ var v=String(s||'').trim();
+ if(!v)return null;
+ var iso=v.replace(' ','T');
+ var d=Date.parse(/[Zz]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(iso)?iso:iso+'Z');
  return isNaN(d)?null:d/1000;
 }
 
@@ -23420,6 +26025,64 @@ function inWindow(tc,r){
  return true;
 }
 function winOn(){return st.t0!==null||st.t1!==null;}
+
+/* ---------- the collection filter ----------
+   An export merged from several images carries every host's rows in one set
+   of tables, each row naming the collection it came from. No selection means
+   all of them, which is the useful default: the question an examiner opens
+   three disks with is "what happened", not "what happened on disk 2". Picking
+   one narrows every grid, both charts, the severity counts and the ATT&CK
+   matrix at once - the same reach the time window has, and for the same
+   reason. A table with no such column is left alone rather than emptied:
+   CROSS_IOCS is about several collections by construction and filtering it to
+   one would be filtering out the answer. */
+var HOSTS=D.hosts||[],HOSTCOL=D.hostcol||'';
+function hostOn(){return !!(st.host&&HOSTCOL);}
+function hostCol(t){
+ if(t._hc===undefined)t._hc=HOSTCOL?ci(t,HOSTCOL):-1;
+ return t._hc;
+}
+function inHost(t,r){
+ var i=hostCol(t);
+ return i<0||r[i]===st.host;
+}
+function hostFilter(rows,t){
+ if(!hostOn())return rows;
+ var i=hostCol(t);
+ if(i<0)return rows;
+ return rows.filter(function(r){return r[i]===st.host;});
+}
+/* Rows this collection contributed to a table, for the badge that says so. */
+function hostSkipped(t){
+ if(!hostOn())return 0;
+ var i=hostCol(t);
+ if(i<0)return 0;
+ var n=0;
+ t.rows.forEach(function(r){if(r[i]!==st.host)n++;});
+ return n;
+}
+function hostRender(){
+ var box=el('hf');
+ if(!box)return;
+ if(HOSTS.length<2||!HOSTCOL){box.innerHTML='';return;}
+ var h='<span class="lb">collection</span><select id="hostsel" title="'+
+   'narrow every table to one of the collections in this export">'+
+   '<option value="">all '+HOSTS.length+'</option>';
+ HOSTS.forEach(function(x){
+  h+='<option value="'+esc(x)+'"'+(st.host===x?' selected':'')+'>'+esc(x)+'</option>';});
+ box.innerHTML=h+'</select>';
+ var sel=el('hostsel');
+ sel.className=hostOn()?'on':'';
+ sel.onchange=function(){setHost(sel.value);};
+}
+function setHost(v){
+ if(st.host===v)return;
+ st.host=v;
+ /* the calendar shading and the '-24h' anchor are both read off the timeline,
+    so a narrower set of rows is a different calendar and a different anchor */
+ DAYN=null;DMAX=null;
+ hostRender();chips();render();
+}
 /* The latest moment anything in the collection carries, so '-24h' has an end
    to count back from. The capture is the natural anchor, not the reader's
    clock: a collection taken last year is still read as its own last day. */
@@ -23429,8 +26092,9 @@ function dataMax(){
  DMAX=0;
  var t=vt('timeline')||vt('findings');
  if(t){
-  var tc=tcols(t);
+  var tc=tcols(t),hi=hostOn()?hostCol(t):-1;
   t.rows.forEach(function(r){
+   if(hi>=0&&r[hi]!==st.host)return;
    var sp=rowSpan(tc,r);
    if(sp&&sp[1]>DMAX)DMAX=sp[1];});}
  return DMAX;
@@ -23499,6 +26163,15 @@ function undatedCount(t){
  t.rows.forEach(function(r){if(rowSpan(tc,r)===null)n++;});
  return n;
 }
+function hostBadge(t){
+ if(!hostOn())return '';
+ if(hostCol(t)<0)return '<span class="badge">collection filter not applied '+
+   '\u2014 '+esc(t.name)+' has no per-collection rows</span>';
+ var n=hostSkipped(t);
+ return '<span class="badge warn">collection '+esc(st.host)+
+   (n?' \u2014 '+n.toLocaleString()+' row(s) from the others hidden':'')+
+   ' <span class="pill" data-hostclear="1">clear &times;</span></span>';
+}
 function winBadge(t){
  if(!winOn())return '';
  var tc=tcols(t);
@@ -23543,7 +26216,9 @@ function frows(){
  var f=fc();
  if(!f)return [];
  var tc=winOn()?tcols(f.t):null;
+ var hi=hostOn()?hostCol(f.t):-1;
  return f.t.rows.filter(function(r){
+  if(hi>=0&&r[hi]!==st.host)return false;
   if(!st.sev[r[f.severity]])return false;
   if(st.cat&&r[f.category]!==st.cat)return false;
   if(st.tech&&techsOf(r[f.mitre]).indexOf(st.tech)<0)return false;
@@ -23574,7 +26249,10 @@ function chips(){
  var f=fc();
  if(!f){el('chips').innerHTML='';return;}
  var n={};
- (f.t.rows||[]).forEach(function(r){n[r[f.severity]]=(n[r[f.severity]]||0)+1;});
+ var hi=hostOn()?hostCol(f.t):-1;
+ (f.t.rows||[]).forEach(function(r){
+  if(hi>=0&&r[hi]!==st.host)return;
+  n[r[f.severity]]=(n[r[f.severity]]||0)+1;});
  var h='';
  SEV.forEach(function(s){
   h+='<button class="chip '+s+' '+(st.sev[s]?'on':'off')+'" data-s="'+s+'">'+
@@ -23812,8 +26490,9 @@ function dayCounts(){
  DAYN={max:0,n:{}};
  var t=vt('timeline')||vt('findings');
  if(!t)return DAYN;
- var tc=tcols(t);
+ var tc=tcols(t),hi=hostOn()?hostCol(t):-1;
  t.rows.forEach(function(r){
+  if(hi>=0&&r[hi]!==st.host)return;
   var sp=rowSpan(tc,r);
   if(!sp)return;
   var d=new Date(sp[0]*1000);
@@ -24076,7 +26755,10 @@ function viewHead(){
     ' &times;</span>';
   if(st.tech)h+='<span class="pill" data-clear="tech">'+esc(st.tech)+
     ' &times;</span>';
-  h+='</div>'+detailHtml();
+  /* The finding's own row opens underneath it with the artifact rows it
+     came from, which is the same information this panel carried and more of
+     it - two previews of one row is one too many. */
+  h+='</div>';
  }else if(st.view==='timeline'){
   var t=TB[st.table];
   /* Drawn from what the chips, the row filter and the column filters left,
@@ -24084,37 +26766,125 @@ function viewHead(){
      spike sits in. */
   h+=histo(tMatching(t,true),ci(t,'timestamp_utc'),ci(t,'severity'),80,132,true).html;
  }
+ if(hostOn())h+='<div class="pills"><span class="pill" data-hostclear="1">'+
+   'collection: '+esc(st.host)+' &times;</span></div>';
  if(winOn())h+='<div class="pills"><span class="pill" data-winclear="1">'+
    'time window: '+esc(fmtWin())+' &times;</span></div>';
  return h;
 }
 
-/* The finding under the cursor, read out of the row itself - the grid holds
-   every column the detail pane needs, evidence included. */
-function detailHtml(){
- var f=fc(),r=st.sel;
- if(!f||!r)return '';
- var h='<div class="detail" id="det"><span class="x" data-clear="sel">&times;</span>'+
-   '<h4><span class="tag" style="background:var(--'+r[f.severity]+
-   ');color:#0f1419;padding:1px 6px;border-radius:3px;font-size:10px;'+
-   'margin-right:7px">'+esc(r[f.severity])+'</span>'+esc(r[f.title])+'</h4>';
- if(f.detail>=0&&r[f.detail])h+='<div class="d">'+esc(r[f.detail])+'</div>';
- h+='<div class="kv"><span>category</span><div>'+esc(r[f.category])+'</div>';
- if(r[f.artifact])h+='<span>artifact</span><div><code>'+esc(r[f.artifact])+
-   '</code></div>';
- var seen=[r[f.first_utc],r[f.last_utc]].filter(Boolean);
- if(seen.length)h+='<span>seen</span><div>'+esc(seen.join(' .. '))+' UTC</div>';
- h+='<span>occurrences</span><div>'+esc(r[f.count])+'</div>';
- var tl=techsOf(r[f.mitre]);
- if(tl.length){
-  h+='<span>ATT&amp;CK</span><div>';
-  tl.forEach(function(t){
-   var nm=techName(r[f.mitre],t);
-   h+='<span class="pill" data-tech="'+esc(t)+'">'+esc(t)+(nm?' '+esc(nm):'')+
-      '</span>';});
-  h+='</div>';}
- h+='</div>';
- if(f.evidence>=0&&r[f.evidence])h+='<pre>'+esc(r[f.evidence])+'</pre>';
+
+/* ---------- the correlation ----------
+   Its own tab rather than eight grids scattered through the nav, because it
+   answers one question - what do these collections have in common - and the
+   answer is only worth anything read together. Each panel is the top of one
+   cross-host table with a way into the full grid: the point here is to see
+   that a key is shared and an address arrived in a direction, not to page
+   through four hundred rows.
+
+   Deliberately not filtered by the collection picker. Every row in here is a
+   statement about several collections at once, so narrowing to one would be
+   filtering out the answer - and the tab says so rather than silently
+   showing less. */
+function crossPanel(name,cols,fmt){
+ var t=TB[name];
+ if(!t||!t.row_count)return '';
+ var rows=t.rows||[];
+ var at={};t.columns.forEach(function(c,i){at[c]=i;});
+ var h='<div class="mkcard"><div class="mkhead"><b>'+esc(t.title)+'</b>'+
+   '<span class="grow"></span><span class="dim">'+
+   t.row_count.toLocaleString()+' row(s)</span>'+
+   '<button class="mkbtn" data-open="'+esc(name)+'">open '+esc(name)+
+   '</button></div>';
+ if(!rows.length)return h+'<div class="dim pad">'+
+   (t.rows===undefined
+    ?'decoding '+t.row_count.toLocaleString()+' row(s)\u2026'
+    :'no rows')+'</div></div>';
+ h+='<table class="tbl"><thead><tr>';
+ cols.forEach(function(c){h+='<th>'+esc(c)+'</th>';});
+ h+='</tr></thead><tbody>';
+ rows.slice(0,8).forEach(function(r){
+  h+='<tr>';
+  cols.forEach(function(c){
+   var v=at[c]===undefined?'':r[at[c]];
+   h+='<td>'+(fmt?fmt(c,v,r,at):esc(String(v==null?'':v)))+'</td>';});
+  h+='</tr>';});
+ h+='</tbody></table>';
+ if(t.row_count>8)h+='<div class="dim pad">'+(t.row_count-8).toLocaleString()+
+   ' more in the full table</div>';
+ return h+'</div>';
+}
+/* The cross-host tables are not in the set the console decodes on open, and
+   they are not waited for as a set either.
+
+   Waiting was the first cut and it was wrong. CROSS_HASHES on a real estate
+   is every file three hosts have in common - tens of thousands of rows - and
+   blocking eight panels on the slowest of them meant staring at "unpacking"
+   while the one table nobody came for decoded. Each panel shows eight rows;
+   there is no reason for the eight rows of CROSS_IOCS to wait on any of it.
+   So they are decoded one at a time, in the order the tab lists them, and the
+   page is redrawn as each lands. A panel that has no rows yet draws its
+   heading and its count - which come from the index and need no decode at
+   all - so the tab is complete from the first paint and only fills in. */
+function crossWarm(){
+ if(crossWarm._busy)return;
+ var next=crossTables().filter(function(n){return TB[n].rows===undefined;})[0];
+ if(!next)return;
+ crossWarm._busy=1;
+ ensure([next]).then(function(){
+  crossWarm._busy=0;
+  if(st.view==='correlation')draw();
+  crossWarm();});
+}
+function viewCorrelation(){
+ if(!haveCross())return '<div class="pad"><h3>Correlation</h3>'+
+  '<div class="dim">This export holds one collection. Pass several - '+
+  '<code>linsight.py uac1.tar disk2.dd disk3.E01 --export ./case '+
+  '--correlate</code> - and this tab fills with what is true of more than '+
+  'one of them.</div></div>';
+ var have=crossTables();
+ crossWarm();
+ var hosts=TB['HOSTS'],hrows=(hosts&&hosts.rows)||[];
+ var h='<div class="pad"><h3>Correlation</h3>';
+ h+='<div class="dim" style="margin-bottom:8px">What is true of more than '+
+   'one of these collections, and of none of them on its own. The collection '+
+   'picker does not apply here: every row is a statement about several at '+
+   'once.</div>';
+ if(hrows.length){
+  var ha={};hosts.columns.forEach(function(c,i){ha[c]=i;});
+  h+='<div class="cards">';
+  hrows.forEach(function(r){
+   h+='<div class="card" data-hostpick="'+esc(r[ha['collection']])+'">'+
+      '<b>'+esc(r[ha['collection']])+'</b><span>'+
+      esc(r[ha['hostname']]||'hostname not recorded')+'</span>'+
+      '<span class="dim">'+esc(r[ha['critical']]||'0')+' critical \u00b7 '+
+      esc(r[ha['high']]||'0')+' high \u00b7 '+
+      esc(r[ha['indicators']]||'0')+' indicators</span></div>';});
+  h+='</div>';
+ }
+ h+=crossPanel('CROSS_SESSIONS',
+   ['timestamp_utc','from_collection','to_collection','user','result','service']);
+ h+=crossPanel('CROSS_COMMANDS',
+   ['timestamp_utc','from_collection','to_collection','user','matched','command']);
+ h+=crossPanel('CROSS_IOCS',
+   ['indicator','type','host_count','hosts','first_host','first_utc','spread']);
+ h+=crossPanel('CROSS_KEYS',
+   ['key_type','fingerprint_head','host_count','hosts']);
+ h+=crossPanel('CROSS_HASHES',
+   ['digest','host_count','hosts','notable','same_path','paths']);
+ h+=crossPanel('CROSS_ACCOUNTS',
+   ['username','uid','host_count','hosts','consistent','shells']);
+ h+=crossPanel('CROSS_PERSISTENCE',['kind','value','host_count','hosts']);
+ h+=crossPanel('CROSS_FINDINGS',
+   ['severity','category','finding','host_count','hosts'],
+   function(c,v){
+    if(c==='severity')return '<b style="color:var(--'+esc(v)+')">'+esc(v)+'</b>';
+    return esc(String(v==null?'':v));});
+ h+=crossPanel('CROSS_TECHNIQUES',
+   ['technique','severity','host_count','hosts','missing_from']);
+ if(!have.length)h+='<div class="dim pad">Nothing is shared between these '+
+   'collections - which is itself an answer, and a cleaner one than a table '+
+   'of coincidences would have been.</div>';
  return h+'</div>';
 }
 
@@ -24130,6 +26900,10 @@ function buildNav(){
  var h='';
  if(fc()||vt('timeline')){
   VIEWS.forEach(function(v){
+   /* Correlation is only a tab when the export holds more than one
+      collection. An empty tab that explains why it is empty is worth having
+      where a reader might expect data; in the nav it is just a dead entry. */
+   if(v[0]==='correlation'&&!haveCross())return;
    var t=vt(v[0]),n=t?'<span class="n">'+t.row_count.toLocaleString()+'</span>':'';
    h+='<a data-v="'+v[0]+'">'+v[1]+n+'</a>';});}
  var rest=IDX.filter(function(t){return !isView(t);});
@@ -24192,6 +26966,165 @@ function searchAll(q){
  out.sort(function(a,b){return b.count-a.count;});
  return out;
 }
+/* A local model with the case behind it.
+
+   The model is not given the case - it is given the schema and a read-only
+   SELECT, and has to go and look, exactly as the MCP server does. That is why
+   the steps are shown under every answer: an answer from a 7B is worth what
+   the queries behind it are worth, and an analyst who cannot see them has
+   been handed a rumour. The page talks to this server and the server talks to
+   a model on localhost; nothing leaves the machine. */
+/* The Ask panel. A conversation rather than a box, because the second
+   question an examiner asks is almost always about the answer to the first -
+   "and what else did that address touch" needs an antecedent, and a panel
+   that forgets between questions makes the analyst paste the address back in
+   every time.
+
+   turns is what is on screen, newest first so the composer stays where it
+   was; history is what goes back to the model, and it is only the questions
+   and the answers. The tool traffic stays here. */
+var ASK={busy:false,q:'',cfg:null,turns:[],history:[],skill:'',need:''};
+function askSkill(name){
+ var list=(ASK.cfg&&ASK.cfg.skills)||[];
+ for(var i=0;i<list.length;i++)if(list[i].name===name)return list[i];
+ return null;
+}
+function viewAsk(){
+ var h='<h1>Ask</h1>';
+ if(!served)
+  return h+'<p class="desc">This needs the investigation server - it is the '+
+   'server that talks to the model. Open the case with --serve.</p>';
+ if(!ASK.cfg){
+  fetch('/api/llm').then(function(r){return r.json();}).then(function(j){
+   ASK.cfg=j;draw();}).catch(function(){ASK.cfg={models:[]};draw();});
+  return h+'<p class="desc">Looking for a model...</p>';
+ }
+ var c=ASK.cfg;
+ if(!c.models||!c.models.length)
+  return h+'<p class="desc">No model answered at <code>'+esc(c.url||'')+
+   '</code>. Start one and pull a model that supports tool calling - '+
+   '<code>ollama pull llama3.1:8b</code> - then reopen this tab.</p>';
+ h+='<p class="desc">A model on this machine, querying this case. It reads '+
+    'the tables and nothing else, and every answer shows the queries behind '+
+    'it so you can check them.</p>';
+
+ /* The playbooks, as buttons. A skill whose tables this collection does not
+    have is still offered, dimmed: it runs, and it reports that the evidence
+    is not there, which is a result an examiner needs said rather than left
+    to infer from a button that is missing. */
+ var sk=c.skills||[];
+ if(sk.length){
+  h+='<div class="dim" style="margin-top:13px">or run a playbook - the '+
+     'sequence an examiner follows, with the tables and the joins already '+
+     'named</div><div class="skills">';
+  sk.forEach(function(s){
+   var thin=!s.has||!s.has.length;
+   h+='<button class="skill'+(thin?' thin':'')+'" data-skill="'+esc(s.name)+
+      '" title="'+esc(s.about+(thin?' - this case has none of the tables it '+
+      'names':''))+'"><b>'+esc(s.title)+'</b>'+
+      (s.args&&s.args.length?' <i>needs '+esc(s.args[0].name)+'</i>':'')+
+      '</button>';});
+  h+='</div>';
+ }
+
+ var sel=ASK.skill?askSkill(ASK.skill):null;
+ if(sel)
+  h+='<div class="askrow"><span class="dim">playbook: <b>'+esc(sel.title)+
+     '</b>'+(ASK.need?' - type the '+esc(ASK.need)+' below':'')+
+     '</span><button class="mkbtn" id="askclr2">not this one</button></div>';
+
+ h+='<textarea id="askq" placeholder="'+
+    (ASK.need?esc('the '+ASK.need+', on its own'):
+     'which addresses both failed SSH logins and got a 2xx from the web '+
+     'server?')+'">'+esc(ASK.q)+'</textarea>';
+ h+='<div class="askrow"><select id="askm">';
+ c.models.forEach(function(m){
+  h+='<option'+(m===c.model?' selected':'')+'>'+esc(m)+'</option>';});
+ h+='</select><button class="mkbtn" id="askgo"'+(ASK.busy?' disabled':'')+'>'+
+    (ASK.busy?'thinking...':'ask')+'</button>';
+ if(ASK.turns.length)
+  h+='<button class="mkbtn" id="askclr">new thread</button>';
+ h+='<span class="dim">local · read-only · a 7B on '+
+    'CPU takes a minute or two</span></div>';
+ if(ASK.turns.length)
+  h+='<div class="dim" style="margin-top:6px">'+ASK.turns.length+
+     ' exchange'+(ASK.turns.length===1?'':'s')+' in this thread - the model '+
+     'sees the last two, so a follow-up can say "it".</div>';
+
+ ASK.turns.forEach(function(t){
+  var o=t.out||{};
+  h+='<div class="askturn"><div class="askq"><b>'+esc(t.label)+'</b></div>';
+  if(o.error)h+='<div class="askans">'+esc(o.error)+'</div>';
+  else{
+   if(o.unsupported&&o.unsupported.length)
+    h+='<div class="askbad"><b>'+o.unsupported.length+' figure'+
+       (o.unsupported.length===1?'':'s')+' below appear in no query result:'+
+       '</b> '+esc(o.unsupported.join(', '))+'. Those did not come from this '+
+       'case. Check the queries yourself before using any of this.</div>';
+   h+='<div class="askans">'+esc(o.answer||'(it answered with nothing)')+
+      '</div>';
+   if(o.truncated)
+    h+='<div class="dim" style="margin-top:6px">it used every round it had, '+
+       'so this is what it had reached - ask for one part of it, narrower.'+
+       '</div>';
+   if(o.steps&&o.steps.length){
+    h+='<div style="margin-top:11px"><span class="dim">what it looked at, in '+
+       'order</span></div>';
+    o.steps.forEach(function(st){
+     h+='<div class="askstep"><b>'+esc(st.tool)+'</b> '+esc(st.note||'');
+     if(st.args&&st.args.sql)
+      h+='<div class="asksql">'+esc(st.args.sql)+'</div>';
+     h+='</div>';});
+   }
+   h+='<div class="dim" style="margin-top:9px">answered by '+
+      esc(o.model||'')+'</div>';
+  }
+  h+='</div>';});
+ return h;
+}
+function askRun(name,text){
+ if(ASK.busy)return;
+ var sel=name?askSkill(name):null;
+ var need=sel&&sel.args&&sel.args.length?sel.args[0].name:'';
+ if(need&&!text){ASK.skill=name;ASK.need=need;ASK.q='';draw();
+  var box=el('askq');if(box)box.focus();return;}
+ if(!name&&!text)return;
+ var args={};if(need)args[need]=text;
+ var label=sel?(sel.title+(text?': '+text:'')):text;
+ ASK.busy=true;draw();
+ fetch('/api/ask',{method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({question:text,model:(el('askm')||{}).value,
+     skill:name||'',args:args,history:ASK.history})})
+  .then(function(r){return r.json();})
+  .then(function(j){
+    ASK.busy=false;ASK.skill='';ASK.need='';ASK.q='';
+    /* The server hands back the thread it wants next time. Only replace ours
+       when it did - an error carries no history, and dropping the thread on
+       a failed question loses the two exchanges before it as well. */
+    if(j&&j.history)ASK.history=j.history;
+    ASK.turns.unshift({label:label,out:j});draw();})
+  .catch(function(e){ASK.busy=false;
+    ASK.turns.unshift({label:label,
+      out:{error:'the server did not answer: '+e}});draw();});
+}
+function askWire(){
+ var b=el('askgo'),q=el('askq'),clr=el('askclr'),clr2=el('askclr2');
+ if(q)q.oninput=function(){ASK.q=q.value;};
+ if(q)q.onkeydown=function(e){
+  /* Ctrl-Enter sends. Enter has to stay a newline: a question with a quoted
+     path or a pasted log line in it is a multi-line question. */
+  if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();
+   askRun(ASK.skill,(q.value||'').trim());}};
+ if(clr)clr.onclick=function(){
+  ASK.turns=[];ASK.history=[];ASK.skill='';ASK.need='';draw();};
+ if(clr2)clr2.onclick=function(){ASK.skill='';ASK.need='';draw();};
+ var btns=document.querySelectorAll('.skill');
+ for(var i=0;i<btns.length;i++)btns[i].onclick=function(){
+  askRun(this.getAttribute('data-skill'),(el('askq')||{}).value||'');};
+ if(!b)return;
+ b.onclick=function(){askRun(ASK.skill,(q&&q.value||'').trim());};
+}
 function viewSearch(){
  var q=st.gq||'';
  var h='<h1>Search all tables</h1>';
@@ -24235,8 +27168,16 @@ function draw(){
     renders itself: it owns its sort, its column filters and its caret, none
     of which survive being rebuilt from a string. */
  if(st.view==='table'||vt(st.view)){tRender();markNav();return;}
- el('main').innerHTML=st.view==='search'?viewSearch()
-  :st.view==='attack'?viewAttack():viewOverview();
+ el('main').innerHTML=st.view==='ask'?viewAsk()
+  :st.view==='search'?viewSearch()
+  :st.view==='attack'?viewAttack()
+  :st.view==='graph'?viewGraph()
+  :st.view==='panels'?viewPanels()
+  :st.view==='correlation'?viewCorrelation()
+  :st.view==='entities'?viewEntities()
+  :st.view==='context'?viewContext()
+  :st.view==='iocs'?viewIocs()
+  :st.view==='marked'?viewMarked():viewOverview();
  wire();
  markNav();
 }
@@ -24260,9 +27201,100 @@ function goTable(name,q){
  render();
 }
 var gqTimer=null;
+function wireExtras(){
+ egWire();
+ askWire();
+ [].forEach.call(document.querySelectorAll('.gt rect.ev'),function(rc){
+  rc.onclick=function(){
+   var e=GEV[+rc.getAttribute('data-i')];if(!e||!GSRC)return;
+   var entry=mkCycle(GSRC.name,e.row,rowRef(GSRC,e.row,fmtT(e.t)));
+   rc.setAttribute('fill',entry&&entry.state?'var(--'+entry.state+')':
+     'var(--'+e.s+')');
+   rc.setAttribute('opacity',entry&&entry.state==='benign'?.3:
+     entry&&entry.state?1:.72);
+   rc.setAttribute('width',entry&&entry.state?5:3);};});
+ [].forEach.call(document.querySelectorAll('tr.ioc'),function(tr){
+  tr.onclick=function(){
+   var ind=tr.getAttribute('data-ioc'),key='IOC|'+h32(ind);
+   var cur=marks[key],at=-1;
+   for(var i=0;i<MK_STATES.length;i++)if(cur&&cur.state===MK_STATES[i][0])at=i;
+   var next=at+1>=MK_STATES.length?null:MK_STATES[at+1][0];
+   var entry=next?{state:next,note:cur?cur.note||'':'',
+                   labels:cur?cur.labels||[]:[]}:null;
+   mkSave(key,entry,{table:'IOCS',what:ind});
+   tr.className='ioc'+mkClass(entry);};});
+ [].forEach.call(document.querySelectorAll('.lbl-chip[data-lbl]'),function(c){
+  c.onclick=function(){
+   var l=c.getAttribute('data-lbl');st.label=st.label===l?'':l;draw();};});
+ /* The case cards are editable in place: a note written somewhere other than
+    beside the evidence is a note that will not be written. Saved on blur
+    rather than per keystroke - one request per thought, not per letter. */
+ [].forEach.call(document.querySelectorAll('textarea[data-note-for]'),function(ta){
+  ta.onblur=function(){
+   var k=ta.getAttribute('data-note-for'),m=marks[k];if(!m)return;
+   if((m.note||'')===ta.value)return;
+   m.note=ta.value;mkSave(k,m,m.where);};});
+ [].forEach.call(document.querySelectorAll('input[data-lbl-for]'),function(inp){
+  inp.onchange=function(){
+   var k=inp.getAttribute('data-lbl-for'),m=marks[k];if(!m)return;
+   m.labels=inp.value.split(/[ ,;]+/).filter(Boolean);
+   mkSave(k,m,m.where);draw();};});
+ [].forEach.call(document.querySelectorAll('button[data-cycle]'),function(b){
+  b.onclick=function(){
+   var k=b.getAttribute('data-cycle'),m=marks[k];if(!m)return;
+   var at=-1;
+   for(var i=0;i<MK_STATES.length;i++)if(m.state===MK_STATES[i][0])at=i;
+   var nx=MK_STATES[(at+1)%MK_STATES.length][0];
+   m.state=nx;mkSave(k,m,m.where);draw();};});
+ [].forEach.call(document.querySelectorAll('button[data-del]'),function(b){
+  b.onclick=function(){
+   var k=b.getAttribute('data-del');mkSave(k,null,null);draw();};});
+ [].forEach.call(document.querySelectorAll('button[data-ctx]'),function(b){
+  b.onclick=function(){ctxOpen(b.getAttribute('data-ctx'),15);};});
+ var cg=document.getElementById('ctx_go'),cw=document.getElementById('ctx_when');
+ if(cg&&cw){
+  var go=function(){
+   var v=cw.value.trim();
+   if(v)ctxOpen(v,(st.ctx&&st.ctx.minutes)||15);};
+  cg.onclick=go;
+  cw.onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();go();}};}
+ [].forEach.call(document.querySelectorAll('button[data-ctxm]'),function(b){
+  b.onclick=function(){
+   st.ctx.minutes=+b.getAttribute('data-ctxm');CTX=null;CTXQ=null;draw();};});
+ [].forEach.call(document.querySelectorAll('button[data-view]'),function(b){
+  b.onclick=function(){loadView(b.getAttribute('data-view'));};});
+ var sv=document.getElementById('cs_save');
+ if(sv)sv.onclick=function(){
+  var n=prompt('Name this view');if(n)saveView(n.trim());};
+ var rep=document.getElementById('cs_rep');
+ if(rep)rep.onclick=function(){
+  var blob=new Blob([caseReport()],{type:'text/markdown'});
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download='case-report.md';a.click();};
+ var dl=document.getElementById('cs_dl');
+ if(dl)dl.onclick=function(){
+  var blob=new Blob([JSON.stringify({case:caseInfo,marks:marks},null,1)],
+    {type:'application/json'});
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download='case.json';a.click();};
+ ['cs_name','cs_an'].forEach(function(id){
+  var i=document.getElementById(id);if(!i)return;
+  i.onchange=function(){
+   caseInfo[id==='cs_name'?'name':'examiner']=i.value;
+   if(served){try{fetch('/api/case',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(caseInfo)});}catch(e){}}
+  };});
+}
 function wire(){
+ wireExtras();
  wireHisto();
  wireWin();
+ [].forEach.call(document.querySelectorAll('[data-open]'),function(b){
+  b.onclick=function(){setView('table',b.getAttribute('data-open'));};});
+ [].forEach.call(document.querySelectorAll('[data-hostpick]'),function(b){
+  b.onclick=function(){setHost(b.getAttribute('data-hostpick'));
+                       setView('overview');};});
  var gq=el('gq');
  if(gq){
   gq.oninput=function(){
@@ -24340,6 +27372,7 @@ function start(){
     when it is opened. */
  el('main').innerHTML='<div class="empty">Opening the export...</div>';
  ensure(needs()).then(function(){
+  hostRender();
   chips();
   buildNav();
   var v=(location.hash||'').replace('#','');
@@ -24350,7 +27383,13 @@ function start(){
   else if(IDX.length)setView('table',IDX[0].name);
  });
  document.onkeydown=function(e){
-  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
+  /* Never while the examiner is typing. The guard listed INPUT and SELECT but
+     not TEXTAREA, so writing a note went 'b', 'r', 'u' and then the 't' of
+     'brute' fired the focus-the-time-window shortcut and the rest of the word
+     was typed into the date box. Any field that takes text has to be here,
+     including anything contenteditable. */
+  var tg=e.target||{},tn=tg.tagName;
+  if(tn==='INPUT'||tn==='SELECT'||tn==='TEXTAREA'||tg.isContentEditable)return;
   var k=e.key;
   if(k==='/'){var q=el('q');if(q){q.focus();e.preventDefault();}}
   if(k==='t'){var tb=el('t0');if(tb){tb.focus();calOpen('t0');e.preventDefault();}}
@@ -24393,15 +27432,23 @@ function tLayout(t,rows,cap){
    lens.push(m);
   }
   lens.sort(function(a,b){return a-b;});
-  var p90=lens.length?lens[Math.min(lens.length-1,Math.floor(lens.length*0.9))]:0;
-  var chars=Math.max(t.columns[j].length+2,p90);
+  /* p95, not p90. At p90 one row in ten is wider than its column, which on a
+     grid of log lines is a whole screen of clipped text - and the columns
+     that suffer are the ones carrying the evidence, because they are the
+     ones with the outliers. The extra width costs a little horizontal
+     scroll; the missing width costs the reader the message. */
+  var p95=lens.length?lens[Math.min(lens.length-1,Math.floor(lens.length*0.95))]:0;
+  var chars=Math.max(t.columns[j].length+2,p95);
   /* Short columns keep their content on one line; long ones wrap. The
      threshold sits above a UTC timestamp (19 chars) on purpose - wrapping
      '2026-06-11 12:24:57' onto two lines doubles the height of every row in
      the table for no gain. */
-  var nw=(p90<=28&&!num)||(num&&seen);
-  var px=Math.round(chars*7.2)+18;
-  out.push({w:Math.max(64,Math.min(nw?300:460,px)),num:(num&&seen>0),nw:nw});
+  var nw=(p95<=30&&!num)||(num&&seen);
+  /* 7.2px a character was measured against the body font; the monospace
+     cells this grid uses for paths and log lines are wider than that, so a
+     column of them was sized for text narrower than the text it holds. */
+  var px=Math.round(chars*7.9)+20;
+  out.push({w:Math.max(64,Math.min(nw?360:620,px)),num:(num&&seen>0),nw:nw});
  }
  return out;
 }
@@ -24444,6 +27491,12 @@ function tMatching(t,raw){
  if(winOn()&&!raw){
   var tc=tcols(t);
   if(tc.any)rows=rows.filter(function(r){return inWindow(tc,r);});}
+ /* Inside `raw` as well, unlike the window: the timeline chart is drawn raw
+    so that picking a spike does not hide the shape it sits in, but choosing a
+    collection is a statement about which evidence is in scope at all, and a
+    chart still drawn over three hosts would be answering a question nobody
+    asked. */
+ rows=hostFilter(rows,t);
  var v=isView(t);
  if(v){
   var si=t.columns.indexOf('severity');
@@ -24476,7 +27529,18 @@ function tOptions(t,j){
 function tBodyHtml(t,rows,cap){
  var sevIdx=t.columns.indexOf('severity'),h='';
  for(var i=0;i<cap;i++){
-  var r=rows[i];h+='<tr data-r="'+i+'"'+(r===st.sel?' class="sel"':'')+'>';
+  var r=rows[i];var _m=mkGet(t.name,r);
+  h+='<tr data-r="'+i+'" class="'+(r===st.sel?'sel':'')+mkClass(_m)+'">';
+  var _st=_m&&_m.state?_m.state:'';
+  var _note=_m&&_m.note?_m.note:'';
+  h+='<td class="mkc" data-mk="'+i+'" title="'+
+     (_st?esc(stateLabel(_st)):'click to mark')+' \u2014 '+
+     MK_STATES.map(function(x){return x[1];}).join(' \u203a ')+
+     '">'+(_st?MK_GLYPH[_st]:'<span class="g">\u25cb</span>')+'</td>';
+  h+='<td class="ntc" data-note="'+i+'" title="'+
+     (_note?esc(_note):'add a note')+'">'+
+     (_note?'<span class="hasnote">\u270e</span>':
+            '<span class="g">\u270e</span>')+'</td>';
   for(var j=0;j<t.columns.length;j++){
    var v=r[j]===undefined?'':r[j];
    var cls=(sevIdx===j)?'sev-'+esc(v):(lay[j].num?'num':'');
@@ -24510,18 +27574,64 @@ function emptyNote(t){
    t.row_count.toLocaleString()+' row(s) at other severities. '+
    '<span class="pill" id="allsev">show all severities &times;</span>';
 }
+/* How many rows are put in the DOM, which is not how many the page holds.
+
+   Every row is already here - the export embeds the whole table - so "showing
+   the first 500" was never a limit on the evidence, only on what had been
+   rendered. Telling the examiner to go and open the CSV to see row 501 of
+   their own investigation was the wrong answer to a question the page could
+   answer itself.
+
+   The cap stays, because putting a hundred thousand rows into a table element
+   locks the tab. It is now the examiner's to raise, per table, and it says
+   what raising it will cost. */
+var MKW=104,NTW=62;
+/* Rows drawn at once. Every one of them is a row the browser lays out on
+   each repaint of the grid, and SIGMA_MATCHES carries long rule titles and
+   a quoted evidence line per row - a thousand of those is a lot of text to
+   measure. Five hundred halves that for every table, and the pager below
+   reads its page count from here, so nothing else has to change. */
+var PAGE=500, PAGEAT={};
+function pageOf(t){return PAGEAT[t.name]||0;}
+function pageNote(t,total){
+ if(total<=PAGE)return total.toLocaleString()+' row(s)';
+ var at=pageOf(t),from=at*PAGE,to=Math.min(total,from+PAGE);
+ var pages=Math.ceil(total/PAGE);
+ var h='Rows '+(from+1).toLocaleString()+'\u2013'+to.toLocaleString()+
+   ' of '+total.toLocaleString()+
+   '  <span class="dim">(page '+(at+1)+' of '+pages.toLocaleString()+')</span> ';
+ h+='<button class="mkbtn" data-pg="0"'+(at?'':' disabled')+'>\u00ab first</button> ';
+ h+='<button class="mkbtn" data-pg="'+(at-1)+'"'+(at?'':' disabled')+
+    '>\u2039 prev</button> ';
+ h+='<button class="mkbtn" data-pg="'+(at+1)+'"'+(to<total?'':' disabled')+
+    '>next \u203a</button> ';
+ h+='<button class="mkbtn" data-pg="'+(pages-1)+'"'+(to<total?'':' disabled')+
+    '>last \u00bb</button>';
+ return h;
+}
+function wireCap(){
+ [].forEach.call(document.querySelectorAll('button[data-pg]'),function(b){
+  if(b.disabled)return;
+  b.onclick=function(){
+   var t=TB[st.table];if(!t)return;
+   PAGEAT[t.name]=Math.max(0,+b.getAttribute('data-pg'));
+   tRefresh();
+   var m=document.getElementById('main');if(m)m.scrollTop=0;};});
+}
 function tRefresh(){
  var t=TB[st.table];if(!t){return;}
+ pvClose();          /* the row it was anchored to may not survive the redraw */
  var rows=tMatching(t);
- var cap=rows.length>t.cap?t.cap:rows.length;
+ var at=pageOf(t)*PAGE;
+ if(at>=rows.length)at=PAGEAT[t.name]=0;
+ var page=rows.slice(at,at+PAGE);
  var tb=document.getElementById('tb');
- if(tb){tb.innerHTML=tBodyHtml(t,rows,cap);wireRows();}
+ if(tb){tb.innerHTML=tBodyHtml(t,page,page.length);wireRows();}
+ TLAST=page;
  var mn=document.getElementById('matchn');
  if(mn){mn.textContent=rows.length.toLocaleString()+' matching';}
  var note=document.getElementById('note');
- if(note){note.innerHTML=rows.length>cap?'Showing first '+cap.toLocaleString()+
-  ' of '+rows.length.toLocaleString()+' matching rows. Narrow the filter, or use'+
-  ' the CSV / JSON export for everything.':'';}
+ if(note){note.innerHTML=pageNote(t,rows.length);wireCap();}
  var none=document.getElementById('none');
  if(none){none.style.display=rows.length?'none':'block';
   if(!rows.length){none.innerHTML=emptyNote(t);wireEmpty();}}
@@ -24536,7 +27646,9 @@ function tRefresh(){
 function tRender(){
  var t=TB[st.table];if(!t){return;}
  var rows=tMatching(t);
- var cap=rows.length>t.cap?t.cap:rows.length;
+ var at=pageOf(t)*PAGE;
+ if(at>=rows.length)at=PAGEAT[t.name]=0;
+ var page=rows.slice(at,at+PAGE),cap=page.length;
  var h='<h2>'+esc(t.title)+' <span class="badge">'+t.name+'</span></h2>';
  h+='<p class="desc">'+esc(t.description||'');
  if(t.sources&&t.sources.length){h+='<br>sources: '+esc(t.sources.join(', '));}
@@ -24545,7 +27657,7 @@ function tRender(){
     'in this table..." value="'+esc(st.tq||'')+'"><span class="badge">'+t.row_count.toLocaleString()+
     ' rows total</span><span class="badge" id="matchn">'+rows.length.toLocaleString()+
     ' matching</span><button class="clr" id="clr">clear filters</button>'+
-    winBadge(t);
+    hostBadge(t)+winBadge(t);
  if(t.no_gzip){h+='<span class="badge warn">this browser has no '+
    'DecompressionStream, so the packed tables cannot be read here \\u2014 '+
    'use the CSV / JSON export, or a current browser</span>';}
@@ -24557,7 +27669,7 @@ function tRender(){
  h+='<div id="vhead">'+viewHead()+'</div>';
  /* the layout is measured once per table, not per keystroke - columns that
     resize while you are typing into them are worse than columns that do not */
- lay=tLayout(t,rows.length?rows:t.rows,Math.max(cap,1));
+ lay=tLayout(t,page.length?page:rows,Math.max(cap,1));
  /* table-layout:fixed only honours the <colgroup> if the table itself has a
     width. Left to 'auto' the browser falls back to shrink-to-fit and sizes
     column 1 from its content - which is how a table of one long field and
@@ -24576,15 +27688,22 @@ function tRender(){
     no wrapping column to give it to (a table of short fields), fall back to
     proportional so the table still fills the pane instead of stretching one
     column to 1000px of whitespace. */
- h+='<table class="tbl" style="width:'+(stretch?avail:total)+'px"><colgroup>';
+ h+='<table class="tbl" style="width:'+((stretch?avail:total)+MKW+NTW)+
+    'px"><colgroup>';
+ h+='<col style="width:'+MKW+'px"><col style="width:'+NTW+'px">';
  lay.forEach(function(L,i){
   h+=(stretch&&i===elastic)?'<col>':'<col style="width:'+L.w+'px">';});
- h+='</colgroup><thead><tr id="hdr">';
+ h+='</colgroup><thead><tr id="hdr">'+
+    '<th class="mkc" title="click a marker to cycle it through '+
+    MK_STATES.map(function(x){return x[1];}).join(' › ')+
+    '"><span class="lbl">Analyst mark</span></th>'+
+    '<th class="ntc" title="click to write a note beside a row">'+
+    '<span class="lbl">Notes</span></th>';
  t.columns.forEach(function(c,i){
   var mark=sortCol===i?(sortAsc?' \\u25b2':' \\u25bc'):'';
   h+='<th data-i="'+i+'" title="'+esc(c)+' \\u2014 click to sort">'+
      '<span class="lbl">'+esc(c)+mark+'</span></th>';});
- h+='</tr><tr class="f" id="frow">';
+ h+='</tr><tr class="f" id="frow"><th class="mkc"></th><th class="ntc"></th>';
  var lists='';
  t.columns.forEach(function(c,i){
   var opts=tOptions(t,i),lid='';
@@ -24595,14 +27714,14 @@ function tRender(){
   h+='<th><input data-i="'+i+'" placeholder="filter '+esc(c)+'"'+
      (lid?' list="'+lid+'"':'')+' value="'+esc(colFilters[i]||'').replace(/"/g,'&quot;')+
      '"></th>';});
- h+='</tr></thead><tbody id="tb">'+tBodyHtml(t,rows,cap)+'</tbody></table>'+lists;
+ h+='</tr></thead><tbody id="tb">'+tBodyHtml(t,page,cap)+'</tbody></table>'+lists;
  h+='<div class="empty" id="none"'+(rows.length?' style="display:none"':'')+
     '>'+(rows.length?'No rows match.':emptyNote(t))+'</div>';
- h+='<p class="desc" id="note">'+(rows.length>cap?'Showing first '+cap.toLocaleString()+
-  ' of '+rows.length.toLocaleString()+' matching rows. Narrow the filter, or use'+
-  ' the CSV / JSON export for everything.':'')+'</p>';
+ h+='<p class="desc" id="note">'+pageNote(t,rows.length)+'</p>';
+ h+='<div id="pvpane"></div>';
  document.getElementById('main').innerHTML=h;
  tWire();
+ wireCap();
  wireEmpty();
  wireWin();
 }
@@ -24627,6 +27746,8 @@ function wireHisto(){
 }
 /* Every 'clear the window' control, wherever it was drawn. */
 function wireWin(){
+ [].forEach.call(document.querySelectorAll('[data-hostclear]'),function(x){
+  x.onclick=function(){setHost('');};});
  [].forEach.call(document.querySelectorAll('[data-winclear]'),function(x){
   x.onclick=function(){setWin(null,null);};});
 }
@@ -24657,16 +27778,570 @@ function wireHead(){
    only in tWire() left every grid dead the moment it was filtered: the rows
    redrew, the click did nothing, and the evidence pane kept showing whatever
    was open before. Anything that rebuilds the body must call this after. */
+/* ---------- from a finding to the rows underneath it ----------------------
+   A Sigma match and a hacktool hit both name the table they came from and
+   quote one line of it, shortened to fit a cell. The next question is always
+   the same - show me that row where it lives, with the columns the summary
+   had to drop and none of them cut short. Clicking the row opens exactly that
+   underneath it; the button beside it opens the whole grid, filtered to the
+   same row, for the case where the answer is in what surrounds it. */
+function evPairs(text){
+ /* 'k=v; k=v' back into fragments, keeping each one's raw text so a value
+    that was split by mistake can be put back together below. */
+ var out=[];
+ String(text||'').split('; ').forEach(function(part){
+  var i=part.indexOf('=');
+  out.push([i<1?'':part.slice(0,i),i<1?'':part.slice(i+1),part]);});
+ return out;
+}
+/* A value can contain '; ' itself - a sudo line quotes the whole command,
+   TTY and PWD included - so a fragment whose key is not a column of this
+   table is not a field at all. It is the middle of the one before it, and
+   joining it back is what stops 'detail' being compared against its own
+   first clause, which is a comparison nothing can satisfy.
+   Only then is a value tested for the '...' that says it was shortened to
+   fit the cell: the shortening can fall in a later fragment, and a value cut
+   short must never be matched on - a prefix of a message matches no row. */
+function evKeys(t,prs){
+ var out=[];
+ prs.forEach(function(p){
+  var j=t.columns.indexOf(p[0]);
+  if(j<0){if(out.length)out[out.length-1][1]+='; '+p[2];return;}
+  out.push([j,p[1]]);});
+ return out.filter(function(x){return x[1].indexOf('...')<0;});
+}
+function evSource(t,row){
+ var ti=ci(t,'table');
+ if(ti<0)return null;
+ var name=String(row[ti]||'');
+ if(!name||!TB[name]||name===t.name)return null;
+ var ev=ci(t,'matched_row'),cx=ci(t,'context'),wi=ci(t,'timestamp_utc');
+ return {name:name,
+         when:wi>=0?String(row[wi]||''):'',
+         pairs:evPairs((ev>=0?row[ev]:'')||(cx>=0?row[cx]:''))};
+}
+/* null while the table is still being unpacked - the caller says so and the
+   decode redraws the page. */
+/* TB[name].rows, never T(name). T() unpacks the table it was asked for, and
+   unpacking is not cheap: measured on this collection, JOURNAL takes 9.0
+   seconds and WEB_LOG 4.2, on the thread that draws the page. A click that
+   silently spends nine seconds is the hang this feature was pulled for the
+   first time - the click returned in under a millisecond and the freeze
+   arrived after it, which is why pre-decoding everything in a test hid it.
+   An unpacked table answers instantly; one that is not says so and offers a
+   button, so the wait is asked for rather than sprung. */
+function evReady(name){
+ var t=TB[name];
+ return (t&&t.rows!==undefined)?t:null;
+}
+function evFind(src,cap){
+ var t=evReady(src.name);
+ if(!t)return null;
+ var keys=evKeys(t,src.pairs);
+ if(src.when){
+  var w=t.columns.indexOf('timestamp_utc');
+  if(w>=0)keys.push([w,src.when]);}
+ if(!keys.length)return [];
+ return evRows(t,keys,cap);
+}
+/* One column of one table, value -> the rows holding it, built on first use
+   and kept. The first version of this had no index and rescanned the table on
+   every click; on VAR_LOG that is 1.19M rows walked to show three, and the
+   page stopped answering while it happened.
+   A single row index is stored as a number and only becomes an array when a
+   second row shares the value - most of these columns are near-unique, and a
+   million single-element arrays costs more than the table it indexes. */
+var IX={};
+function ixGet(t,col){
+ var key=t.name+'#'+col;
+ if(IX[key])return IX[key];
+ var m={},rows=t.rows,i,v;
+ for(i=0;i<rows.length;i++){
+  v=rows[i][col];
+  if(v===undefined||v===null||v==='')continue;
+  v=String(v);
+  if(m[v]===undefined){m[v]=i;}
+  else if(typeof m[v]==='number'){m[v]=[m[v],i];}
+  else if(m[v].length<64){m[v].push(i);}}
+ IX[key]=m;
+ return m;
+}
+/* Rows where every key holds exactly the quoted value.
+
+   The keys are looked up through whichever of them is most likely to be
+   near-unique - a timestamp before anything else - so the comparison runs
+   over a handful of candidate rows rather than the whole table. Without a
+   usable index column it still scans, which is the old behaviour and only
+   happens where the summary quoted nothing indexable. */
+var IX_PREFER=['timestamp_utc','start_utc','timestamp','client_ip','source_ip',
+               'path','pid','command'];
+function evRows(t,keys,cap){
+ var out=[],i,k,pick=-1,pri=99;
+ for(k=0;k<keys.length;k++){
+  var nm=t.columns[keys[k][0]],at=IX_PREFER.indexOf(nm);
+  if(at<0)at=IX_PREFER.length;               /* usable, just not preferred */
+  if(at<pri){pri=at;pick=k;}}
+ function ok(r){
+  for(var q=0;q<keys.length;q++){
+   var v=r[keys[q][0]];
+   if(String(v===undefined||v===null?'':v)!==keys[q][1])return false;}
+  return true;}
+ if(pick>=0){
+  var hit=ixGet(t,keys[pick][0])[keys[pick][1]];
+  if(hit===undefined)return [];
+  var list=(typeof hit==='number')?[hit]:hit;
+  for(i=0;i<list.length&&out.length<cap;i++){
+   var r1=t.rows[list[i]];
+   if(ok(r1))out.push(r1);}
+  return out;}
+ for(i=0;i<t.rows.length&&out.length<cap;i++){
+  if(ok(t.rows[i]))out.push(t.rows[i]);}
+ return out;
+}
+/* What to type into the target grid's filter. The timestamp pins the row it
+   came from; without one, the longest thing the summary quoted in full. */
+function evQuery(src){
+ if(src.when)return src.when;
+ var best='';
+ src.pairs.forEach(function(p){
+  if(p[1].indexOf('...')<0&&p[1].length>best.length&&p[1].length<=60)
+   best=p[1];});
+ return best;
+}
+/* One rendering for both pivots, so a row opened from the findings list and
+   the same row opened from the Sigma grid read identically. */
+function pvRows(name,t,rows){
+ var h='';
+ rows.forEach(function(r,n){
+  h+='<div class="evsrc">'+esc(name)+
+     (rows.length>1?' &middot; row '+(n+1)+' of '+rows.length:'')+'</div>';
+  h+='<table class="evkv"><tbody>';
+  for(var j=0;j<t.columns.length;j++){
+   var v=r[j];
+   if(v===undefined||v===null||v==='')continue;
+   h+='<tr><th>'+esc(t.columns[j])+'</th><td>'+esc(v)+'</td></tr>';}
+  h+='</tbody></table>';});
+ return h;
+}
+/* The row as the summary already carries it - no artifact table needed.
+   This is what the first attempts kept missing: a Sigma match quotes the
+   fields it fired on, and that quote IS the evidence. Reaching past it into
+   the artifact table meant unpacking WEB_LOG or JOURNAL - four and nine
+   seconds on the thread that draws the page - to show what was already in
+   hand. Columns are known before a table is unpacked, so the quote is laid
+   out under the artifact's own field names either way.
+   Where the table does happen to be unpacked already the full row is shown
+   instead, because it carries the fields the quote had to drop. That is a
+   bonus when it is free, never something to wait for. */
+function pvSummary(name,prs){
+ var cols=(TB[name]&&TB[name].columns)||[],out=[];
+ prs.forEach(function(p){
+  var j=cols.indexOf(p[0]);
+  /* the same rejoining evKeys does: a value can contain '; ' itself */
+  if(j<0){if(out.length)out[out.length-1][1]+='; '+p[2];return;}
+  out.push([p[0],p[1]]);});
+ if(!out.length)return '';
+ var h='<div class="evsrc">'+esc(name)+'</div><table class="evkv"><tbody>';
+ out.forEach(function(kv){
+  h+='<tr><th>'+esc(kv[0])+'</th><td>'+esc(kv[1])+'</td></tr>';});
+ return h+'</tbody></table>';
+}
+/* A finding is a summary and the preview under it inherits that: it shows the
+   samples the finding kept, not every row the rule matched. Without the line
+   ten rows read as the answer when they are ten of nineteen. The Sigma grid
+   carries none of this - a row there is one match, and the rest of them are
+   the rows around it. */
+function pvNote(shown,total){
+ if(!total||Number(total)<=shown)
+  return '<div class="dim" style="margin-bottom:5px">summary</div>';
+ return '<div class="dim" style="margin-bottom:5px">summary - the '+shown+
+  ' sample(s) this finding kept, of '+esc(total)+' match(es). Open every '+
+  'match of this rule for the rest.</div>';
+}
+/* Only ever called with rows in hand: an unpacked table that held the row.
+   Everything else is drawn from the quote by pvSummary, which needs no table
+   at all. */
+/* The quote goes up immediately; the whole row replaces it when the server
+   answers. The quote is what the summary could fit in a cell - eight fields
+   with the long ones shortened - and reading a truncated message is exactly
+   what an examiner cannot do. The alternative was unpacking the artifact
+   table in the browser, four seconds for WEB_LOG and nine for JOURNAL, which
+   is what made a click feel like a hang. The database already holds every
+   row, so this is one indexed lookup and a few kilobytes.
+   Opened as a file rather than served there is no server to ask, and the
+   quote is what there is - which is why it is drawn first and not instead. */
+function pvUpgrade(host,name,pairsList){
+ if(!served||!host)return;
+ var t=TB[name];
+ if(!t||!t.columns)return;
+ var wanted=pairsList.map(function(prs){
+  return evKeys(t,prs).map(function(k){return [t.columns[k[0]],k[1]];});
+ }).filter(function(k){return k.length;});
+ if(!wanted.length)return;
+ Promise.all(wanted.map(function(keys){
+  return fetch('/api/find?table='+encodeURIComponent(name)+
+               '&keys='+encodeURIComponent(JSON.stringify(keys)))
+   .then(function(r){return r.json();})
+   .catch(function(){return null;});
+ })).then(function(all){
+  var cols=null,rows=[];
+  all.forEach(function(j){
+   if(!j||!j.rows||!j.rows.length)return;
+   cols=j.columns;
+   rows.push(j.rows[0]);});
+  if(!rows.length||!host.parentNode)return;
+  host.innerHTML=pvRows(name,{columns:cols},rows);
+ });
+}
+function evHtml(src,rows){
+ return pvRows(src.name,TB[src.name],rows);
+}
+/* The same move from a finding, which cannot be made the same way.
+   A Sigma match quotes the row it fired on, field by field, so that row can
+   be found again exactly - that is what evKeys does. A finding is a summary
+   of many rows ("198 source address(es) with 10+ failed logins") and its
+   evidence is written to be read by a person, so there is no row in it to
+   reconstruct. What every line of it does carry is an identifier: an address,
+   a path, a process name. Those are what the rows underneath are found by, so
+   this half is a search and the panel says so rather than implying an
+   exactness it does not have. */
+var RE_FV_IP=/[0-9]{1,3}(?:[.][0-9]{1,3}){3}/g;
+var RE_FV_PATH=/[/][A-Za-z0-9._-]+(?:[/][A-Za-z0-9._-]+)*/g;
+var RE_FV_WORD=/[A-Za-z][A-Za-z0-9_.-]{4,}/g;
+/* Words that appear in the prose of an evidence line rather than in its
+   evidence. Searching for "failure" returns most of an auth log. */
+var FV_SKIP=('failure failures against account accounts unnamed success '+
+ 'accepted publickey password invalid preauth session opened closed user '+
+ 'users total first last seen mtime size deleted running process processes '+
+ 'address addresses executable directory directories world-writable').split(' ');
+function fvTokens(text){
+ var str=String(text||''),out=[],m,i;
+ m=str.match(RE_FV_IP);
+ if(m)for(i=0;i<m.length;i++)out.push(m[i]);
+ m=str.match(RE_FV_PATH);
+ if(m)for(i=0;i<m.length;i++){if(m[i].length>4)out.push(m[i]);}
+ m=str.match(RE_FV_WORD);
+ if(m)for(i=0;i<m.length;i++){
+  if(FV_SKIP.indexOf(m[i].toLowerCase())<0)out.push(m[i]);}
+ return out;
+}
+/* Evidence first, the artifact only after it. Both are searched, but ordering
+   them by kind across the two - every path before every word - let the
+   artifact's own filename outrank the evidence: the dmesg finding spent two
+   of its three tries on '/hardware/dmesg.txt', which is where the rows were
+   read from and appears in none of them. What a finding quotes is always a
+   better identifier than what it was read out of. */
+function fvCandidates(evidence,artifact){
+ var out=fvTokens(evidence).concat(fvTokens(artifact));
+ var seen={},uniq=[];
+ out.forEach(function(x){if(!seen[x]){seen[x]=1;uniq.push(x);}});
+ /* Three at most. Each one is a pass over every decoded row, and a click has
+    to answer while the finger is still on the mouse. */
+ return uniq.slice(0,3);
+}
+/* No search on click any more, and this is the reason the previews had to
+   come out the first time: searchAll reads every column of every decoded row,
+   and running it - up to three times, once per candidate identifier - froze
+   the page for seconds on a collection with VAR_LOG and JOURNAL unpacked.
+   A roll-up finding ("198 source address(es) with 10+ failed logins") has no
+   single row to open, so there is nothing here worth paying that for. The
+   identifier is offered as a button instead: the search view is built to do
+   this, it decodes what it needs and it is debounced, so the cost is paid
+   deliberately and with the page still answering. */
+function fvFind(toks){
+ return {token:toks[0]||'',res:[],tried:toks};
+}
+/* A roll-up finding has no single row to open - "198 source address(es) with
+   10+ failed logins" is a count, not a row - but it is not empty either. What
+   it carries is its own evidence, written to be read: one line per address,
+   per file, per process, with the counts and the span already worked out.
+   That is the preview, and it costs nothing to show.
+   The first version searched every decoded row for an identifier on each
+   click instead, which is what froze the page; the identifier is still
+   offered, as a button, so the search happens when it is asked for. */
+function fvHtml(got,row,f){
+ var h='';
+ if(row&&f){
+  var det=f.detail>=0?String(row[f.detail]||''):'';
+  if(det)h+='<div class="dim" style="margin-bottom:6px">'+esc(det)+'</div>';
+  var kept=f.evidence_count>=0?row[f.evidence_count]:0;
+  var all=f.count>=0?row[f.count]:0;
+  var lines=String(f.evidence>=0?row[f.evidence]||'':'')
+            .split(String.fromCharCode(10))
+            .filter(function(x){return x.replace(/^[ ]+|[ ]+$/g,'');});
+  if(lines.length){
+   h+='<div class="evsrc">evidence'+
+      (all&&Number(all)>lines.length
+       ?' &middot; '+lines.length+' of '+esc(all):'')+'</div>';
+   h+='<table class="evkv"><tbody>';
+   lines.forEach(function(ln,i){
+    h+='<tr><th>'+(i+1)+'</th><td>'+esc(ln)+'</td></tr>';});
+   h+='</tbody></table>';}
+  else if(!got.token)
+   h+='<div class="dim">This finding kept no sample rows.</div>';
+ }
+ if(got.token)
+  h+='<div class="dim" style="margin-top:7px">A roll-up of many rows, so '+
+     'there is no single artifact row to open. Search every table for <b>'+
+     esc(got.token)+'</b> to see them.</div>';
+ return h;
+}
+/* A finding raised from a Sigma match is not a summary of many rows in the
+   way the others are: its artifact is the table name rather than a filename,
+   and its evidence is the same 'k=v; k=v' line that SIGMA_MATCHES carries,
+   one per kept sample. So it gets the exact treatment - the same evKeys the
+   Sigma grid uses - and only a finding that is genuinely a roll-up falls back
+   to searching for an identifier. Returns null when there is nothing exact to
+   be had, which is what sends the caller to the search. */
+function fvExact(row,f){
+ var name=String(row[f.artifact]||'');
+ if(!name||!TB[name])return null;
+ var t=evReady(name);
+ var lines=String(row[f.evidence]||'').split(String.fromCharCode(10));
+ if(!t){
+  /* Nothing unpacked, nothing waited for: every line the finding kept is
+     already a quote of the row it came from. */
+  var sums=[],k;
+  for(k=0;k<lines.length&&sums.length<12;k++){
+   var s1=lines[k].replace(/^[ ]+|[ ]+$/g,'');
+   if(s1)sums.push(evPairs(s1));}
+  if(!sums.length)return null;
+  return {name:name,rows:null,sums:sums};}
+ /* Every line the finding kept, not the first three. A finding keeps ten
+    samples of a rule that may have fired two hundred times, and cutting those
+    ten to three hid the only evidence that named the payload. */
+ var out=[],when='',i;
+ for(i=0;i<lines.length&&out.length<12;i++){
+  var ln=lines[i].replace(/^[ ]+|[ ]+$/g,'');
+  if(!ln)continue;
+  var keys=evKeys(t,evPairs(ln));
+  if(!keys.length)continue;
+  var hit=evRows(t,keys,1);
+  if(hit.length){
+   out.push(hit[0]);
+   if(!when){
+    var w=t.columns.indexOf('timestamp_utc');
+    if(w>=0&&hit[0][w])when=String(hit[0][w]);}}}
+ if(!out.length)return null;                /* not a quoted row after all */
+ return {name:name,rows:out,t:t,when:when};
+}
+function fvExactHtml(ex,row,f){
+ if(ex.rows===null){
+  var kept0=ex.sums.length,h0=pvNote(kept0,row[f.count]);
+  h0+='<div class="pvbody">';
+  ex.sums.forEach(function(p){h0+=pvSummary(ex.name,p);});
+  return h0+'</div>';}
+ /* A finding keeps ten samples of a rule that may have fired two hundred
+    times, so what is below is the evidence this finding carries and not the
+    whole of what the rule matched. Say so, and say where the rest is. */
+ var kept=String(row[f.evidence]||'').split(String.fromCharCode(10))
+          .filter(function(x){return x.replace(/^[ ]+|[ ]+$/g,'');}).length;
+ return pvNote(kept,row[f.count])+pvRows(ex.name,ex.t,ex.rows);
+}
+function fvToggle(tr,t,row){
+ var f=fc();
+ if(!f)return;
+ var ex=fvExact(row,f);
+ var got=ex?null:fvFind(fvCandidates(String(row[f.evidence]||''),
+                                     String(row[f.artifact]||'')));
+ var rule='';
+ var b='<div class="evgo">';
+ if(ex){
+  var ttl=String(row[f.title]||'');
+  if(ttl.indexOf('Sigma rule matched: ')===0)rule=ttl.slice(20);
+  b+='<button class="mkbtn" data-fvgo="'+esc(ex.name)+'">open '+
+     esc(ex.name)+' here</button>';
+  if(rule&&TB.SIGMA_MATCHES)
+   b+='<button class="mkbtn" data-fvrule="'+esc(rule)+'">every match of '+
+      'this rule</button>';
+  b+='<span class="dim">the rows this rule fired on, as they are in the '+
+     'artifact</span>';
+ }else{
+  got.res.slice(0,3).forEach(function(R){
+   b+='<button class="mkbtn" data-fvgo="'+esc(R.name)+'">open '+
+      esc(R.name)+' here</button>';});
+  if(got.token)b+='<button class="mkbtn" data-fvall="1">search every table'+
+    '</button>';
+  b+='<span class="dim">found by identifier, not by exact row - a finding '+
+     'summarises many</span>';}
+ b+='</div>';
+ if(!pvOpen(t.name+'#'+tr.getAttribute('data-r'),
+            (ex?fvExactHtml(ex,row,f):fvHtml(got,row,f))+b,tr))return;
+ var p=pvPane();
+ if(ex&&ex.rows===null)pvUpgrade(p.querySelector('.pvbody'),ex.name,ex.sums);
+ var q=ex?(ex.when||''):got.token;
+ [].forEach.call(p.querySelectorAll('button[data-fvgo]'),function(x){
+  x.onclick=function(e){e.stopPropagation();
+   goTable(x.getAttribute('data-fvgo'),q);};});
+ var allb=p.querySelector('button[data-fvall]');
+ if(allb)allb.onclick=function(e){e.stopPropagation();
+  st.gq=got.token;setView('search');};
+ var rb=p.querySelector('button[data-fvrule]');
+ if(rb)rb.onclick=function(e){e.stopPropagation();
+  goTable('SIGMA_MATCHES',rb.getAttribute('data-fvrule'));};
+}
+/* Only one open at a time. Every open preview is another block the grid has
+   to lay out on each repaint, and they were accumulating one per click with
+   nothing ever closing them - an examiner working down a list of matches ends
+   up with the whole page inside expanded rows. Closing the last one keeps the
+   cost of a click flat however many have been opened. */
+var PVAT=null;          /* the row the pane is currently showing */
+function pvPane(){return document.getElementById('pvpane');}
+/* Directly below the row, in the scrolled content rather than the viewport,
+   so it stays with its row while the grid is scrolled. */
+function pvPlace(tr){
+ var p=pvPane(),m=document.querySelector('main');
+ if(!p||!m||!tr)return;
+ var r=tr.getBoundingClientRect(),mr=m.getBoundingClientRect();
+ p.style.top=Math.round(r.bottom-mr.top+m.scrollTop)+'px';
+ p.style.left=Math.round(m.scrollLeft)+'px';
+ p.style.width=Math.max(320,m.clientWidth-38)+'px';
+}
+function pvClose(){
+ var p=pvPane();
+ if(p){p.className='';p.innerHTML='';}
+ PVAT=null;
+}
+/* Draw into the pane. Returns false when the same row is clicked again, so a
+   second click closes it exactly as the expanding row used to. */
+function pvOpen(key,html,tr){
+ var p=pvPane();
+ if(!p)return false;
+ if(PVAT===key){pvClose();return false;}
+ PVAT=key;
+ p.className='on';
+ pvPlace(tr);
+ p.innerHTML='<span class="x" data-pvx="1">&times;</span>'+html;
+ var x=p.querySelector('[data-pvx]');
+ if(x)x.onclick=function(e){e.stopPropagation();pvClose();};
+ return true;
+}
+function evToggle(tr,t,row,src){
+ /* A grid row is one match and says so by being one row - it needs no count
+    of the others beside it, and the grid it is already in is where they are.
+    The findings preview is the one that summarises, so it carries the note. */
+ var found=evFind(src,3);
+ var full=!!(found&&found.length);
+ /* The same head and the same buttons the findings pane carries. A grid row
+    is one match rather than a summary of many, so the line says which of the
+    rule's matches this is instead of how many samples were kept - but the
+    reader's question is the same one, and so is the way back to the rest. */
+ var ri=ci(t,'rule'),cnt=ci(t,'count');
+ var rule=ri>=0?String(row[ri]||''):'';
+ var total=cnt>=0?row[cnt]:0;
+ var head='';
+ if(total&&Number(total)>1)
+  head='<div class="dim" style="margin-bottom:5px">one of '+esc(total)+
+       ' match(es) this rule produced. Open every match of this rule for '+
+       'the rest.</div>';
+ var html=head+'<div class="pvbody">'+
+   (full?evHtml(src,found):pvSummary(src.name,src.pairs))+'</div>'+
+   '<div class="evgo">'+
+   '<button class="mkbtn" data-evgo="1">open '+esc(src.name)+' here</button>'+
+   (rule?'<button class="mkbtn" data-evrule="'+esc(rule)+'">every match of '+
+    'this rule</button>':'')+
+   '<span class="dim">the row this rule fired on, as it is in the '+
+   'artifact</span>'+
+   '</div>';
+ if(!pvOpen(t.name+'#'+tr.getAttribute('data-r'),html,tr))return;
+ var p=pvPane();
+ if(!full)pvUpgrade(p.querySelector('.pvbody'),src.name,[src.pairs]);
+ var b=p.querySelector('button[data-evgo]');
+ if(b)b.onclick=function(e){e.stopPropagation();goTable(src.name,evQuery(src));};
+ var rb=p.querySelector('button[data-evrule]');
+ if(rb)rb.onclick=function(e){e.stopPropagation();
+  goTable(t.name,rb.getAttribute('data-evrule'));};
+}
 function wireRows(){
+ /* The marker is live on every grid, not only the findings: an artifact row
+    is exactly the thing an examiner wants to flag, and restricting marking to
+    the findings would mean the tool decides what is interesting. */
+ [].forEach.call(document.querySelectorAll('td.mkc[data-mk]'),function(td){
+  td.onclick=function(ev){
+   ev.stopPropagation();
+   var t=TB[st.table];if(!t||t.rows===undefined)return;
+   var i=+td.getAttribute('data-mk'),row=TLAST[i];if(!row)return;
+   var tc=tcols(t),sp=tc.any?rowSpan(tc,row):null;
+   var entry=mkCycle(t.name,row,rowRef(t,row,sp?fmtT(sp[0]):''));
+   var tr=td.parentNode;
+   tr.className=(row===st.sel?'sel':'')+mkClass(entry);
+  };});
+ /* A note belongs beside the row it is about. Opened in place rather than
+    in a dialog: an examiner writing "this is the dropper" wants the row still
+    on screen while they type it. Saved on blur, like the case cards. */
+ [].forEach.call(document.querySelectorAll('td.ntc[data-note]'),function(td){
+  td.onclick=function(ev){
+   ev.stopPropagation();
+   var t=TB[st.table];if(!t||t.rows===undefined)return;
+   var i=+td.getAttribute('data-note'),row=TLAST[i];if(!row)return;
+   var tr=td.parentNode,nxt=tr.nextSibling;
+   if(nxt&&nxt.className==='noterow'){nxt.parentNode.removeChild(nxt);return;}
+   var key=mkKey(t.name,row),m=marks[key];
+   var ed=document.createElement('tr');
+   ed.className='noterow';
+   var td2=document.createElement('td');
+   td2.setAttribute('colspan',String(t.columns.length+2));
+   td2.innerHTML='<textarea placeholder="why this row matters">'+
+     esc(m&&m.note?m.note:'')+'</textarea>'+
+     '<div class="hint">saved when you click away \u2014 a note marks the row '+
+     'as interesting if it is not marked already</div>';
+   ed.appendChild(td2);
+   tr.parentNode.insertBefore(ed,tr.nextSibling);
+   var ta=td2.querySelector('textarea');ta.focus();
+   ta.onblur=function(){
+    var cur=marks[key],txt=ta.value.trim();
+    if(!cur&&!txt){ed.parentNode&&ed.parentNode.removeChild(ed);return;}
+    var tc=tcols(t),sp=tc.any?rowSpan(tc,row):null;
+    var entry=cur||{state:'interesting',labels:[]};
+    entry.note=txt;
+    if(!txt&&!entry.state)entry=null;
+    mkSave(key,entry,rowRef(t,row,sp?fmtT(sp[0]):''));
+    if(ed.parentNode)ed.parentNode.removeChild(ed);
+    tRefresh();};
+  };});
+ /* Any grid whose rows name another table can be opened. One handler on the
+    tbody rather than one per row: the first version asked evSource - which
+    splits a row's whole quoted summary - about every rendered row at wiring
+    time, and wiring runs again on every page turn and every keystroke in a
+    filter box. Five hundred rows of that is work done to answer a question
+    nobody asked, since only the row actually clicked is ever opened. */
+ (function(){
+  var t=TB[st.table];
+  if(!t||t.rows===undefined||ci(t,'table')<0)return;
+  var body=document.getElementById('tb');
+  if(!body)return;
+  body.classList.add('pivot');
+  body.onclick=function(ev){
+   var n=ev.target,tr=null;
+   while(n&&n!==body){
+    /* the marker and the note pencil own their own clicks */
+    if(n.className==='mkc'||n.className==='ntc')return;
+    if(n.tagName==='TR'&&n.getAttribute('data-r')!==null)tr=n;
+    n=n.parentNode;}
+   if(!tr)return;
+   var row=TLAST[+tr.getAttribute('data-r')];
+   if(!row)return;
+   var src=evSource(t,row);
+   if(src)evToggle(tr,t,row,src);};
+ })();
  if(isView(TB[st.table])!=='findings')return;
- [].forEach.call(document.querySelectorAll('tbody tr'),function(tr){
-  tr.onclick=function(){
-   st.sel=TLAST[+tr.getAttribute('data-r')];
+ [].forEach.call(document.querySelectorAll('tbody tr[data-r]'),function(tr){
+  tr.classList.add('pivot');
+  tr.onclick=function(ev){
+   /* the marker and the note pencil own their own clicks */
+   var n=ev.target;
+   while(n&&n!==tr){
+    if(n.className==='mkc'||n.className==='ntc')return;
+    n=n.parentNode;}
+   var t=TB[st.table],row=TLAST[+tr.getAttribute('data-r')];
+   if(!t||!row)return;
+   st.sel=row;
    var vh=document.getElementById('vhead');
    if(vh){vh.innerHTML=viewHead();wireHead();}
    [].forEach.call(document.querySelectorAll('tbody tr.sel'),function(o){
     o.classList.remove('sel');});
-   tr.classList.add('sel');};});
+   tr.classList.add('sel');
+   fvToggle(tr,t,row);};});
 }
 function tWire(){
  wireHead();
@@ -24702,7 +28377,11 @@ function tWire(){
   [].forEach.call(frow.querySelectorAll('th'),function(th){th.style.top=top+'px';});}
 }
 
-start();
+/* Marks are loaded before the first paint, so a grid renders already
+   coloured rather than flickering into it a moment later. Served, that
+   is one request to the case file; opened as a file it is a synchronous
+   read of localStorage and the callback runs immediately. */
+mkLoad(function(){start();themeInit();});
 """
 
 
@@ -24716,6 +28395,3058 @@ def _triage_payload(tri, opts):
     two copies a way to disagree with each other.
     """
     return {"meta": [[k, str(v)] for k, v in tri.meta.items() if v]}
+
+# -------------------------------------------------------------------------
+# an MCP server over a finished case
+# -------------------------------------------------------------------------
+
+"""An MCP server over a finished case, so a model can investigate it.
+
+The database is the whole point. A collection parses to three and a half
+million rows and a 870 MB case.db; no model reads that, and pasting a slice of
+it into a prompt produces confident answers about whichever slice was pasted.
+So nothing is summarised here and nothing is pre-digested - the model is given
+the schema and a read-only SELECT, and has to go and look. What it reports can
+then be checked against the same query.
+
+Read-only is enforced twice, because one of them is not enough: the connection
+is opened with mode=ro so the file cannot be written through it whatever
+arrives, and the statement itself has to be a single SELECT or WITH. A model
+writing to an evidence database is not a risk worth carrying for the
+convenience of not checking.
+
+Speaks JSON-RPC 2.0 over stdio, one message per line, which is what MCP's
+stdio transport is. Nothing is written to stdout that is not a response -
+progress and errors go to stderr - because a stray print corrupts the stream
+and the failure looks like the model has gone mad rather than like a bug here.
+"""
+
+
+PROTOCOL = "2024-11-05"
+ROW_CAP = 200                   # rows returned unless the caller asks for more
+ROW_MAX = 2000
+CELL_CAP = 600                  # a log line can be 2 KB; a model does not need
+                                # every byte of forty of them at once
+
+
+QUERY_SECONDS = 30              # how long one statement may run before it
+                                # is stopped and handed back as a mistake
+SEARCH_SECONDS = 60             # the whole-case sweep touches every column of
+                                # every table, so it gets its own, larger one
+
+
+class CaseError(Exception):
+    """Something the caller did, reported to the model rather than raised."""
+
+
+# ---------------------------------------------------------------- database
+
+def _open(path):
+    if not path or not os.path.isfile(path):
+        raise CaseError("no database at %r - run with --db or --serve first, "
+                        "which writes case.db beside the export" % path)
+    db = sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"), uri=True)
+    db.execute("PRAGMA query_only = ON")
+    return db
+
+
+def _tables(db):
+    """name -> row count, from the manifest the export writes."""
+    out = {}
+    try:
+        for name, rows in db.execute("SELECT name, rows FROM _tables"):
+            out[str(name)] = rows
+    except sqlite3.Error:
+        for (name,) in db.execute("SELECT name FROM sqlite_master "
+                                  "WHERE type='table' AND name NOT LIKE '\\_%' "
+                                  "ESCAPE '\\'"):
+            out[str(name)] = None
+    return out
+
+
+def _cols(db, name):
+    return [c[1] for c in db.execute('PRAGMA table_info("%s")' % name)]
+
+
+def _check(name, known):
+    if name not in known:
+        raise CaseError("no table called %r. case_tables lists them." % name)
+    return name
+
+
+def _budget(db, seconds=None):
+    """Stop a statement that is not going to finish.
+
+    A model writing SQL against forty tables eventually writes a join with no
+    ON clause, and against three and a half million rows that is not a slow
+    query, it is a server that has stopped answering. SQLite will cancel one
+    mid-flight if asked often enough, so ask: the callback runs every hundred
+    thousand VM steps and returns non-zero once the clock is out.
+
+    The cancellation surfaces as OperationalError('interrupted'), which the
+    caller turns back into a sentence the model can act on. A model told its
+    query was too broad narrows it. A model told nothing waits, and so does
+    the examiner.
+    """
+    # Read at call time, not bound as a default: a default argument is
+    # evaluated once at import, and a constant that cannot be turned down for
+    # a test is a constant nobody tests.
+    end = time.monotonic() + (QUERY_SECONDS if seconds is None else seconds)
+
+    def tick():
+        return 1 if time.monotonic() > end else 0
+
+    db.set_progress_handler(tick, 100000)
+
+
+def _unbudget(db):
+    db.set_progress_handler(None, 0)
+
+
+def _cell(v):
+    if v is None:
+        return ""
+    s = v if isinstance(v, str) else str(v)
+    return s if len(s) <= CELL_CAP else s[:CELL_CAP - 3] + "..."
+
+
+def _rows(cur, cap):
+    cols = [d[0] for d in cur.description]
+    out = []
+    for r in cur:
+        out.append(dict(zip(cols, [_cell(v) for v in r])))
+        if len(out) >= cap:
+            break
+    return cols, out
+
+
+def _limit(args, default=ROW_CAP):
+    try:
+        n = int(args.get("limit") or default)
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(ROW_MAX, n))
+
+
+# ---------------------------------------------------------------- the tools
+
+def t_tables(db, args):
+    """Every table, its size and its columns - the map the model works from."""
+    known = _tables(db)
+    want = args.get("table")
+    if want:
+        _check(want, known)
+        names = [want]
+    else:
+        names = sorted(known)
+    out = []
+    for n in names:
+        out.append({"table": n, "rows": known.get(n),
+                    "columns": _cols(db, n)})
+    return {"tables": out, "total": len(known)}
+
+
+def t_query(db, args):
+    """One read-only SELECT, which is the tool the rest are shortcuts for."""
+    sql = str(args.get("sql") or "").strip().rstrip(";").strip()
+    if not sql:
+        raise CaseError("sql is required")
+    head = sql.lstrip("( \t\r\n")[:6].lower()
+    if not (head.startswith("select") or head.startswith("with")):
+        raise CaseError("read-only: the statement must be a SELECT or a WITH")
+    if ";" in sql:
+        raise CaseError("one statement at a time")
+    cap = _limit(args)
+    _budget(db)
+    try:
+        cur = db.execute(sql)
+        cols, rows = _rows(cur, cap)
+    except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            raise CaseError(
+                "that query ran for %d seconds without finishing and was "
+                "stopped. It is almost always a join with no condition "
+                "linking the two tables, or a LIKE over the largest table in "
+                "the case. Narrow it: name the columns instead of *, add a "
+                "WHERE on a time or an identifier, and join on one of the "
+                "columns the schema lists as shared." % QUERY_SECONDS)
+        raise CaseError(_sql_error(db, sql, e))
+    except sqlite3.Error as e:
+        raise CaseError(_sql_error(db, sql, e))
+    finally:
+        _unbudget(db)
+    out = {"columns": cols, "rows": rows, "returned": len(rows),
+           "capped": len(rows) >= cap}
+    if out["capped"]:
+        # A flag gets read past; a sentence does not. Asked to break a claim,
+        # llama3.1:8b ran a query with LIMIT 20, got twenty rows back beside
+        # "capped": true, and reported "AUTH_LOG has 20 rows". It has 26,807.
+        # Reporting the page size as the population is the same wrong-number
+        # mistake as reporting an empty page as an absence, and it is fixed
+        # the same way - by saying it in words, in the result.
+        out["note"] = ("this is the first %d row(s) and there are more - %d "
+                       "is the limit, not the count. Do not report it as a "
+                       "total. If you need the number, run the same query as "
+                       "SELECT COUNT(*) with the same WHERE and no LIMIT."
+                       % (len(rows), cap))
+    if not rows:
+        # An empty result is the one answer a model reports without checking,
+        # and the one it is most often wrong about. So it does not come back
+        # empty: it comes back with what the columns it filtered on really
+        # contain, and with the sentence that has to be said out loud.
+        out["note"] = ("0 rows is not evidence that the host has none. It "
+                       "usually means a filter value is wrong. Do not report "
+                       "this as an absence - correct the query and run it "
+                       "again, or say the data cannot answer it.")
+        why = _why_empty(db, sql)
+        if why:
+            out["check_your_values"] = why
+    return out
+
+
+# What a statement filtered on, so an empty result can answer the question the
+# model is about to get wrong. Deliberately crude - this is not a SQL parser
+# and does not need to be. It has to find the column names on the left of a
+# literal comparison, and being wrong about one costs a hint that is not shown.
+_FROM = re.compile(r'(?:from|join)\s+"?([A-Za-z_][A-Za-z_0-9]*)"?', re.I)
+_FILTER = re.compile(r'"?([A-Za-z_][A-Za-z_0-9]*)"?\s*(?:=|==|like)\s*'
+                     r"'([^']*)'", re.I)
+
+
+def _sql_error(db, sql, err):
+    """A rejected statement, with the columns that would have worked.
+
+    'no such column: timestamp_utc' is true and useless. LOGINS keeps its times
+    in start and end - the one table in the case that does - and a model told
+    only that its column does not exist has no way to find that out except by
+    spending another turn on case_tables. llama3.1:8b did not spend it: it gave
+    up on the query and replied with the SQL as prose.
+
+    So the rejection carries the answer. Naming the columns costs nothing, it
+    is already in the schema, and it turns a dead end into the next query.
+    """
+    text = str(err)
+    if "no such column" not in text.lower():
+        return "sqlite: %s" % text
+    known = _tables(db)
+    named = []
+    for name in _FROM.findall(sql or ""):
+        if name in known and name not in named:
+            named.append(name)
+    if not named:
+        return "sqlite: %s" % text
+    parts = ["sqlite: %s." % text,
+             "These are the columns those tables really have -"]
+    for name in named[:4]:
+        parts.append("  %s: %s" % (name, ", ".join(_cols(db, name))))
+    parts.append("Pick from those and run it again. Two names are worth "
+                 "knowing before you guess: times are not all called "
+                 "timestamp_utc - LOGINS keeps them in start and end - and "
+                 "whether an attempt was granted or refused is result, "
+                 "never outcome or status. state is something else, how a "
+                 "session ended.")
+    return chr(10).join(parts)
+
+
+def _why_empty(db, sql, seconds=5):
+    """What the columns a query filtered on actually contain.
+
+    The most expensive answer an analyst can be given is a wrong negative, and
+    this is where they come from. Asked which address failed the most SSH
+    logins, llama3.1:8b filtered FAILED_LOGINS on kind = 'SSH' - a column that
+    only ever holds 'btmp' - got nothing back, and reported that the host had
+    recorded no failed SSH logins at all. There were 210.
+
+    The instruction to check the vocabulary before believing an empty result
+    was already in the system prompt, three hundred words earlier, and the
+    model went straight past it. So the correction moves to where it cannot be
+    missed: the empty result itself carries the values that column really
+    holds. A model that is shown 'btmp' does not need to be told to ask.
+
+    Bounded, and silent when it cannot finish: a hint is worth having and
+    never worth waiting for.
+    """
+    tables, cols_of = [], {}
+    known = _tables(db)
+    for name in _FROM.findall(sql or ""):
+        if name in known and name not in cols_of:
+            tables.append(name)
+            cols_of[name] = _cols(db, name)
+
+    seen, out = set(), []
+    for col, value in _FILTER.findall(sql or ""):
+        for name in tables:
+            if col not in cols_of[name] or (name, col) in seen:
+                continue
+            seen.add((name, col))
+            _budget(db, seconds)
+            try:
+                rows = list(db.execute(
+                    'SELECT "%s" AS v, COUNT(*) n FROM "%s" '
+                    'WHERE "%s" <> \'\' GROUP BY 1 ORDER BY 2 DESC LIMIT 8'
+                    % (col, name, col)))
+            except sqlite3.Error:
+                continue                    # too slow, or not a real column
+            finally:
+                _unbudget(db)
+            if rows:
+                out.append({"table": name, "column": col,
+                            "you_filtered_for": value,
+                            "it_actually_holds":
+                                [{"value": _cell(v), "rows": n}
+                                 for v, n in rows]})
+        if len(out) >= 4:                   # enough to correct with
+            break
+    return out
+
+
+def t_findings(db, args):
+    """The analysis tables, severity first - where an examiner starts."""
+    known = _tables(db)
+    sev = str(args.get("severity") or "").upper()
+    order = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+    name = "FINDINGS" if "FINDINGS" in known else None
+    if not name:
+        raise CaseError("this case has no FINDINGS table")
+    cols = _cols(db, name)
+    where, params = "", []
+    if sev:
+        if sev not in order:
+            raise CaseError("severity must be one of %s" % ", ".join(order))
+        where, params = ' WHERE severity = ?', [sev]
+    cap = _limit(args)
+    cur = db.execute('SELECT * FROM "%s"%s' % (name, where), params)
+    _c, rows = _rows(cur, cap)
+    rank = dict((s, i) for i, s in enumerate(order))
+    if "severity" in cols:
+        rows.sort(key=lambda r: rank.get(str(r.get("severity", "")), 99))
+    return {"columns": cols, "rows": rows, "returned": len(rows)}
+
+
+def t_timeline(db, args):
+    """What happened between two timestamps, across every dated table.
+
+    The question an examiner asks after finding one event is always what else
+    was happening around it, and the answer is never in one table.
+    """
+    t0 = str(args.get("from") or "").strip()
+    t1 = str(args.get("to") or "").strip()
+    if not t0 or not t1:
+        raise CaseError("from and to are required, as 'YYYY-MM-DD HH:MM:SS'")
+    known = _tables(db)
+    cap = _limit(args, 40)
+    out, looked = [], 0
+    for name in sorted(known):
+        cols = _cols(db, name)
+        stamp = next((c for c in ("timestamp_utc", "start_utc", "first_utc")
+                      if c in cols), None)
+        if not stamp:
+            continue
+        looked += 1
+        try:
+            cur = db.execute(
+                'SELECT * FROM "%s" WHERE "%s" >= ? AND "%s" <= ? '
+                'ORDER BY "%s" LIMIT ?' % (name, stamp, stamp, stamp),
+                [t0, t1, cap])
+        except sqlite3.Error:
+            continue
+        _c, rows = _rows(cur, cap)
+        if rows:
+            out.append({"table": name, "time_column": stamp,
+                        "rows": rows, "returned": len(rows)})
+    return {"from": t0, "to": t1, "tables_with_events": len(out),
+            "tables_searched": looked, "events": out}
+
+
+def t_search(db, args):
+    """One term across every column of every table.
+
+    Slow and deliberately so - it is the move that finds an address in the
+    three tables nobody thought to look in. Bounded by a clock rather than by
+    a table count, and it says which tables the clock cost it: an incomplete
+    sweep reported as a complete one is how a present indicator becomes an
+    absent one.
+    """
+    term = str(args.get("term") or "").strip()
+    if len(term) < 2:
+        raise CaseError("term must be at least two characters")
+    known = _tables(db)
+    only = args.get("tables") or []
+    if only:
+        for n in only:
+            _check(n, known)
+    # Smallest first. The sweep is bounded by a clock, so the order decides
+    # what is inside the bound when it runs out - and forty small tables
+    # answered is a better partial result than one 3.5-million-row BODYFILE
+    # scanned while the other thirty-nine went unlooked-at.
+    names = sorted(only or known, key=lambda n: (known.get(n) or 0, n))
+    cap = _limit(args, 5)
+    like = "%" + term.replace("%", "\\%").replace("_", "\\_") + "%"
+    hits, unsearched = [], []
+    end = time.monotonic() + SEARCH_SECONDS
+    for name in names:
+        if time.monotonic() > end:
+            unsearched.append(name)
+            continue
+        cols = _cols(db, name)
+        if not cols:
+            continue
+        where = " OR ".join('"%s" LIKE ? ESCAPE \'\\\'' % c for c in cols)
+        _budget(db, max(1, end - time.monotonic()))
+        try:
+            cur = db.execute('SELECT COUNT(*) FROM "%s" WHERE %s'
+                             % (name, where), [like] * len(cols))
+            n = cur.fetchone()[0]
+            if n:
+                cur = db.execute('SELECT * FROM "%s" WHERE %s LIMIT ?'
+                                 % (name, where), [like] * len(cols) + [cap])
+                _c, rows = _rows(cur, cap)
+                hits.append({"table": name, "matches": n, "sample": rows})
+        except sqlite3.Error:
+            unsearched.append(name)             # interrupted, or unscannable
+        finally:
+            _unbudget(db)
+    hits.sort(key=lambda h: -h["matches"])
+    out = {"term": term, "tables_with_matches": len(hits),
+           "total_matches": sum(h["matches"] for h in hits), "hits": hits}
+    if unsearched:
+        # Said rather than swallowed. A search that quietly covered half the
+        # case reads exactly like one that covered all of it and found
+        # nothing, and that is the difference between a lead and a wrong
+        # negative.
+        out["not_searched"] = unsearched
+        out["note"] = ("the %d second budget ran out before these tables "
+                       "were searched, so this is not a complete answer. "
+                       "Search them directly with the tables argument, or "
+                       "query them with a WHERE on the column you expect "
+                       "the term in." % SEARCH_SECONDS)
+    return out
+
+
+def t_values(db, args):
+    """What a column actually contains, most common first.
+
+    The gap between a schema and a query is the vocabulary. Told the columns
+    of LOGIN_RECORDS, a model wrote outcome = 'success', got nothing back, and
+    reported that the host had recorded no successful sign-in - when that
+    column only ever holds 'FAILED LOGIN' and the successes were in AUTH_LOG
+    under result = 'success'. A wrong negative is the most expensive answer an
+    analyst can be given, and this is what stops it.
+    """
+    known = _tables(db)
+    name = _check(str(args.get("table") or ""), known)
+    col = str(args.get("column") or "")
+    cols = _cols(db, name)
+    if col not in cols:
+        raise CaseError("%s has no column %r. Its columns are: %s"
+                        % (name, col, ", ".join(cols)))
+    cap = _limit(args, 25)
+    cur = db.execute('SELECT "%s" AS value, COUNT(*) AS rows FROM "%s" '
+                     'GROUP BY 1 ORDER BY 2 DESC LIMIT ?' % (col, name), [cap])
+    out = [{"value": _cell(v), "rows": n} for v, n in cur]
+    total = db.execute('SELECT COUNT(DISTINCT "%s") FROM "%s"'
+                       % (col, name)).fetchone()[0]
+    return {"table": name, "column": col, "distinct_values": total,
+            "showing": len(out), "values": out}
+
+
+def t_row(db, args):
+    """The rows where named columns hold exactly the given values.
+
+    What a finding quotes is a summary with the long fields shortened. This is
+    how the model gets the row itself, at full length, to check the quote
+    against rather than trusting it.
+    """
+    known = _tables(db)
+    name = _check(str(args.get("table") or ""), known)
+    keys = args.get("keys") or {}
+    if not isinstance(keys, dict) or not keys:
+        raise CaseError("keys must be an object of column -> exact value")
+    cols = _cols(db, name)
+    use = [(k, v) for k, v in keys.items() if k in cols]
+    if not use:
+        raise CaseError("none of %s is a column of %s. Its columns are: %s"
+                        % (", ".join(map(str, keys)), name, ", ".join(cols)))
+    where = " AND ".join('"%s" = ?' % k for k, _ in use)
+    cap = _limit(args, 5)
+    cur = db.execute('SELECT * FROM "%s" WHERE %s LIMIT ?' % (name, where),
+                     [str(v) for _, v in use] + [cap])
+    _c, rows = _rows(cur, cap)
+    return {"table": name, "matched_on": [k for k, _ in use],
+            "rows": rows, "returned": len(rows)}
+
+
+TOOLS = [
+    ("case_tables",
+     "Every table in the case with its row count and columns. Start here: the "
+     "table names and column names are what every other tool takes.",
+     {"type": "object",
+      "properties": {"table": {"type": "string",
+                               "description": "one table, instead of all"}}},
+     t_tables),
+    ("case_query",
+     "Run one read-only SELECT against the case database. This is the real "
+     "tool - the others are shortcuts. Standard SQLite; the schema comes from "
+     "case_tables.",
+     {"type": "object",
+      "properties": {"sql": {"type": "string",
+                             "description": "a single SELECT or WITH"},
+                     "limit": {"type": "integer",
+                               "description": "max rows (default 200)"}},
+      "required": ["sql"]},
+     t_query),
+    ("case_findings",
+     "The findings the triage raised, most severe first. The starting point "
+     "for 'what is wrong with this host'.",
+     {"type": "object",
+      "properties": {"severity": {"type": "string",
+                                  "description": "CRITICAL|HIGH|MEDIUM|LOW|INFO"},
+                     "limit": {"type": "integer"}}},
+     t_findings),
+    ("case_timeline",
+     "Every dated row between two timestamps, across every table that carries "
+     "a time. Use it after finding one event, to see what surrounded it.",
+     {"type": "object",
+      "properties": {"from": {"type": "string",
+                              "description": "'YYYY-MM-DD HH:MM:SS' UTC"},
+                     "to": {"type": "string"},
+                     "limit": {"type": "integer",
+                               "description": "max rows per table (default 40)"}},
+      "required": ["from", "to"]},
+     t_timeline),
+    ("case_search",
+     "Search one term across every column of every table - an address, a "
+     "hash, a filename, a username. Slower than a targeted query, and it "
+     "finds the tables you would not have thought to look in.",
+     {"type": "object",
+      "properties": {"term": {"type": "string"},
+                     "tables": {"type": "array", "items": {"type": "string"},
+                                "description": "restrict to these tables"},
+                     "limit": {"type": "integer",
+                               "description": "sample rows per table (default 5)"}},
+      "required": ["term"]},
+     t_search),
+    ("case_values",
+     "What a column actually contains, most common value first. Use it before "
+     "filtering on a value you have not seen - a WHERE that matches nothing "
+     "usually means the value is wrong, not that the data is absent.",
+     {"type": "object",
+      "properties": {"table": {"type": "string"},
+                     "column": {"type": "string"},
+                     "limit": {"type": "integer",
+                               "description": "how many values (default 25)"}},
+      "required": ["table", "column"]},
+     t_values),
+    ("case_row",
+     "The full rows where the named columns hold exactly these values. Use it "
+     "to pull the real row behind a finding's quoted summary, which is "
+     "shortened to fit a cell.",
+     {"type": "object",
+      "properties": {"table": {"type": "string"},
+                     "keys": {"type": "object",
+                              "description": "column -> exact value"},
+                     "limit": {"type": "integer"}},
+      "required": ["table", "keys"]},
+     t_row),
+]
+
+GUIDE = """This is a finished forensic triage of one Linux host, parsed into a
+SQLite database of normalised tables. Investigate it; do not summarise it.
+
+How to work:
+  1. case_tables first. The names and columns are the map.
+  2. case_findings for what the triage already raised.
+  3. case_query for anything else. It is a real SELECT over real rows.
+  4. case_row to pull the whole row behind a finding, because what a finding
+     quotes is shortened to fit a cell.
+
+What to hold to:
+  - Every claim you make should be answerable by a query you ran. Say which
+    table and which rows, so the analyst can check you.
+  - A table with no rows is not the same as a clean host: it can mean the
+    collector never ran that artifact. FINDINGS and SIGMA_COVERAGE say which.
+  - Timestamps are UTC throughout.
+  - You are read-only, by construction. Nothing you do can alter the case."""
+
+
+# ------------------------------------------------------------------ protocol
+
+def _send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+
+def _result(rid, payload):
+    _send({"jsonrpc": "2.0", "id": rid, "result": payload})
+
+
+def _error(rid, code, message):
+    _send({"jsonrpc": "2.0", "id": rid,
+           "error": {"code": code, "message": message}})
+
+
+def _content(payload):
+    return {"content": [{"type": "text",
+                         "text": json.dumps(payload, indent=1, default=str)}]}
+
+
+def serve_mcp(path, quiet=False):
+    """Read JSON-RPC from stdin until it closes. Returns an exit status."""
+    try:
+        db = _open(path)
+    except CaseError as e:
+        sys.stderr.write("[!] mcp: %s\n" % e)
+        return 2
+    known = _tables(db)
+    if not quiet:
+        sys.stderr.write("[*] mcp: %s, %d table(s) - waiting for a client\n"
+                         % (os.path.basename(path), len(known)))
+    # Imported in the body rather than at the top: skills is built after this
+    # module, so at module level the name does not exist yet. This is the one
+    # exception the build documents, and it exists for exactly this case.
+    tools = all_tools()
+    call = dict((t[0], t[3]) for t in tools)
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue                      # not ours; a stray line is not fatal
+        rid = msg.get("id")
+        method = msg.get("method") or ""
+        params = msg.get("params") or {}
+
+        if method == "initialize":
+            want = str(params.get("protocolVersion") or PROTOCOL)
+            _result(rid, {
+                "protocolVersion": want,
+                "capabilities": {"tools": {}, "prompts": {}, "resources": {}},
+                "serverInfo": {"name": "linsight", "version": "1.0"},
+                "instructions": GUIDE})
+            continue
+        if method in ("notifications/initialized", "initialized"):
+            continue                      # a notification: no id, no reply
+        if method == "ping":
+            _result(rid, {})
+            continue
+        if method == "tools/list":
+            _result(rid, {"tools": [
+                {"name": n, "description": d, "inputSchema": s}
+                for n, d, s, _fn in tools]})
+            continue
+
+        # The playbooks, as the protocol's own prompts. A client that speaks
+        # MCP already has a menu for these, so shipping them this way means an
+        # examiner in Claude Desktop picks "Everything one address did" from a
+        # list instead of being told the tool exists and left to phrase it.
+        if method == "prompts/list":
+            _result(rid, {"prompts": [
+                {"name": sk["name"], "description": sk["title"] + " - "
+                                                   + sk["about"],
+                 "arguments": sk["args"]}
+                for sk in available(db)]})
+            continue
+        if method == "prompts/get":
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            try:
+                text = render(name, db, args)
+            except CaseError as e:
+                _error(rid, -32602, str(e))
+                continue
+            _result(rid, {
+                "description": (SKILL_BY_NAME.get(name)
+                                or {}).get("title") or str(name),
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}]})
+            continue
+
+        # Resources: the two things a client wants attached to the context
+        # rather than fetched with a tool call. The schema is the map, and it
+        # is what stops a model inventing a table name; the guide is how to
+        # work. Both are small, and both are read far more often than they
+        # change - which is what a resource is for.
+        if method == "resources/list":
+            _result(rid, {"resources": [
+                {"uri": "case://schema",
+                 "name": "Case schema",
+                 "description": "Every table in this case, its row count and "
+                                "its columns.",
+                 "mimeType": "application/json"},
+                {"uri": "case://findings",
+                 "name": "Findings",
+                 "description": "What the triage raised, most severe first.",
+                 "mimeType": "application/json"},
+                {"uri": "case://guide",
+                 "name": "How to work this case",
+                 "description": "The method, and what not to conclude.",
+                 "mimeType": "text/plain"}]})
+            continue
+        if method == "resources/read":
+            uri = str(params.get("uri") or "")
+            try:
+                if uri == "case://schema":
+                    text = json.dumps(t_tables(db, {}), indent=1, default=str)
+                    mime = "application/json"
+                elif uri == "case://findings":
+                    text = json.dumps(t_findings(db, {"limit": 200}), indent=1,
+                                      default=str)
+                    mime = "application/json"
+                elif uri == "case://guide":
+                    text, mime = GUIDE, "text/plain"
+                else:
+                    _error(rid, -32602, "no resource at %r" % uri)
+                    continue
+            except CaseError as e:
+                _error(rid, -32602, str(e))
+                continue
+            _result(rid, {"contents": [{"uri": uri, "mimeType": mime,
+                                        "text": text}]})
+            continue
+        if method == "tools/call":
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            fn = call.get(name)
+            if fn is None:
+                _error(rid, -32602, "no tool called %r" % name)
+                continue
+            try:
+                _result(rid, _content(fn(db, args)))
+            except CaseError as e:
+                # a mistake the model can correct, so it goes back as content
+                # rather than as a protocol error it cannot see the text of
+                _result(rid, {"content": [{"type": "text", "text": str(e)}],
+                              "isError": True})
+            except sqlite3.Error as e:
+                _result(rid, {"content": [{"type": "text",
+                                           "text": "sqlite: %s" % e}],
+                              "isError": True})
+            continue
+        if rid is not None:
+            _error(rid, -32601, "unsupported method %r" % method)
+    return 0
+
+# -------------------------------------------------------------------------
+# playbooks: the moves an examiner makes, for a model
+# -------------------------------------------------------------------------
+
+"""Playbooks: the moves an examiner makes, written down so a model can run them.
+
+A 7B model with a schema and a SELECT can answer a question. It cannot decide
+which question to ask next, and that is most of the job. Asked "what happened
+to this host" it queries FINDINGS, reads the top row back in different words,
+and stops - which is a summary, and the one thing the tool is not for.
+
+So the method goes in the file rather than in the analyst's head. Each skill
+is a sequence an examiner actually follows, with the tables named, the join
+written out, and the trap that particular sequence falls into called out where
+it falls. Handed one, the same 7B runs seven queries instead of one and the
+answer has a shape: what is established, what it rests on, what is still open.
+
+Three consumers, one definition:
+
+  - MCP prompts. `prompts/list` and `prompts/get` are how the protocol ships
+    exactly this, so a client - Claude Desktop, Claude Code - offers them by
+    name and no linsight-specific glue is needed at the other end.
+  - The case_skill tool, for the local model in the Ask panel, which has no
+    prompt menu and has to be able to fetch a playbook mid-conversation.
+  - The buttons in the page, so an analyst who does not want to phrase a
+    question can press the thing they meant.
+
+Every playbook is rendered against the case in front of it. A skill that names
+CRON and SYSTEMD_TIMERS on a host where the collector caught neither says so,
+in the text, rather than sending the model to query an empty table and report
+the emptiness as a finding.
+"""
+
+
+
+# One placeholder syntax, and it is not str.format: the playbooks are full of
+# SQL and JSON, and a stray brace in either turns a format() into a traceback
+# at exactly the moment an examiner is waiting on an answer. <ANGLE> tokens
+# also survive being left unfilled - a model that receives <ADDRESS> asks which
+# address, where a model that receives '' silently profiles nothing.
+def _fill(text, args):
+    for key, value in (args or {}).items():
+        text = text.replace("<%s>" % str(key).upper(), str(value))
+    return text
+
+
+# ---------------------------------------------------------------- the skills
+#
+# Fields:
+#   name    what the tool and the protocol call it
+#   title   what a human sees in a menu
+#   about   one line: when you would reach for this
+#   args    (name, description, required) - what it needs to be pointed at
+#   tables  every table the plan mentions, so the renderer can say which of
+#           them this case actually has before the model starts guessing
+#   plan    the playbook itself
+
+SKILLS = (
+
+    {"name": "triage_host",
+     "title": "What is wrong with this host",
+     "about": "Start here. The findings, then the rows underneath them.",
+     "args": (),
+     "tables": ("FINDINGS", "SIGMA_MATCHES", "HACKTOOL_HITS", "IOC_HITS",
+                "YARA_MATCHES", "COLLECTION_ERRORS"),
+     "plan": """Establish what this host looks like, from the evidence up.
+
+1. case_findings(severity="CRITICAL"), then again with "HIGH". These are what
+   the triage raised, not what is true - they are leads with row counts.
+
+2. Take the three most serious. For each, the finding names an artifact and a
+   count; go to that table and read the rows themselves:
+       SELECT * FROM <the artifact table> WHERE ... LIMIT 20
+   A finding's `evidence` column is shortened to fit a cell. case_row pulls the
+   whole row when a quote matters.
+
+3. SIGMA_MATCHES and HACKTOOL_HITS are a second opinion from a different
+   engine. Where they agree with a finding, say so - two engines on the same
+   rows is worth more than one:
+       SELECT rule, severity, "table", count, first_utc, last_utc
+         FROM SIGMA_MATCHES ORDER BY count DESC LIMIT 20
+
+4. Now place it in time. Take first_utc of the earliest serious finding and
+   run case_timeline over the hour around it. What surrounds an event is
+   usually what explains it.
+
+5. Answer in three parts, in this order:
+     - what is established, each line with the table and the count behind it
+     - what is suspected and what would confirm it
+     - what this collection cannot tell you
+
+Before you write step 5, check COLLECTION_ERRORS. An artifact the collector
+failed to read is a hole in the evidence, and a hole reported as an absence is
+a wrong answer that reads exactly like a right one."""},
+
+    {"name": "profile_address",
+     "title": "Everything one address did",
+     "about": "One IP, across every table that records an address.",
+     "args": (("address", "the IP address, e.g. 209.141.62.185", True),),
+     "tables": ("FAILED_LOGINS", "AUTH_LOG", "WEB_LOG", "LOGIN_RECORDS",
+                "LOGINS", "SOCKETS", "NETSTAT", "PRIVILEGE_ACTIVITY",
+                "IOC_HITS", "ARP_NEIGHBORS"),
+     "plan": """Build the whole record of <ADDRESS> on this host.
+
+The address is spelled differently in every table it appears in. That is the
+one thing to get right here, and it is the thing most answers get wrong:
+
+    source_ip     FAILED_LOGINS, AUTH_LOG, PRIVILEGE_ACTIVITY
+    client_ip     WEB_LOG
+    remote_ip     LOGIN_RECORDS
+    source_host   LOGINS, FAILED_LOGINS   (a name OR an address, both appear)
+    peer_addr     SOCKETS, NETSTAT
+    indicator     IOC_HITS
+
+1. case_search(term="<ADDRESS>") first, and read the table list it returns
+   before writing any SQL. It searches every column of every table, so it
+   finds the two tables you would not have thought of. The counts it gives you
+   are the counts to reconcile against later.
+
+2. Authentication. Both halves, and both numbers:
+       SELECT COUNT(*) FROM FAILED_LOGINS WHERE source_ip = '<ADDRESS>'
+       SELECT timestamp_utc, user, event, result FROM AUTH_LOG
+        WHERE source_ip = '<ADDRESS>' ORDER BY timestamp_utc
+   The question that matters is not how many failures. It is whether anything
+   succeeded after them, and as which account.
+
+3. Web, if WEB_LOG has rows for it. What was requested, and what came back:
+       SELECT status, COUNT(*) n FROM WEB_LOG WHERE client_ip = '<ADDRESS>'
+        GROUP BY status ORDER BY n DESC
+       SELECT timestamp_utc, method, resource, status, user_agent FROM WEB_LOG
+        WHERE client_ip = '<ADDRESS>' AND CAST(status AS INTEGER) < 400
+        ORDER BY timestamp_utc LIMIT 40
+   A 404 is someone knocking. A 200 on the same path is someone in.
+
+4. Sessions and sockets. LOGINS records the origin as a hostname in
+   source_host, so match it loosely there and exactly everywhere else:
+       SELECT user, service, terminal, source_host, start, "end", duration
+         FROM LOGINS WHERE source_host LIKE '%<ADDRESS>%'
+       SELECT proto, state, local_port, peer_addr, peer_port, process, exe, user
+         FROM SOCKETS WHERE peer_addr = '<ADDRESS>'
+   A row in SOCKETS is a connection that was live when the collector ran, which
+   is a much stronger statement than a line in a log.
+
+5. Bound the activity: the earliest and latest timestamp for <ADDRESS> in each
+   table that has one, so the answer carries a window rather than a verb.
+
+Report per-table counts, both sides of every claim, taken from your own
+results: "<N> failed logins and <M> web requests" is checkable once you have
+run the two counts. "significant activity" is not, at any N."""},
+
+    {"name": "profile_user",
+     "title": "Everything one account did",
+     "about": "One account: how it signed in, what it ran, what it can do.",
+     "args": (("user", "the username, e.g. www-data", True),),
+     "tables": ("USERS", "LOGINS", "LOGIN_RECORDS", "LASTLOG", "AUTH_LOG",
+                "SHELL_HISTORY", "PRIVILEGE_ACTIVITY", "SUDOERS", "CRON",
+                "PROCESSES", "USER_ARTIFACTS"),
+     "plan": """Build the whole record of the account <USER>.
+
+1. The account itself. USERS is one row per account and it already carries the
+   joins - do not rebuild them by hand:
+       SELECT * FROM USERS WHERE username = '<USER>'
+   Read shell, login_capable, uid, privileged_groups, authorized_keys,
+   sudo_rules, last_login_utc. A service account with a real shell, or with an
+   authorized_keys file, is the finding on its own.
+
+2. How it signed in. Four tables record a sign-in and they do not agree by
+   accident - if one is empty, go to the next before concluding anything:
+       SELECT user, service, terminal, source_host, start, "end", duration,
+              result, state FROM LOGINS WHERE user = '<USER>' ORDER BY start
+       SELECT timestamp_utc, event, result, source_ip FROM AUTH_LOG
+        WHERE user = '<USER>' OR target_user = '<USER>' ORDER BY timestamp_utc
+   Note LOGINS times are `start` and `end`, not timestamp_utc, and that it
+   holds refused logins as well as granted ones - `lastb` reads there too.
+   result = 'success' is the sign-ins; state is how a session ended, not
+   whether it was allowed. For the last time this account got in:
+       SELECT MAX(start) FROM LOGINS
+        WHERE user = '<USER>' AND result = 'success' 
+
+3. What it ran:
+       SELECT timestamp_utc, shell, file, line_no, command FROM SHELL_HISTORY
+        WHERE user = '<USER>' ORDER BY file, line_no
+   History has no timestamps unless the shell was configured to keep them, so
+   most rows will have an empty timestamp_utc. File order is still order.
+   Then the live picture:
+       SELECT pid, ppid, start_utc, exe, args FROM PROCESSES WHERE user='<USER>'
+
+4. What it did with privilege. actor is who elevated, target_user is who they
+   became - check both, because <USER> can be either end of it:
+       SELECT timestamp_utc, event, actor, target_user, command, result
+         FROM PRIVILEGE_ACTIVITY
+        WHERE actor = '<USER>' OR target_user = '<USER>' ORDER BY timestamp_utc
+
+5. What it left behind: CRON where owner or run_as is <USER>, and
+   USER_ARTIFACTS for the per-user files the collector picked up.
+
+If a WHERE on username returns nothing, call case_values(table, column) before
+you report the account as absent. Some tables carry the uid, some the name,
+and some the name with a domain on it."""},
+
+    {"name": "intrusion_window",
+     "title": "Reconstruct one moment",
+     "about": "What every artifact was recording around a given time.",
+     "args": (("when", "'YYYY-MM-DD HH:MM:SS' UTC, the moment to centre on",
+               True),),
+     "tables": ("AUTH_LOG", "WEB_LOG", "SHELL_HISTORY", "AUDIT_LOG",
+                "PRIVILEGE_ACTIVITY", "BODYFILE", "JOURNAL", "FINDINGS"),
+     "plan": """Reconstruct what was happening at <WHEN>.
+
+1. case_timeline from fifteen minutes before <WHEN> to fifteen minutes after.
+   It asks every table that carries a clock, which is the point - the tables
+   you would have thought to check are not usually the ones that explain it.
+
+2. Read what came back as one sequence, not table by table. The order across
+   tables is the story: a request, then a process, then a file, then a
+   connection outward is an intrusion. The same four in a different order is a
+   backup job.
+
+3. Widen only where it is thin. If the window is empty, go to two hours; if it
+   is a wall of one table, narrow to five minutes and query that table
+   directly.
+
+4. BODYFILE is the filesystem's own account of the same window and it is
+   usually the largest table in the case. Bound it hard:
+       SELECT mtime_utc, path, size FROM BODYFILE
+        WHERE mtime_utc BETWEEN '<WHEN minus 15m>' AND '<WHEN plus 15m>'
+        ORDER BY mtime_utc LIMIT 100
+   A file written inside the window, in a directory a web server can write to,
+   is worth more than anything a log says about it.
+
+5. Say what happened, in order, with a timestamp and a table on every line.
+   Where two tables record the same event, say both - that is corroboration,
+   and it is the difference between a timeline and a guess.
+
+Timestamps are UTC everywhere in this database. If a row's time looks hours
+off, it is not a time zone bug in the data, it is a different event."""},
+
+    {"name": "persistence",
+     "title": "What survives a reboot",
+     "about": "Every mechanism that would run this again tomorrow.",
+     "args": (),
+     "tables": ("CRON", "SYSTEMD_UNITS", "SYSTEMD_TIMERS", "INIT_AND_PROFILE",
+                "KERNEL_MODULES", "USERS", "PROC_ENVIRON_VARIABLES",
+                "SERVICES", "REMOTE_ACCESS"),
+     "plan": """Find everything on this host that would run again without a
+person doing anything.
+
+Work through the mechanisms. Each is one query, and the point is coverage -
+an intrusion usually installs more than one, and finding the first is not
+finding them all.
+
+1. Scheduled work:
+       SELECT file, owner, kind, schedule, run_as, command, running_pids
+         FROM CRON ORDER BY owner
+   running_pids joins the command against the live process table. A scheduled
+   job that is also running right now is a different problem from one that is
+   merely configured.
+       SELECT * FROM SYSTEMD_TIMERS
+
+2. Units, which is where a modern implant lives:
+       SELECT unit, path, scope, exec_start, user, restart, wanted_by,
+              running_pids FROM SYSTEMD_UNITS
+        WHERE exec_start <> '' ORDER BY scope, unit
+   Read exec_start, not the unit name. A unit called `sysstat-collect` that
+   execs something out of /tmp or /dev/shm or a home directory is the answer.
+   Check exec_start_pre too - it runs first and is read less often.
+
+3. Shell startup, which needs no privilege at all:
+       SELECT * FROM INIT_AND_PROFILE
+
+4. The kernel:
+       SELECT module, filename, license, signer, intree, description
+         FROM KERNEL_MODULES WHERE intree <> 'Y' OR signer = ''
+   An out-of-tree unsigned module on a stock distribution kernel is either a
+   driver somebody built or a rootkit, and the filename usually says which.
+
+5. The loader:
+       SELECT * FROM PROC_ENVIRON_VARIABLES WHERE variable LIKE 'LD_%'
+   plus /etc/ld.so.preload if the collection has it - case_search("ld.so.preload").
+
+6. Keys, which are the quietest of all:
+       SELECT username, home, shell, authorized_keys, has_private_key
+         FROM USERS WHERE authorized_keys <> ''
+   An authorized_keys on an account that should never log in interactively is
+   persistence, whatever else it looks like.
+
+For each mechanism you find, say: where it is configured, what it runs, whose
+it is, and whether it is running now. A path under /tmp, /dev/shm, /var/tmp or
+a home directory in any of these is the thing to lead with."""},
+
+    {"name": "web_intrusion",
+     "title": "Follow a web exploitation chain",
+     "about": "Request, response, and what ran on the host afterwards.",
+     "args": (),
+     "tables": ("WEB_LOG", "WEB_CONFIG", "PROCESSES", "SHELL_HISTORY",
+                "AUDIT_LOG", "SOCKETS", "BODYFILE", "FINDINGS"),
+     "plan": """Work a web-facing intrusion from the request to what it ran.
+
+1. What was probed. Exploitation is shaped differently from browsing:
+       SELECT resource, COUNT(*) n, MIN(timestamp_utc) first,
+              MAX(timestamp_utc) last FROM WEB_LOG
+        WHERE resource LIKE '%..%' OR resource LIKE '%cgi-bin%'
+           OR resource LIKE '%.php%' OR resource LIKE '%wp-%'
+           OR resource LIKE '%/etc/passwd%' OR resource LIKE '%eval%'
+           OR resource LIKE '%cmd=%'
+        GROUP BY resource ORDER BY n DESC LIMIT 40
+
+2. What worked. This is the whole question, and it is one column:
+       SELECT timestamp_utc, client_ip, method, resource, status, size,
+              user_agent FROM WEB_LOG
+        WHERE CAST(status AS INTEGER) BETWEEN 200 AND 399
+          AND (resource LIKE '%..%' OR resource LIKE '%cmd=%'
+               OR resource LIKE '%.php%')
+        ORDER BY timestamp_utc LIMIT 40
+   status is text in this database, so compare it as CAST(status AS INTEGER)
+   or against the string. A 200 to a traversal path is not a probe, it is a
+   read. Note size: two 200s to the same path with different sizes usually
+   means one of them returned something.
+
+3. Who. Take the client_ip from step 2 and count what else it did. If it also
+   appears in FAILED_LOGINS, that is one actor on two services, and it is
+   a JOIN, never a UNION:
+       SELECT w.client_ip, w.n AS web, f.n AS failed
+         FROM (SELECT client_ip, COUNT(*) n FROM WEB_LOG
+                WHERE client_ip <> '' GROUP BY client_ip) w
+         JOIN (SELECT source_ip, COUNT(*) n FROM FAILED_LOGINS
+                WHERE source_ip <> '' GROUP BY source_ip) f
+           ON f.source_ip = w.client_ip ORDER BY w.n DESC LIMIT 10
+
+4. What it became. Take the timestamp of the first successful request and run
+   case_timeline over the ten minutes after it. A web server that spawns a
+   shell, a curl, a python, or anything at all out of /tmp is the handoff from
+   request to execution:
+       SELECT pid, ppid, user, start_utc, exe, args FROM PROCESSES
+        WHERE user IN ('www-data','apache','nginx','httpd','daemon')
+   and the same accounts in SHELL_HISTORY, which should be empty for them.
+
+5. What it left. Files written under the web root around that time, from
+   BODYFILE - WEB_CONFIG gives you the root to look under.
+
+State the chain as a chain: this address requested this, got this status at
+this time, and this ran N seconds later. Where you cannot join two links, say
+which link is missing rather than closing the gap with a verb."""},
+
+    {"name": "privilege_escalation",
+     "title": "How they got root",
+     "about": "Sudo, SUID, group changes, and accounts that should not exist.",
+     "args": (),
+     "tables": ("PRIVILEGE_ACTIVITY", "SUDOERS", "SUID_SGID", "USERS",
+                "GROUPS", "AUTH_LOG", "CAPABILITIES"),
+     "plan": """Establish whether privilege was escalated on this host, and how.
+
+1. What was actually used:
+       SELECT timestamp_utc, event, actor, target_user, command, result, tty
+         FROM PRIVILEGE_ACTIVITY ORDER BY timestamp_utc
+   Read `result`. A failed sudo followed by a successful one, same actor, same
+   minute, is a password being found. Read `command` - sudo to a shell, an
+   editor, or anything with -e or ! in it is sudo to root by another name.
+
+2. What is permitted:
+       SELECT file, line_no, rule, nopasswd FROM SUDOERS
+        WHERE nopasswd <> '' OR rule LIKE '%ALL%'
+   A NOPASSWD rule for a service account is escalation waiting to be used, and
+   it does not need a log line to be true.
+
+3. What is on disk:
+       SELECT path, kind, owner, mode, mtime_utc, md5, in_distro_baseline
+         FROM SUID_SGID WHERE in_distro_baseline <> 'yes'
+   The baseline column is the whole value of this table - the twenty expected
+   SUID binaries are not the answer, the twenty-first is. Check mtime_utc
+   against the rest of the intrusion window, and call case_values on
+   in_distro_baseline before filtering on it, so the filter matches what that
+   column really holds.
+
+4. Who is privileged, whether or not they used it:
+       SELECT username, uid, shell, login_capable, privileged_groups,
+              password_status, last_login_utc FROM USERS
+        WHERE privileged_groups <> '' OR uid = 0 ORDER BY uid
+   More than one account with uid 0 is a backdoor, not a configuration.
+
+5. Who was created or changed, and when:
+       SELECT timestamp_utc, event, actor, target_user, target_group, detail
+         FROM PRIVILEGE_ACTIVITY
+        WHERE event LIKE '%USER%' OR event LIKE '%GROUP%'
+        ORDER BY timestamp_utc
+
+6. Capabilities, if the collection has them - a binary with cap_setuid needs
+   no SUID bit and is missed by anyone only looking for one.
+
+Say which of these is evidence of escalation having happened and which is
+capability for it to happen. They are different findings and an analyst needs
+them separated."""},
+
+    {"name": "egress",
+     "title": "What was talking outward",
+     "about": "Outbound connections, listeners, and the transfers in history.",
+     "args": (),
+     "tables": ("SOCKETS", "NETSTAT", "PROC_NET", "PROCESSES",
+                "SHELL_HISTORY", "FIREWALL", "ROUTES", "IOC_HITS"),
+     "plan": """Establish what this host was talking to, and what was listening.
+
+1. Established connections, with the process on the end of them:
+       SELECT proto, state, local_addr, local_port, peer_addr, peer_port,
+              pid, process, exe, user FROM SOCKETS
+        WHERE state = 'ESTAB' AND peer_addr <> '' ORDER BY peer_addr
+   Exclude the host's own networks by reading the addresses rather than by
+   assuming: 10., 172.16-31., 192.168., 127., ::1 are local. Anything else is
+   the internet, and the interesting rows are the ones where exe is not a
+   thing that should be talking to it.
+
+2. Listeners, which is how it was reached in the first place:
+       SELECT proto, local_addr, local_port, process, exe, user FROM SOCKETS
+        WHERE state = 'LISTEN' ORDER BY CAST(local_port AS INTEGER)
+   A listener on 0.0.0.0 that is not the service this host exists to run is
+   the finding. A high port held by a shell, a python, or a binary in /tmp is
+   the finding whatever it is bound to.
+
+3. NETSTAT is the same picture from a different command. Where SOCKETS is
+   empty, use it - and where both have rows, agreement between them is worth
+   saying. case_values(table="SOCKETS", column="state") first if a filter on
+   'ESTAB' returns nothing: the two commands spell the states differently.
+
+4. Transfers, which leave no socket behind once they finish:
+       SELECT user, file, line_no, command FROM SHELL_HISTORY
+        WHERE command LIKE '%curl%' OR command LIKE '%wget%'
+           OR command LIKE '%scp%' OR command LIKE '%rsync%'
+           OR command LIKE '%nc %' OR command LIKE '%ncat%'
+           OR command LIKE '%base64%' OR command LIKE '%/dev/tcp/%'
+        ORDER BY user, file, line_no
+   /dev/tcp is a bash builtin and needs no binary on the host at all.
+
+5. What the host was configured to allow - FIREWALL - and where it routes.
+
+For every connection you report, give the process and the account behind it.
+A peer address on its own is a lead. A peer address, a pid, a binary path and
+the account that owns it is a finding."""},
+
+    {"name": "challenge",
+     "title": "Try to break a conclusion",
+     "about": "Take a claim and attack it. Report what survives.",
+     "args": (("claim", "the statement to test, in one sentence", True),),
+     "tables": (),
+     "plan": """Your job here is to refute this claim, not to support it:
+
+    <CLAIM>
+
+Assume it is wrong and go and find the row that proves it. An analyst is about
+to put this in a report, and the cheapest place to find the error is here.
+
+1. Write the ONE query that would find a counterexample - a single row whose
+   existence makes the claim false - and run it. Not a query that confirms the
+   claim: a query that breaks it. For a claim that nothing of some kind
+   happened, that is the query for a thing of that kind happening, with no
+   condition on it beyond the kind:
+
+       "nobody logged in successfully from the internet"
+           -> SELECT timestamp_utc, user, source_ip, result FROM AUTH_LOG
+               WHERE result = 'success' AND source_ip <> ''
+               ORDER BY timestamp_utc LIMIT 20
+       "there is no persistence"
+           -> SELECT owner, schedule, command FROM CRON LIMIT 40
+       "this address only failed"
+           -> the same address in AUTH_LOG with result = 'success'
+
+   Keep it short and keep it wide. A counterexample query with three
+   conditions on it is not looking for the counterexample, it is looking for a
+   particular one you imagined. Never compare a column to an aggregate of
+   itself - `WHERE start > (SELECT MAX(start) ...)` cannot return a row, and
+   an empty result from a query that could not have returned one tells you
+   nothing at all.
+
+2. Rows came back? The claim is WRONG. One more query and then stop - the
+   count, because the query above had a LIMIT on it and the number of rows it
+   handed you is that limit, not the population:
+
+       SELECT COUNT(*) FROM <the same table> WHERE <the same conditions>
+
+   Then quote two or three of the rows, with the table and that count, and
+   stop. Do not keep querying to soften it.
+
+3. Nothing came back? Then you are not finished, because an empty result is
+   the answer this job gets wrong. Before you say it stands, run these:
+
+   a. Is the table there at all? case_tables. An empty or absent table means
+      the collector never ran that artifact, and "no evidence" from a
+      collection that never looked is UNSUPPORTED, not STANDS.
+   b. Is the value right? case_values on every column you filtered on. A
+      column that only holds 'FAILED LOGIN' returns nothing for 'failure'.
+      The empty result you were shown lists these for you - read it.
+   c. Does the triage disagree? case_findings. If a finding says the opposite
+      of your empty query, trust the finding and go and read its rows: your
+      query is wrong.
+   d. Is it in another table? The same fact is in more than one. A sign-in is
+      in AUTH_LOG, LOGINS, LOGIN_RECORDS and USERS.last_login_utc.
+
+4. Give one verdict, and put the evidence in the same sentence. These are
+   the shapes to fill in from YOUR results - the counts and the times below
+   are blanks, not values, and copying them back is reporting a number you
+   never queried:
+
+     WRONG        - wrong: <TABLE> has <COUNT> rows matching <THE FILTER>,
+                    the earliest at <TIMESTAMP FROM YOUR RESULT>
+     STANDS       - stands: <TABLE> has <TOTAL> rows and none of them
+                    <WHAT THE CLAIM SAYS CANNOT BE THERE>
+     UNSUPPORTED  - unsupported: this collection has no <TABLE>, so nothing
+                    here can settle it
+
+   A verdict on its own is not an answer. If you cannot put a table and a
+   number from your own results next to it, you have not established it and
+   the verdict is UNSUPPORTED.
+
+Do not hedge into agreement, and do not state a value - an address, a user, a
+time - that did not appear in a result above. A claim you could not break
+after genuinely trying is worth stating plainly, and that is only true if you
+tried."""},
+
+    {"name": "collection_quality",
+     "title": "What this collection cannot tell you",
+     "about": "The holes: what the collector missed, and what that costs.",
+     "args": (),
+     "tables": ("COLLECTION_ERRORS", "COLLECTION_LOG", "UNPARSED_FILES",
+                "SIGMA_COVERAGE", "LOG_INVENTORY", "FILE_INVENTORY"),
+     "plan": """Establish the limits of this evidence before anyone relies on it.
+
+Every answer from this case is bounded by what the collector managed to read,
+and that boundary is almost never stated. State it.
+
+1. What failed outright:
+       SELECT * FROM COLLECTION_ERRORS
+   A permission denied on /root or /var/log is not a detail. It means every
+   answer about that path is "unknown", not "clean".
+
+2. What was collected but not parsed:
+       SELECT * FROM UNPARSED_FILES LIMIT 50
+   These are files linsight held and could not turn into rows. They may still
+   be readable by hand and they are invisible to every query you have run.
+
+3. Which tables are empty, and what each of them would have answered.
+   case_tables gives the row counts; the empty ones are the map of the blind
+   spots. For each, name the question that now cannot be answered - no
+   AUDIT_LOG means process execution is only known from history and ps, no
+   BODYFILE means file timestamps are only known for the files that were
+   copied.
+
+4. How far back the logs go:
+       SELECT MIN(timestamp_utc), MAX(timestamp_utc) FROM AUTH_LOG
+   and the same for WEB_LOG and JOURNAL. Rotation is the most common reason an
+   intrusion appears to start on a Monday. If the earliest log entry is close
+   to the earliest suspicious event, the start of the intrusion is very
+   probably before the evidence.
+
+5. SIGMA_COVERAGE, if present: which rules could run against which tables. A
+   rule that never ran is not a rule that found nothing.
+
+Write this as a list an analyst can put at the front of a report: what is
+known, what is unknown, and which of the unknowns are worth going back to the
+host for."""},
+)
+
+SKILL_BY_NAME = dict((s["name"], s) for s in SKILLS)
+
+
+# Prepended to every rendered playbook, and it is not decoration. Handed the
+# ten-step challenge plan, llama3.1:8b wrote the whole thing back out - each
+# step, each query in a fenced JSON block, a verdict at the bottom - without
+# calling a single tool. It had understood the method perfectly and executed
+# none of it. A numbered plan reads as something to transcribe unless it says
+# otherwise, so it says otherwise, first, before the model has read far enough
+# to start copying.
+HOW = """Run this plan. Do not write it out.
+
+Make ONE tool call now - the first step below - and stop. You will be sent the
+rows it returns, and then you take the next step. Work through it that way,
+one call at a time, until you have what the last step asks for.
+
+The SQL in this plan is for you to run through case_query, not to repeat back.
+A step you write out as text has not been done, and a message with no tool call
+in it ends the investigation and is shown to the analyst as your answer.
+
+Adapt it where the case needs it. It names the tables and the joins because
+those are what a schema alone does not tell you - the column names are real,
+the values in them may not be what you assume.
+
+Every number, address, username and timestamp in your answer must come from a
+result you were sent back. Nothing in this plan is data: where it shows the
+shape of an answer, the values in it are blanks to fill from your own rows.
+Copying one back is reporting a figure you never queried."""
+
+
+# ---------------------------------------------------------------- rendering
+
+def available(db):
+    """Every skill, with the tables this case actually has for it.
+
+    Nothing is hidden on the grounds of a missing table. A host with no
+    WEB_LOG can still be asked about web intrusion, and the honest answer is
+    that the collection has no web logs - which is a result, and one an
+    examiner needs said out loud rather than inferred from a greyed-out
+    button.
+    """
+    known = _tables(db) if db is not None else {}
+    out = []
+    for s in SKILLS:
+        out.append({"name": s["name"], "title": s["title"],
+                    "about": s["about"],
+                    "args": [{"name": a, "description": d, "required": r}
+                             for a, d, r in s["args"]],
+                    "has": [t for t in s["tables"] if known.get(t)],
+                    "missing": [t for t in s["tables"] if not known.get(t)]})
+    return out
+
+
+def render(name, db, args=None):
+    """One playbook, filled in and grounded in this case."""
+    skill = SKILL_BY_NAME.get(name)
+    if skill is None:
+        raise CaseError("no skill called %r. They are: %s"
+                        % (name, ", ".join(sorted(SKILL_BY_NAME))))
+    missing = [a for a, _d, req in skill["args"]
+               if req and not str((args or {}).get(a) or "").strip()]
+    if missing:
+        raise CaseError("%s needs %s. Ask the analyst for it rather than "
+                        "picking one." % (name, " and ".join(missing)))
+
+    known = _tables(db) if db is not None else {}
+    body = [HOW, "", _fill(skill["plan"], args)]
+
+    named = list(skill["tables"])
+    have = [t for t in named if known.get(t)]
+    empty = [t for t in named if t in known and not known.get(t)]
+    absent = [t for t in named if t not in known]
+    if named:
+        body.append("")
+        body.append("In this case: " + (
+            "%s %s rows." % (", ".join(have),
+                             "has" if len(have) == 1 else "have") if have
+            else "none of the tables this playbook names have rows."))
+        if empty:
+            body.append("Present but empty, so the collector produced nothing "
+                        "for them: " + ", ".join(empty) + ". Do not report "
+                        "their emptiness as a finding about the host.")
+        if absent:
+            body.append("Not in this case at all - do not query them: "
+                        + ", ".join(absent) + ".")
+    return chr(10).join(body)
+
+
+# ---------------------------------------------------------------- the tool
+#
+# Registered here rather than in mcp.py because of the build: skills sits
+# after mcp in dependency order, so mcp cannot name t_skill at module level.
+# Both consumers reach it through all_tools() instead.
+
+def t_skill(db, args):
+    """Fetch a playbook, or the list of them.
+
+    A small model reaches this when the analyst asked something broad. Handing
+    it the method costs one turn and saves the four it would otherwise spend
+    querying FINDINGS from three angles.
+    """
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return {"skills": [{"name": s["name"], "title": s["title"],
+                            "about": s["about"],
+                            "needs": [a for a, _d, r in s["args"] if r]}
+                           for s in SKILLS],
+                "note": "call case_skill again with one of these names to get "
+                        "the playbook, then follow it with the other tools"}
+    extra = dict((k, v) for k, v in args.items() if k != "name")
+    return {"skill": name, "playbook": render(name, db, extra)}
+
+
+SKILL_TOOL = (
+    "case_skill",
+    "An investigative playbook: the sequence an examiner follows for a kind "
+    "of question, with the tables and the joins named. Call it with no "
+    "arguments to see what there is, then by name to get the method. Use it "
+    "whenever the question is broad ('what happened here', 'is this host "
+    "compromised') rather than a single lookup.",
+    {"type": "object",
+     "properties": {
+         "name": {"type": "string",
+                  "description": "the playbook, e.g. triage_host, "
+                                 "profile_address, persistence, challenge. "
+                                 "Omit to list them."},
+         "address": {"type": "string",
+                     "description": "for profile_address"},
+         "user": {"type": "string", "description": "for profile_user"},
+         "when": {"type": "string",
+                  "description": "for intrusion_window, a UTC timestamp"},
+         "claim": {"type": "string", "description": "for challenge"}}},
+    t_skill)
+
+
+def all_tools():
+    """The case tools plus the playbooks, which is what both callers want."""
+    return list(TOOLS) + [SKILL_TOOL]
+
+# -------------------------------------------------------------------------
+# a local model, given the case and told to look
+# -------------------------------------------------------------------------
+
+"""A local model, given the case and told to go and look.
+
+The same tools the MCP server exposes, driven from inside the investigation
+server so the panel in the page can use them. The model never receives the
+case: it receives the schema and a read-only SELECT, and has to ask. Three and
+a half million rows do not fit in a context window, and a model handed a
+sample of them answers confidently about the sample.
+
+The loop is the whole implementation. Send the question with the tool
+definitions; if the reply asks for a tool, run it, append the result, and send
+it back. Stop when the model answers in words instead, or when it has had
+enough turns - a model that cannot finish in eight rounds is not converging
+and its ninth query will not save it.
+
+Nothing leaves the machine. The page talks to this server because its own CSP
+forbids it from talking to anything else, and this server talks to a model on
+localhost. That is a property worth keeping: the case is evidence, and the
+first rule of evidence is that you know where it went.
+"""
+
+
+
+# A local 7B on CPU is not fast, and the number was set against bare
+# questions. A playbook is several thousand tokens of prompt before the schema
+# is added, and prompt processing is the slow half on a CPU: profile_address
+# against a 3.4-million-row case went past 180 seconds on the first turn and
+# came back as "cannot reach a model", which sent the examiner to check
+# whether Ollama was running. It was running. It was thinking.
+ASK_TIMEOUT = 600
+ASK_ROUNDS = 8              # tool calls before we stop and take what we have
+ASK_URL = "http://127.0.0.1:11434/v1"
+
+# What the model is sent, measured against the window it has to hold it in.
+#
+# On a real case the fixed part of every turn is 4,757 tokens - 954 for the
+# system prompt, 2,884 for the schema of 79 tables, 919 for the tool
+# definitions - against a num_ctx of 16,384. That leaves room for two tool
+# results, and one `SELECT * FROM AUTH_LOG` at the default row cap is 87,163
+# characters, near 22,000 tokens on its own.
+#
+# What happens then is not an error. Ollama does not refuse a prompt that is
+# longer than num_ctx: it drops the front of it, which is the system prompt,
+# the schema and the question, and answers from what is left - the tail of a
+# JSON blob. The reply that comes back is fluent, cites real rows, and is not
+# an answer to anything that was asked. That is what "it answers something
+# else" looks like from the outside, and no change of model fixes it.
+#
+# So the conversation is kept inside the window here, where it can be done
+# knowingly: rows are capped before a result is serialised, a result too big
+# even then loses whole rows rather than its own closing brace, and when the
+# thread outgrows the window the oldest results are dropped and say so.
+ASK_ROWS = 40               # rows one tool result may carry back
+ASK_CHARS_PER_TOKEN = 4     # near enough to budget with, and no tokeniser
+ASK_REPLY_TOKENS = 1200     # left free for the model's own answer
+ASK_RESULT_TOKENS = 2000    # the most one result may take of the rest
+
+SYSTEM = """You are helping a forensic analyst work a Linux triage case that
+is already parsed into a SQLite database of normalised tables.
+
+Investigate. Do not summarise, and do not guess. Every claim you make must
+come from a query you actually ran, and you must say which table and which
+values it came from so the analyst can check you.
+
+How to work:
+  - The schema is below. Use those exact table and column names. Never invent
+    a table name: if it is not in the list, it does not exist here.
+  - case_query for anything specific. It is a real SELECT over real rows.
+  - case_tables(table="NAME") when you need the columns of one not listed.
+  - case_findings for what the triage already raised.
+  - case_row to pull a full row when a finding quotes a shortened one.
+  - If a query errors, read the error and fix the query. Do not abandon the
+    question and do not answer from memory - the answer is in the database.
+  - If a WHERE returns 0 rows, your value is probably wrong, not missing.
+    Call case_values(table, column) to see what that column really holds, and
+    try again. Never report something as absent on the strength of one
+    equality filter that matched nothing.
+  - The same fact lives in more than one table. A sign-in is in AUTH_LOG,
+    LOGINS, LOGIN_RECORDS and USERS.last_login_utc, and they do not agree by
+    accident - if one is empty, try the next before concluding anything.
+  - Call the tool. Do not write the call out as text in your reply.
+  - If the question is broad - "what happened here", "is this compromised",
+    "tell me about this address" - call case_skill FIRST. It returns the
+    sequence an examiner follows for that kind of question, with the tables
+    and the joins already named. Following one is the difference between
+    seven queries that build an answer and one query read back in different
+    words.
+
+What to hold to:
+  - An empty table is not a clean host. It can mean the collector never ran
+    that artifact. Say so rather than reporting an absence as a result.
+  - Timestamps are UTC.
+  - If the data does not answer the question, say that. A wrong lead costs an
+    analyst more time than no lead.
+  - Be brief. Lead with the answer, then the evidence for it.
+
+Correlating, which is most of the job:
+  - "in BOTH A and B" is a JOIN or an INTERSECT. It is never a UNION. UNION
+    means "in either", and answering a both-question with one returns a value
+    that may appear in neither of the two tables you were asked about. Asked
+    which address was in FAILED_LOGINS and WEB_LOG, a UNION returned
+    99.72.192.47, which has 6 rows in the first and 0 in the second - a wrong
+    answer that reads exactly like a right one.
+  - The same fact is named differently in different tables. The address is
+    source_ip in FAILED_LOGINS and AUTH_LOG, client_ip in WEB_LOG, remote_ip
+    in LOGIN_RECORDS, peer_addr in NETSTAT and SOCKETS. Join the columns that
+    mean the same thing, not the ones that are spelled the same.
+  - Count each side and say both numbers. "209.141.62.185: 210 failed logins
+    and 1,456 web requests" is checkable; "the top address" is not.
+
+    The shape to use:
+      SELECT f.source_ip, f.n AS failed, w.n AS web
+        FROM (SELECT source_ip, COUNT(*) n FROM FAILED_LOGINS
+               WHERE source_ip <> '' GROUP BY source_ip) f
+        JOIN (SELECT client_ip, COUNT(*) n FROM WEB_LOG
+               WHERE client_ip <> '' GROUP BY client_ip) w
+          ON w.client_ip = f.source_ip
+       ORDER BY f.n + w.n DESC LIMIT 5
+
+  - Empty strings are not nulls here. Every column is text and an absent
+    value is '', so exclude it with <> '' rather than IS NOT NULL.
+  - Before you answer that something appears in two places, run one count per
+    place. If either is 0, it does not appear in both and your join was
+    wrong."""
+
+
+# The questions an examiner actually asks, and the tables that answer them.
+# Given the schema alone a model still has to guess which of LOGINS,
+# LOGIN_RECORDS, LASTLOG and AUTH_LOG holds a sign-in - and it guessed
+# 'auth_events', which exists nowhere, then gave up. Naming the route is the
+# difference between one query and three wrong ones. Only tables this case
+# actually has are shown.
+ROUTES = (
+    ("who signed in, and when",
+     ("LOGINS", "LOGIN_RECORDS", "LASTLOG", "USERS", "AUTH_LOG")),
+    ("failed logins, brute force",
+     ("FAILED_LOGINS", "AUTH_LOG", "USERS")),
+    ("what was running, what ran",
+     ("PROCESSES", "PROCESS_MASTER", "SHELL_HISTORY", "AUDIT_LOG")),
+    ("network connections and listeners",
+     ("SOCKETS", "NETSTAT", "PROC_NET", "FIREWALL")),
+    ("web requests, exploitation, webshells",
+     ("WEB_LOG", "WEB_CONFIG")),
+    ("persistence",
+     ("CRON", "SYSTEMD_UNITS", "INIT_AND_PROFILE", "KERNEL_MODULES")),
+    ("privilege escalation and sudo",
+     ("PRIVILEGE_ACTIVITY", "SUDOERS", "SUID_SGID", "USERS")),
+    ("files on disk, timestamps, hashes",
+     ("BODYFILE", "FILE_HASHES", "COLLECTED_FILES", "HIDDEN_PATHS")),
+    ("library hijack, preloaded objects",
+     ("PROC_ENVIRON", "PROC_ENVIRON_VARIABLES", "KERNEL_MODULES")),
+    ("what the triage already found",
+     ("FINDINGS", "SIGMA_MATCHES", "HACKTOOL_HITS", "IOC_HITS")),
+)
+
+
+# Columns that are the same fact in more than one table. Derived from the
+# schema rather than listed by hand, so a case with different artifacts gets
+# a different map and none of it is ever stale.
+JOIN_KEYS = ("pid", "ppid", "user", "username", "target_user", "uid",
+             "source_ip", "client_ip", "remote_ip", "source_host",
+             "remote_host", "path", "exe", "command", "inode", "tool",
+             "md5", "sha256", "local_port", "peer_port", "port")
+
+
+def _schema_brief(db):
+    """The whole schema, and how its tables join.
+
+    All 75 tables with all their columns is under 2,000 tokens - cheaper than
+    the partial version it replaces, and it removes the last reason to guess.
+    The join map is the other half: a host is one story told by forty
+    artifacts, and an analyst's real questions are correlations - which
+    address both brute-forced SSH and got a 2xx, which pid owns the socket
+    that is talking to it. A model that does not know pid is in eighteen
+    tables cannot ask that, however good its SQL is.
+    """
+    known = _tables(db)
+    live, empty, cols_of = [], [], {}
+    for name in sorted(known):
+        cols_of[name] = _cols(db, name)
+        (live if known.get(name) else empty).append(name)
+
+    out = ["EVERY table in this case. The list is complete: a name that is "
+           "not here does not exist, so never invent one.", ""]
+    for name in live:
+        out.append("  %s [%s rows] (%s)"
+                   % (name, "{:,}".format(known[name] or 0),
+                      ", ".join(cols_of[name])))
+    if empty:
+        out.append("")
+        out.append("Empty here - the collector produced nothing for them, "
+                   "which is not the same as the host being clean: "
+                   + ", ".join(empty))
+
+    where = {}
+    for name in live:
+        for c in cols_of[name]:
+            if c in JOIN_KEYS:
+                where.setdefault(c, []).append(name)
+    joins = [(c, t) for c, t in where.items() if len(t) > 1]
+    if joins:
+        out.append("")
+        out.append("How the tables join. These columns hold the same fact in "
+                   "each table listed, so they are what you correlate on:")
+        for col, names in sorted(joins, key=lambda x: -len(x[1])):
+            out.append("  %-14s %s" % (col, ", ".join(sorted(names))))
+
+    out.append("")
+    out.append("Where to look, by question:")
+    for q, names in ROUTES:
+        have = [n for n in names if n in known]
+        if have:
+            out.append("  %-38s %s" % (q, ", ".join(have)))
+    out.append("")
+    out.append("Correlating is the point. A host is one story told by many "
+               "artifacts: an address in WEB_LOG is the same address in "
+               "FAILED_LOGINS, a pid in PROCESSES is the same pid in "
+               "PROC_ENVIRON and SOCKETS. Join on the columns above rather "
+               "than answering from one table when the question spans two.")
+    return chr(10).join(out)
+
+
+def _timed_out(e):
+    """Whether this failure was the clock, not the connection.
+
+    Python has moved the timeout around between versions - socket.timeout,
+    then TimeoutError, wrapped in URLError on the way out of urllib, and the
+    wrapping differs again by transport. So the cause chain is walked and the
+    text is checked, rather than one exception type being named and being
+    right on one interpreter.
+    """
+    seen = []
+    while e is not None and len(seen) < 6:
+        if isinstance(e, TimeoutError):
+            return True
+        seen.append(e)
+        e = getattr(e, "reason", None) or getattr(e, "__cause__", None)
+    return any("timed out" in str(x).lower() for x in seen)
+
+
+def _llm_post(url, payload, timeout=ASK_TIMEOUT):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+# Tuned for a CPU-only host. num_ctx because the model advertises 131,072 and
+# is given the server default unless asked - the schema alone is nearly three
+# thousand tokens. num_batch because prompt processing is the slow half on a
+# CPU and a bigger batch is straightforwardly faster. num_thread at the
+# physical core count rather than the logical one: on this EPYC the second
+# thread of a core adds contention, not throughput. keep_alive is the one that
+# an examiner actually feels - without it the 4.9 GB is unloaded between
+# questions and every question pays to read it back off disk.
+ASK_OPTIONS = {"num_ctx": 16384, "num_batch": 512, "temperature": 0}
+ASK_KEEPALIVE = "30m"
+
+
+def _native(messages):
+    """The same conversation, in the shape Ollama's own API expects.
+
+    The two protocols disagree about one field: OpenAI carries tool-call
+    arguments as a JSON string, Ollama as an object. Sending a string back
+    gets 400 "Value looks like object, but can't find closing '}' symbol",
+    which is Ollama trying to parse the string as JSON one layer too late.
+    """
+    out = []
+    for m in messages:
+        calls = m.get("tool_calls")
+        if not calls:
+            out.append(m)
+            continue
+        fixed = []
+        for c in calls:
+            fn = dict(c.get("function") or {})
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    fn["arguments"] = json.loads(args or "{}")
+                except ValueError:
+                    fn["arguments"] = {}
+            fixed.append({"function": fn})
+        out.append({"role": m.get("role", "assistant"),
+                    "content": m.get("content") or "",
+                    "tool_calls": fixed})
+    return out
+
+
+def _chat(url, model, messages, tools, timeout=ASK_TIMEOUT):
+    """One exchange, normalised to {content, tool_calls}.
+
+    Ollama gets its own endpoint rather than the OpenAI-compatible one, for a
+    single reason: num_ctx. The model advertises 131,072 tokens of context and
+    Ollama gives it the server default - a few thousand - unless asked. The
+    schema alone is two thousand, so the compatible endpoint drops the tables
+    out of the window part way through and the model starts inventing names
+    again. /api/chat takes options; /v1 does not.
+
+    Anything else - LM Studio, llama.cpp, vLLM - keeps the OpenAI path, where
+    the window is the server's business and this has no way to set it anyway.
+    """
+    base = url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3].rstrip("/")
+    # An empty tool list is sent as no tool list at all. Several runtimes read
+    # "tools": [] as a malformed request rather than as "none", and the turn
+    # that has its tools taken away deliberately - the last one - is exactly
+    # the turn that must not fail.
+    if ":11434" in base:
+        payload = {"model": model, "messages": _native(messages),
+                   "stream": False, "keep_alive": ASK_KEEPALIVE,
+                   "options": ASK_OPTIONS}
+        if tools:
+            payload["tools"] = tools
+        body = _llm_post(base + "/api/chat", payload, timeout)
+        msg = body.get("message") or {}
+        calls = []
+        for c in msg.get("tool_calls") or []:
+            fn = c.get("function") or {}
+            args = fn.get("arguments")
+            calls.append({"id": c.get("id") or fn.get("name") or "call",
+                          "function": {"name": fn.get("name"),
+                                       "arguments": args if isinstance(args, str)
+                                       else json.dumps(args or {})}})
+        return {"content": msg.get("content") or "", "tool_calls": calls}
+    payload = {"model": model, "messages": messages, "temperature": 0}
+    if tools:
+        payload["tools"] = tools
+    body = _llm_post(url.rstrip("/") + "/chat/completions", payload, timeout)
+    msg = ((body.get("choices") or [{}])[0].get("message") or {})
+    return {"content": msg.get("content") or "",
+            "tool_calls": msg.get("tool_calls") or []}
+
+
+def llm_models(url=ASK_URL, timeout=10):
+    """What the runtime has, so the page can offer a choice rather than a box."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/models",
+                                    timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return []
+    return [m.get("id") for m in (body.get("data") or []) if m.get("id")]
+
+
+def _schema(tools):
+    return [{"type": "function",
+             "function": {"name": n, "description": d, "parameters": s}}
+            for n, d, s, _fn in tools]
+
+
+def _objects(text):
+    """Every balanced {...} in a string, in the order they were written.
+
+    All of them rather than the last one, because of what a model does with a
+    long plan: handed the ten-step challenge playbook, llama3.1:8b transcribed
+    it - every step, each with its SQL in a fenced JSON block - and finished
+    with {"name": "STANDS", ...}, which is a verdict and not a tool. Reading
+    only the last object found that, failed to match a tool, and returned two
+    minutes of narration to the analyst as though it were an answer, with four
+    perfectly good calls sitting unread above it.
+    """
+    out, depth, start = [], 0, -1
+    for i, c in enumerate(text or ""):
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}" and depth:
+            depth -= 1
+            if not depth and start >= 0:
+                out.append(text[start:i + 1])
+    return out
+
+
+def _loose_call(text, known, solo=None):
+    """A tool call a model wrote into its message instead of the tool field.
+
+    Not every local model has a tool-calling template, and several that
+    advertise one still answer with the JSON as prose: qwen2.5-coder returns
+    {"name": "case_query", "arguments": {...}} as content, with tool_calls
+    empty. The intent is unambiguous and the alternative is telling the
+    analyst their model is unsupported, so it is read - but only when it names
+    a tool that exists, and only when the message is that object and nothing
+    else. A model that merely mentions a tool in a sentence is answering, not
+    calling.
+    """
+    body = (text or "").strip()
+    if body.startswith("```"):                  # ```json ... ```
+        body = body.split(chr(10), 1)[-1].rsplit("```", 1)[0].strip()
+
+    # The first object that names a tool that exists, not the last object in
+    # the message. A model that narrates before it calls has still decided
+    # what to call; a model that writes the whole plan out has decided what to
+    # call first, and running that one turn puts real rows in front of it,
+    # which is what stops the transcribing.
+    for chunk in ([body] if body.startswith("{") and body.endswith("}")
+                  else _objects(body)):
+        try:
+            got = json.loads(chunk)
+        except ValueError:
+            continue
+        if not isinstance(got, dict):
+            continue
+        name = got.get("name") or got.get("tool")
+        if name not in known:
+            continue                        # a verdict, a row, a stray object
+        args = got.get("arguments")
+        if args is None:
+            args = got.get("parameters") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                # The argument written where the object of arguments should
+                # be: qwen2.5-coder answered "when was the last sign-in" with
+                #   {"name": "case_query", "arguments": "SELECT MAX(...)"}
+                # and this dropped it, so a query that had found the right
+                # table and the right column was printed to the analyst as
+                # the answer. A tool with one required parameter has only one
+                # thing that string can be. A tool with two does not, and
+                # guessing which is which would be worse than not reading it.
+                one = (solo or {}).get(name)
+                if not one or not args.strip():
+                    continue
+                args = {one: args.strip()}
+        if not isinstance(args, dict):
+            continue
+        return [{"id": "loose-0",
+                 "function": {"name": name, "arguments": json.dumps(args)}}]
+    return None
+
+
+# name(key="value", key=value) - a call written the way it would be typed,
+# which is neither the tool field nor the JSON object the other two readers
+# handle.
+_CALL_RE = re.compile(r"^([A-Za-z_][A-Za-z_0-9]*)\s*\((.*)\)$", re.S)
+_ARG_RE = re.compile(r"""([A-Za-z_][A-Za-z_0-9]*)\s*=\s*"""
+                     r"""("[^"]*"|'[^']*'|[^,()]+)""")
+
+
+def _loose_pycall(text, known):
+    """A tool call a model wrote as a call rather than as an object.
+
+    The third spelling, and the one that costs the most when it is missed.
+    Asked when the host was last signed in to, llama3.1:8b ran one query and
+    then replied with
+
+        case_values(table="USERS", column="last_login_utc")
+
+    as its whole message. Nothing about that is an answer - it is the next
+    step, written out instead of taken - and with no reader for it the panel
+    showed the analyst a function call where the sign-in should have been.
+    _loose_call reads the same intent spelled as JSON and _loose_sql reads it
+    spelled as SQL; this reads it spelled as Python, which is how a model
+    that has been shown a tool signature tends to write it.
+
+    Same guard as the other two: the message has to be that call and nothing
+    else, and it has to name a tool that exists. A model explaining which
+    tool it used is answering, and re-running that would cost it a turn.
+    """
+    body = (text or "").strip()
+    if body.startswith("```"):
+        body = body.split(chr(10), 1)[-1].rsplit("```", 1)[0].strip()
+    body = body.rstrip(";").strip()
+    m = _CALL_RE.match(body)
+    if not m or m.group(1) not in known:
+        return None
+    args = {}
+    for key, raw in _ARG_RE.findall(m.group(2) or ""):
+        val = raw.strip().strip("\"'")
+        args[key] = val
+    if not args and (m.group(2) or "").strip():
+        return None                     # positional, or something else again
+    return [{"id": "loose-call",
+             "function": {"name": m.group(1), "arguments": json.dumps(args)}}]
+
+
+def _loose_sql(text, known):
+    """A message that is not an answer but the query the model meant to run.
+
+    The other half of _loose_call, and it comes from the same place: asked to
+    challenge a conclusion, llama3.1:8b worked the plan, had a query rejected
+    for a column that does not exist, and then replied with nothing but
+
+        SELECT timestamp_utc FROM LOGINS WHERE source_host = '' ...
+
+    as its message. That is not an answer to anything - it is a tool call that
+    lost its wrapper on the way out, and returning it to the analyst as the
+    model's conclusion is the worst outcome available. So it is run, and the
+    rows go back, and the model gets to finish.
+
+    Only when the message is that statement and nothing else. A model that
+    quotes the SQL it ran inside a sentence is explaining itself, which is
+    exactly what it was asked to do, and re-running that would turn every good
+    answer into another turn.
+    """
+    if "case_query" not in known:
+        return None
+    body = (text or "").strip()
+    if body.startswith("```"):
+        body = body.split(chr(10), 1)[-1].rsplit("```", 1)[0].strip()
+    body = body.strip().rstrip(";").strip()
+    head = body.lstrip("( \t\r\n")[:6].lower()
+    if not (head.startswith("select") or head.startswith("with")):
+        return None
+    if ";" in body:
+        return None
+    return [{"id": "loose-sql",
+             "function": {"name": "case_query",
+                          "arguments": json.dumps({"sql": body})}}]
+
+
+# The three kinds of value that make a forensic claim, and the three a model
+# invents most readily. Small numbers are left alone deliberately: "2 of the 8
+# tables" is arithmetic over results rather than a figure from one, and
+# flagging it would bury the figures that matter under noise.
+_FACT = re.compile(
+    r"\b\d{1,3}(?:\.\d{1,3}){3}\b"                      # an address
+    r"|\b\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?"  # a timestamp
+    r"|\b\d[\d,]{2,}\b")                                # a count, 3 digits up
+
+
+def _plain(text):
+    """Comparable form: no thousands separators, one kind of space."""
+    return (text or "").replace(",", "").replace("T", " ")
+
+
+def _unsupported(answer, corpus):
+    """Figures in the answer that appear in no result the model was sent.
+
+    This does not stop a model inventing. It stops an examiner believing the
+    invention, which is the part that matters and the part that can actually
+    be enforced.
+
+    It is needed because of what llama3.1:8b did with profile_address on a
+    3.4-million-row case: it ran case_search, once, got eight tables back with
+    their real counts - and then wrote a hundred and fifty lines of per-table
+    statistics for tables the search had not returned. BODYFILE with 26,192
+    rows and a source_ip column it does not have. SUDOERS with 42. Earliest
+    and latest timestamps for every one of them. Four figures in that report
+    were real and the rest were composed, and nothing about the prose said
+    which was which.
+
+    Every number, address and timestamp in the answer is looked up in the raw
+    tool results. What is not there did not come from the case, and is named.
+    """
+    if not (answer or "").strip():
+        return []
+    hay = _plain(corpus)
+    bad, seen = [], set()
+    for hit in _FACT.findall(answer):
+        token = hit.strip().rstrip(".")
+        flat = _plain(token)
+        if not flat or flat in seen:
+            continue
+        seen.add(flat)
+        if flat not in hay:
+            bad.append(token)
+    return bad[:40]
+
+
+def _signature(name, args):
+    """One call, normalised, so the same call twice is recognisable."""
+    if isinstance(args, dict):
+        body = json.dumps(args, sort_keys=True, default=str)
+    else:
+        body = str(args)
+    return name + " " + " ".join(body.split()).lower()
+
+
+REPEAT = ("You have already run this exact call in this investigation and it "
+          "returned %s. Running it again returns the same thing. "
+          "It was not re-run.%s"
+          + chr(10) + chr(10) +
+          "Change something or stop. If the last few queries all came back "
+          "empty, the shape of the query is wrong, not the host: read the "
+          "columns you are filtering on with case_values, drop the narrowest "
+          "condition, or say plainly that you could not establish it. Do not "
+          "answer from a result you did not get.")
+
+
+def _repeat_note(out, extra=""):
+    got = "nothing"
+    if isinstance(out, dict):
+        if out.get("error"):
+            got = "an error"
+        elif out.get("returned"):
+            got = "%s row(s)" % out["returned"]
+        elif "returned" in out:
+            got = "0 rows"
+    return REPEAT % (got, extra)
+
+
+def _brief(name, args, out):
+    """One line saying what the step did, for the trace the analyst reads.
+
+    The trace is not decoration. A model that says 'the host was compromised
+    on the 8th' is worth exactly as much as the queries behind it, and this is
+    where they are shown.
+    """
+    if isinstance(out, dict):
+        for k in ("returned", "total", "total_matches", "tables_with_events"):
+            if k in out:
+                return "%s -> %s %s" % (name, out[k], k.replace("_", " "))
+    return name
+
+
+# How much of the conversation before this question is carried forward. Only
+# the questions and the answers - never the tool traffic, which is where all
+# the tokens are and none of the meaning is. Two exchanges is what a follow-up
+# actually needs ("and what about that address?" refers to the last answer,
+# not to the one before the one before), and it keeps the window for the
+# schema, which is what the model cannot do without.
+ASK_HISTORY = 4                 # messages, so two question-and-answer pairs
+
+
+def _prior(history):
+    """Earlier turns, trimmed to what a follow-up needs to resolve."""
+    out = []
+    for m in history or []:
+        role = str((m or {}).get("role") or "")
+        text = str((m or {}).get("content") or "").strip()
+        if role in ("user", "assistant") and text:
+            # 4,000 characters each was a quarter of the window spent on
+            # what was said last time before this turn had asked anything.
+            out.append({"role": role, "content": text[:1200]})
+    return out[-ASK_HISTORY:]
+
+
+_DROPPED = ("[this result was dropped to keep the conversation inside the "
+            "model's context window. The query did run - if you need it "
+            "again, run it again, narrower.]")
+
+
+def _result_body(out, cap):
+    """One tool result, serialised small enough to send.
+
+    It loses rows, not characters. Slicing the JSON string - which is what
+    this did - handed the model an object with no closing brace and half a
+    value in the last row, and a model that cannot parse a result reports
+    what it can see of it. Dropping whole rows keeps the result a result,
+    and says how many were taken out.
+    """
+    body = json.dumps(out, default=str)
+    if len(body) <= cap or not isinstance(out, dict):
+        return body[:cap]
+    rows = out.get("rows")
+    if not isinstance(rows, list) or len(rows) < 2:
+        return body[:cap]
+    keep = list(rows)
+    while len(keep) > 1:
+        keep = keep[:max(1, int(len(keep) * 0.6))]
+        small = dict(out)
+        small["rows"] = keep
+        small["returned"] = len(keep)
+        small["note"] = (
+            "these are the first %d of the %d row(s) the query matched here; "
+            "the rest were cut to fit the context window, not by the query. "
+            "Do not report %d as a total - run the same WHERE as "
+            "SELECT COUNT(*) if you need the number."
+            % (len(keep), len(rows), len(keep)))
+        body = json.dumps(small, default=str)
+        if len(body) <= cap:
+            return body
+    return body[:cap]
+
+
+def _fit(messages, ctx=None):
+    """The conversation, trimmed to the window rather than truncated by it.
+
+    Everything the model still needs to answer stays: the system message with
+    the schema, the question, and the most recent results. What goes is the
+    oldest tool results, and they go by name - a result replaced with a line
+    saying it was dropped is a result the model knows it ran, where a missing
+    one reads as a query it never made.
+    """
+    ctx = ctx or ASK_OPTIONS.get("num_ctx") or 8192
+    budget = max(2000, (ctx - ASK_REPLY_TOKENS)) * ASK_CHARS_PER_TOKEN
+    total = sum(len(m.get("content") or "") for m in messages)
+    if total <= budget:
+        return messages
+    out = [dict(m) for m in messages]
+    # oldest first, and never the last pair: that is the result the model is
+    # being asked to read.
+    for i in range(1, max(1, len(out) - 2)):
+        if total <= budget:
+            break
+        if out[i].get("role") != "tool":
+            continue
+        was = len(out[i].get("content") or "")
+        if was <= len(_DROPPED):
+            continue
+        out[i]["content"] = _DROPPED
+        total -= was - len(_DROPPED)
+    return out
+
+
+def _final(url, model, messages):
+    """One last turn with the tools taken away.
+
+    A model that has used every round has usually done the work and simply
+    not stopped querying - and throwing that away to tell the analyst it ran
+    out is the worst of both, a minute spent and nothing to show. So it is
+    asked once more, with no tools to reach for, to answer from what is
+    already in front of it. If even that fails there is nothing to salvage
+    and the honest message stands.
+    """
+    messages = messages + [{"role": "user", "content":
+        "Stop querying. Answer now, using ONLY the rows already returned "
+        "above." + chr(10) + chr(10) +
+        "Every value you state - an address, a username, a path, a timestamp "
+        "- must appear in one of those results. If it is not there you do not "
+        "know it, and you must not write it down. Do not fill a gap with a "
+        "plausible value; a fabricated address in a forensic report is worse "
+        "than no report." + chr(10) + chr(10) +
+        "If the queries above returned no rows, then the answer is that you "
+        "did not establish it, and you should say which query you would run "
+        "next. Otherwise: what you established, the table each part came "
+        "from, and what you did not reach."}]
+    try:
+        msg = _chat(url, model, _fit(messages), [])
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return None
+    text = (msg.get("content") or "").strip()
+    return text or None
+
+
+def ask(db_path, question, url=ASK_URL, model=None, rounds=ASK_ROUNDS,
+        history=None, remember=None):
+    """Answer one question against the case.
+
+    -> {answer, steps, model, history}. `history` is the conversation to carry
+    into the next question and is what makes a follow-up work: asked "and what
+    else did it touch?" with no history, a model has no antecedent for "it"
+    and profiles whichever address it happens to see first.
+
+    `remember` is what this turn is recorded as in that thread, and it exists
+    because a playbook is not a question. When the analyst presses a button,
+    `question` is two thousand words of method - carrying that forward would
+    fill the next turn's window with a plan it has already followed, instead
+    of with what was asked and what came back.
+    """
+    question = (question or "").strip()
+    if not question:
+        raise CaseError("ask something")
+    if not model:
+        got = llm_models(url)
+        if not got:
+            raise CaseError(
+                "no model is loaded. Ollama is answering but has nothing to "
+                "run - pull one that supports tool calling, for example "
+                "'ollama pull qwen2.5-coder:7b', then choose it here.")
+        model = got[0]
+
+    db = _open(db_path)
+    tools = all_tools()
+    call = dict((t[0], t[3]) for t in tools)
+    # Tools that take exactly one required argument, and what it is called.
+    # From the schemas, so a tool added later is covered without this being
+    # remembered.
+    solo = dict((t[0], ((t[2] or {}).get("required") or [""])[0])
+                for t in tools
+                if len((t[2] or {}).get("required") or []) == 1)
+    schema = _schema(tools)
+    # The schema goes in the system message rather than being left for the
+    # model to discover. Asked cold, llama3.1 queried 'auth_events' and then
+    # 'login_events', neither of which exists, and gave up - while the answer
+    # sat in LOGINS, LASTLOG and USERS.last_login_utc. A list of names costs a
+    # few hundred tokens and removes the guessing entirely.
+    messages = ([{"role": "system",
+                  "content": SYSTEM + chr(10) + chr(10) + _schema_brief(db)}]
+                + _prior(history)
+                + [{"role": "user", "content": question}])
+    steps = []
+    carry = _prior(history) + [{"role": "user",
+                                "content": remember or question}]
+    # What has already been run, and what it gave back. A model that is stuck
+    # repeats itself rather than stopping: asked to challenge a conclusion,
+    # llama3.1:8b wrote `WHERE start > (SELECT MAX(start) ...)` - which cannot
+    # return a row, by construction - and ran it four times unchanged, burned
+    # every round it had, and then invented an address and a 2023 timestamp
+    # for a collection taken in 2021. Catching the second identical call costs
+    # nothing and buys back the rounds it would have spent on the third.
+    done = {}
+    # Everything the model was sent back, kept so the answer can be checked
+    # against it rather than taken on trust.
+    corpus = []
+
+    for _turn in range(max(1, rounds)):
+        try:
+            msg = _chat(url, model, _fit(messages), schema)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            raise CaseError("the model runtime refused: %s %s" % (e.code, detail))
+        except (urllib.error.URLError, OSError) as e:
+            # A timeout and a refused connection are different problems and
+            # must not read the same. "Is it running?" is actively misleading
+            # when the answer is yes and the model is simply slow.
+            if _timed_out(e):
+                raise CaseError(
+                    "the model did not answer within %d seconds. It is "
+                    "running - it is thinking. A playbook is a long prompt "
+                    "and prompt processing is the slow half on a CPU, so the "
+                    "first turn is the one that runs out. Ask something "
+                    "narrower, or run a smaller model." % ASK_TIMEOUT)
+            raise CaseError("cannot reach a model at %s (%s). Is it running?"
+                            % (url, e))
+        except ValueError:
+            raise CaseError("the model runtime sent something that is not JSON")
+
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            calls = (_loose_call(msg.get("content"), call, solo)
+                     or _loose_pycall(msg.get("content"), call)
+                     or _loose_sql(msg.get("content"), call) or [])
+        if not calls:
+            answer = (msg.get("content") or "").strip()
+            return {"answer": answer, "steps": steps, "model": model,
+                    "unsupported": _unsupported(answer, chr(10).join(corpus)),
+                    "history": carry + [{"role": "assistant",
+                                         "content": answer}]}
+
+        messages.append({"role": "assistant",
+                         "content": msg.get("content") or "",
+                         "tool_calls": calls})
+        for c in calls:
+            fn = (c.get("function") or {})
+            name = fn.get("name") or ""
+            raw = fn.get("arguments")
+            try:
+                args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except ValueError:
+                args = {}
+            handler = call.get(name)
+            # The row cap the tools default to is written for an MCP client
+            # with a hundred thousand tokens to spend. Here 200 rows of
+            # LOGINS is 54,215 characters against a 16,384-token window, and
+            # a model cannot read what it cannot be sent.
+            if isinstance(args, dict):
+                try:
+                    want = int(args.get("limit") or ASK_ROWS)
+                except (TypeError, ValueError):
+                    want = ASK_ROWS
+                args = dict(args, limit=max(1, min(want, ASK_ROWS)))
+            sig = _signature(name, args)
+            if sig in done:
+                out = {"error": _repeat_note(done[sig])}
+            elif handler is None:
+                out = {"error": "no tool called %r" % name}
+            else:
+                try:
+                    out = handler(db, args)
+                except CaseError as e:
+                    # back to the model as data: it can correct a bad column
+                    # name itself, and usually does on the next turn
+                    out = {"error": str(e)}
+                except Exception as e:              # never kill the panel
+                    out = {"error": "%s: %s" % (type(e).__name__, e)}
+            if sig not in done:
+                done[sig] = out
+            steps.append({"tool": name, "args": args,
+                          "note": _brief(name, args, out)})
+            body = _result_body(out, ASK_RESULT_TOKENS * ASK_CHARS_PER_TOKEN)
+            corpus.append(body)
+            messages.append({"role": "tool",
+                             "tool_call_id": c.get("id") or name,
+                             "content": body})
+
+    answer = _final(url, model, messages)
+    if answer and (_loose_call(answer, call, solo)
+                   or _loose_pycall(answer, call)
+                   or _loose_sql(answer, call)):
+        # The last turn is asked to answer with the tools taken away, and a
+        # model that has spent eight rounds without converging sometimes
+        # replies with the ninth query rather than an answer. Asked which
+        # address failed the most SSH logins, llama3.1:8b guessed at the
+        # vocabulary five times and finished with {"name": "case_query",
+        # "parameters": {...}} as its report. There is no round left to run
+        # it in, and printing it puts a tool call in front of an analyst
+        # where a finding should be - so it is not printed. What it looked
+        # at is below it either way.
+        answer = None
+    if not answer:
+        answer = ("I ran out of turns before I could answer that, and could "
+                  "not summarise what I had. What I looked at is below - try "
+                  "asking for one of those, narrower.")
+    return {"answer": answer, "steps": steps, "model": model,
+            "truncated": True,
+            "unsupported": _unsupported(answer, chr(10).join(corpus)),
+            "history": carry + [{"role": "assistant", "content": answer}]}
+
+# -------------------------------------------------------------------------
+# the investigation server: the console plus a case file
+# -------------------------------------------------------------------------
+
+"""The investigation server: the console, plus a case file it writes to.
+
+`--export` gives you a page. This gives you a workspace. The difference is
+that the findings and the artifacts are only half of an investigation - the
+other half is what the examiner decided about them, and a static page has
+nowhere to put that.
+
+Everything here is standard library. The box that reads a triage collection is
+routinely the box that may not install anything, and a server that needs a
+package manager is a server that does not run on the machine the evidence is
+on.
+
+Bound to the loopback interface by default and deliberately: this hands out
+the parsed contents of somebody's compromised host, and that must not become a
+service on the network by accident.
+"""
+
+
+
+
+#: How large a request body the API will read. A mark is a few hundred bytes;
+#: anything approaching this is a bug or an attempt at one.
+MAX_BODY = 1 << 20
+
+#: The states a row can be marked with. The key is what the page stores, the
+#: label is what a report prints, and the colour is what the row turns.
+MARK_STATES = (
+    ("key", "Key evidence", "#ff5f56"),
+    ("interesting", "Interesting", "#f5d067"),
+    ("suspect", "Suspicious", "#ff9f43"),
+    ("benign", "Reviewed - benign", "#3fb950"),
+)
+
+
+class CaseStore:
+    """Marks, labels and notes for one investigation, saved as JSON.
+
+    Written on every change rather than at exit. An investigation that loses
+    an afternoon of annotation because the process was killed is worse than
+    one that costs a few milliseconds per click, and the file is small.
+
+    The row key is chosen by the page - table name plus a hash of the row's
+    values - so a mark survives a re-run that produces the same row in a
+    different position, and does not survive a row whose content changed. That
+    is the correct behaviour for both: the mark belongs to the evidence, not
+    to the offset it happened to sit at.
+    """
+
+    def __init__(self, path, db=None):
+        self.path = os.path.abspath(path)
+        self.db = db
+        self.lock = threading.Lock()
+        self.data = {"version": VERSION, "created": _now(), "case": {},
+                     "marks": {}}
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                got = json.load(fh)
+            if isinstance(got, dict) and isinstance(got.get("marks"), dict):
+                self.data = got
+                self.data.setdefault("case", {})
+                self.data.setdefault("version", VERSION)
+        except (OSError, ValueError):
+            pass                    # a missing or unreadable case starts empty
+        return self.data
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, indent=1, sort_keys=True)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            status("[!] case: could not write %s: %s" % (self.path, e))
+
+    def set_mark(self, key, state="", note="", labels=None, where=None):
+        """Add, change or clear one mark. -> the stored entry, or None."""
+        with self.lock:
+            marks = self.data.setdefault("marks", {})
+            if not state and not note and not labels:
+                marks.pop(key, None)
+                self.save()
+                if self.db:
+                    self.db.put_mark(key, None)
+                return None
+            entry = marks.get(key) or {"created": _now()}
+            entry["state"] = state
+            entry["note"] = note or ""
+            entry["labels"] = sorted(set(labels or []))
+            entry["updated"] = _now()
+            if where:
+                entry["where"] = where
+            marks[key] = entry
+            self.save()
+        if self.db:
+            self.db.put_mark(key, entry)
+        return entry
+
+    def set_case(self, field, value):
+        with self.lock:
+            self.data.setdefault("case", {})[field] = value
+            self.save()
+
+    def snapshot(self):
+        with self.lock:
+            return json.loads(json.dumps(self.data))
+
+
+class CaseDB:
+    """The whole investigation in one SQLite file: evidence and annotation.
+
+    The case JSON holds what the examiner decided. This holds that *and* every
+    parsed row, which is what makes the file worth handing to somebody: open
+    it in any SQLite client and the tables are the tables, queryable with SQL
+    that has nothing to do with this tool.
+
+    Written once when the server starts, then kept current for marks alone.
+    The artifact tables do not change while the server is up - the evidence is
+    what it is - so re-writing them on every annotation would be a great deal
+    of I/O to say nothing new.
+
+    Column names are quoted rather than validated because they come from the
+    table builder, not from a request; the values are bound, never formatted,
+    so a log line containing a quote is a value and not a syntax error.
+    """
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.lock = threading.Lock()
+        self._conn = None
+
+    def connect(self):
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.path, check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        return self._conn
+
+    def build(self, tables, meta=None, quiet=False):
+        """Write every artifact table, one SQL table each. -> rows written."""
+        db = self.connect()
+        total = 0
+        with self.lock:
+            db.execute("DROP TABLE IF EXISTS _tables")
+            db.execute("CREATE TABLE _tables (name TEXT PRIMARY KEY, "
+                       "title TEXT, category TEXT, description TEXT, rows INT)")
+            db.execute("DROP TABLE IF EXISTS _meta")
+            db.execute("CREATE TABLE _meta (key TEXT, value TEXT)")
+            for k, v in (meta or {}).items():
+                db.execute("INSERT INTO _meta VALUES (?,?)", (str(k), str(v)))
+            db.execute("""CREATE TABLE IF NOT EXISTS marks (
+                            key TEXT PRIMARY KEY, state TEXT, note TEXT,
+                            labels TEXT, tbl TEXT, what TEXT, when_utc TEXT,
+                            row_json TEXT, created TEXT, updated TEXT)""")
+            for t in tables:
+                name = _sql_name(t.name)
+                cols = [str(c) for c in t.columns] or ["value"]
+                db.execute('DROP TABLE IF EXISTS "%s"' % name)
+                db.execute('CREATE TABLE "%s" (%s)'
+                           % (name, ",".join('"%s" TEXT' % c.replace('"', '')
+                                             for c in cols)))
+                ins = ('INSERT INTO "%s" VALUES (%s)'
+                       % (name, ",".join("?" * len(cols))))
+                n = 0
+                for row in t.iter_rows():
+                    # _s, not str: the project's own cell formatter. str() on a
+                    # datetime keeps the '+00:00' offset, so the database held
+                    # '2016-04-03 16:05:47+00:00' where every CSV and NDJSON
+                    # export held '2016-04-03 16:05:47'. The console then could
+                    # not parse its own timeline out of its own database.
+                    vals = [None if v is None else _s(v) for v in row[:len(cols)]]
+                    vals += [None] * (len(cols) - len(vals))
+                    db.execute(ins, vals)
+                    n += 1
+                db.execute("INSERT INTO _tables VALUES (?,?,?,?,?)",
+                           (name, t.title, t.category, t.description, n))
+                total += n
+            db.commit()
+        if not quiet:
+            status("[+] sqlite: %d row(s) in %d table(s) -> %s"
+                   % (total, len(tables), self.path))
+        return total
+
+    def rows(self, name, offset=0, limit=0):
+        """One table out of the database. -> {columns, rows, total} or None.
+
+        The page used to carry every row itself, which made a disk image a
+        ten-megabyte HTML file that took ten seconds to open and could not be
+        screenshotted. The database already holds all of it, so the page can
+        ask for a table when the examiner opens it and hold nothing until
+        then.
+        """
+        db = self.connect()
+        with self.lock:
+            row = db.execute("SELECT name, rows FROM _tables WHERE name=?",
+                             (name,)).fetchone()
+            if not row:
+                return None
+            real, total = row
+            cols = [c[1] for c in db.execute('PRAGMA table_info("%s")' % real)]
+            sql = 'SELECT * FROM "%s"' % real
+            if limit and limit > 0:
+                sql += " LIMIT %d OFFSET %d" % (int(limit), int(offset))
+            elif offset:
+                sql += " LIMIT -1 OFFSET %d" % int(offset)
+            out = [list(r) for r in db.execute(sql)]
+        return {"name": real, "columns": cols, "rows": out, "total": total}
+
+    #: Columns a table can carry its clock in, in the order they are trusted.
+    TIME_COLS = ("timestamp_utc", "start_utc", "mtime_utc", "when_utc",
+                 "first_utc", "last_utc", "dtime_utc", "ctime_utc")
+
+    def find(self, name, pairs, limit=3):
+        """The rows where every quoted field holds exactly its quoted value.
+
+        A Sigma match quotes eight of a row's fields, shortening the long ones
+        to fit the cell it lives in. Showing the whole of that row used to mean
+        unpacking the artifact table in the browser - four seconds for
+        WEB_LOG, nine for JOURNAL, on the thread that draws the page. The
+        database already holds every row, so one indexed lookup here costs a
+        few milliseconds and returns the fields at full length.
+
+        Values carrying '...' were shortened and cannot be matched on; the
+        caller drops them, and this refuses to run without something left.
+        """
+        db = self.connect()
+        with self.lock:
+            row = db.execute("SELECT name FROM _tables WHERE name=?",
+                             (name,)).fetchone()
+            if not row:
+                return None
+            real = row[0]
+            cols = [c[1] for c in db.execute('PRAGMA table_info("%s")' % real)]
+            use = [(k, v) for k, v in pairs if k in cols and "..." not in v]
+            if not use:
+                return {"columns": cols, "rows": []}
+            where = " AND ".join('"%s"=?' % k for k, _ in use)
+            sql = ('SELECT * FROM "%s" WHERE %s LIMIT ?'
+                   % (real, where))
+            got = db.execute(sql, [v for _, v in use] + [max(1, int(limit))])
+            return {"columns": cols, "rows": [list(r) for r in got]}
+
+    def context(self, when, minutes=15, per_table=40):
+        """Everything the host recorded around one moment. -> [{table, rows}]
+
+        The question an examiner asks the instant something looks wrong: what
+        else was happening. Answering it means every table with a clock, not
+        the one that happens to be open, and that is a query rather than a
+        scan - which is the whole reason for the database.
+
+        Ordered by how close each row is to the moment, so the first screen is
+        the seconds either side rather than the first table alphabetically.
+        """
+        db = self.connect()
+        out = []
+        with self.lock:
+            names = [r[0] for r in db.execute("SELECT name FROM _tables")]
+            for name in names:
+                cols = [c[1] for c in db.execute('PRAGMA table_info("%s")' % name)]
+                tc = next((c for c in self.TIME_COLS if c in cols), None)
+                if not tc:
+                    continue
+                sql = ('SELECT * FROM "%s" WHERE "%s" >= ? AND "%s" <= ? '
+                       'ORDER BY "%s" LIMIT %d' % (name, tc, tc, tc, per_table))
+                lo, hi = _shift(when, -minutes), _shift(when, minutes)
+                try:
+                    rows = [list(r) for r in db.execute(sql, (lo, hi))]
+                except sqlite3.Error:
+                    continue
+                if rows:
+                    out.append({"table": name, "time_column": tc,
+                                "columns": cols, "rows": rows})
+        out.sort(key=lambda d: -len(d["rows"]))
+        return {"when": when, "minutes": minutes, "tables": out,
+                "total": sum(len(d["rows"]) for d in out)}
+
+    def put_mark(self, key, entry):
+        db = self.connect()
+        with self.lock:
+            if entry is None:
+                db.execute("DELETE FROM marks WHERE key=?", (key,))
+            else:
+                w = entry.get("where") or {}
+                db.execute(
+                    "INSERT OR REPLACE INTO marks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (key, entry.get("state", ""), entry.get("note", ""),
+                     " ".join(entry.get("labels") or []), w.get("table", ""),
+                     w.get("what", ""), w.get("when", ""),
+                     json.dumps({"columns": w.get("columns") or [],
+                                 "row": w.get("row") or []}),
+                     entry.get("created", ""), entry.get("updated", "")))
+            db.commit()
+
+    def close(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+            self._conn = None
+
+
+def _sql_name(name):
+    """A table name safe to quote into SQL - the builder's names already are."""
+    return "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name))
+
+
+#: The last read of the on-disk assets, keyed by the file's identity, so a
+#: page load costs one stat rather than a re-read of the whole script.
+_ASSETS = {}
+
+
+def _asset_file():
+    """The source file that carries APP_CSS and APP_JS, if it can be found.
+
+    Single-file build: linsight.py, the script that is running. Package
+    checkout: src/linsight/gui.py beside this module. Either way it is read
+    from disk rather than from the imported constants, which is the entire
+    point - the constants were fixed when the process started.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "gui.py"),
+                 os.path.abspath(sys.argv[0] or "")):
+        try:
+            if not path or not os.path.isfile(path):
+                continue
+            # The whole file, not a head. In the single-file build APP_CSS
+            # sits about a megabyte in, so reading the first few hundred
+            # kilobytes found no marker, rejected the only file that had
+            # one, and fell back to the compiled-in assets - which is the
+            # exact behaviour this function exists to avoid, arrived at
+            # silently.
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            if 'APP_CSS = """' in text or 'APP_JS = """' in text:
+                return path
+        except OSError:
+            continue
+    return ""
+
+
+def _block(text, name):
+    """The VALUE of a NAME = triple-quoted assignment, not its source.
+
+    The distinction is the whole thing. Reading the file gives the text
+    of the literal, in which a JavaScript regex is written the way
+    Python needs it - a doubled backslash. Handing that to a browser
+    produces a pattern with literal backslashes in it, and the page dies
+    on "Range out of order in character class" before it defines a
+    single function. ast.literal_eval applies exactly the unescaping the
+    interpreter would have applied, so the served asset is identical to
+    the compiled-in one.
+    """
+    key = name + " = " + '"""'
+    i = text.find(key)
+    if i < 0:
+        return ""
+    i += len(key) - 3
+    j = text.find('"""', i + 3)
+    if j <= i:
+        return ""
+    try:
+        return ast.literal_eval(text[i:j + 3])
+    except (ValueError, SyntaxError):
+        return ""
+
+
+def live_assets():
+    """(css, js) as they are on disk now, or (None, None) to use the built-in.
+
+    --serve holds one console in memory for the life of the process, so a
+    rebuilt tool never reached a running server and an examiner kept looking
+    at the stylesheet the server was born with. Re-reading here costs one file
+    read per page load and means a rebuild is a browser refresh away.
+
+    Failure is silent and falls back to the compiled-in assets: a console that
+    refuses to load because a source file moved is worse than one that is a
+    version behind.
+    """
+    path = _asset_file()
+    if not path:
+        return None, None
+    try:
+        info = os.stat(path)
+        stamp = (path, info.st_mtime_ns, info.st_size)
+    except OSError:
+        return None, None
+    if _ASSETS.get("stamp") == stamp:
+        return _ASSETS["css"], _ASSETS["js"]
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None, None
+    css = _block(text, "APP_CSS") or None
+    js = _block(text, "APP_JS") or None
+    _ASSETS.update(stamp=stamp, css=css, js=js)
+    return css, js
+
+
+def _shift(when, minutes):
+    """'2019-10-05 11:14:04' +/- minutes, as the same string shape.
+
+    String arithmetic on a UTC stamp, because that is what the tables store
+    and comparing them as text is exact for this format - no timezone is
+    reintroduced on the way through a date type.
+    """
+    try:
+        t = time.strptime(str(when)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(when)
+    return time.strftime("%Y-%m-%d %H:%M:%S",
+                         time.gmtime(calendar.timegm(t) + minutes * 60))
+
+
+def _now():
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+
+def _skills(store):
+    """The playbooks, told which of their tables this case actually has.
+
+    Offered whether or not the tables are there. A button that vanishes on a
+    host with no web logs teaches an examiner nothing; a playbook that runs
+    and says "this collection has no WEB_LOG" teaches them the shape of their
+    evidence, which is the more useful of the two.
+    """
+    if not store.db:
+        return []
+    try:
+        db = _open(store.db.path)
+    except CaseError:
+        return []
+    try:
+        return available(db)
+    finally:
+        db.close()
+
+
+def _playbook(store, name, args, question):
+    """A skill, rendered against this case and addressed to the model."""
+    db = _open(store.db.path)
+    try:
+        text = render(name, db, args or {})
+    finally:
+        db.close()
+    asked = (question or "").strip()
+    if asked:
+        text += (chr(10) * 2 + "The analyst asked it this way, so answer "
+                 "that, using the method above: " + asked)
+    return text
+
+
+def _handler(page, store):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "linsight/" + VERSION
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            pass                    # the console is the output, not the log
+
+        # -- helpers --------------------------------------------------------
+        def _send(self, code, body, ctype="application/json"):
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            # This page is the evidence; nothing about it should be cached by
+            # anything, and nothing on it should reach the network.
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Security-Policy",
+                             "default-src 'self' 'unsafe-inline'; "
+                             "connect-src 'self'; img-src 'self' data:")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _body(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return {}
+            if n <= 0 or n > MAX_BODY:
+                return {}
+            try:
+                return json.loads(self.rfile.read(n).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return {}
+
+        # -- routes ---------------------------------------------------------
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path in ("/", "/index.html"):
+                body = page() if callable(page) else page
+                return self._send(200, body, "text/html; charset=utf-8")
+            if path == "/api/case":
+                return self._send(200, json.dumps(store.snapshot()))
+            if path == "/api/context":
+                q = urllib.parse.parse_qs(self.path.partition("?")[2])
+                when = (q.get("when") or [""])[0]
+                try:
+                    mins = max(1, min(1440, int((q.get("minutes") or ["15"])[0])))
+                except ValueError:
+                    mins = 15
+                if not store.db or not when:
+                    return self._send(400, json.dumps(
+                        {"error": "need a database and a 'when'"}))
+                return self._send(200, json.dumps(store.db.context(when, mins)))
+            if path == "/api/rows":
+                # The page asks for a table by name and gets it out of the
+                # database. Names are checked against _tables rather than
+                # escaped into the query: a name that is not one this run
+                # built is not a table, and there is nothing to sanitise.
+                q = urllib.parse.parse_qs(self.path.partition("?")[2])
+                name = (q.get("table") or [""])[0]
+                try:
+                    off = max(0, int((q.get("offset") or ["0"])[0]))
+                    lim = int((q.get("limit") or ["0"])[0])
+                except ValueError:
+                    off, lim = 0, 0
+                if not store.db:
+                    return self._send(404, json.dumps(
+                        {"error": "this run has no database"}))
+                got = store.db.rows(name, off, lim)
+                if got is None:
+                    return self._send(404, json.dumps(
+                        {"error": "no table called %r here" % name}))
+                return self._send(200, json.dumps(got))
+            if path == "/api/find":
+                # The pairs arrive as JSON so a value may hold anything at all
+                # - a shell command with '=' and ';' in it is the usual case.
+                q = urllib.parse.parse_qs(self.path.partition("?")[2])
+                name = (q.get("table") or [""])[0]
+                try:
+                    pairs = json.loads((q.get("keys") or ["[]"])[0])
+                except ValueError:
+                    return self._send(400, json.dumps({"error": "bad keys"}))
+                if not store.db:
+                    return self._send(404, json.dumps(
+                        {"error": "this run has no database"}))
+                if not isinstance(pairs, list):
+                    return self._send(400, json.dumps({"error": "bad keys"}))
+                clean = [(str(p[0]), str(p[1])) for p in pairs
+                         if isinstance(p, list) and len(p) == 2]
+                got = store.db.find(name, clean)
+                if got is None:
+                    return self._send(404, json.dumps(
+                        {"error": "no table called %r here" % name}))
+                return self._send(200, json.dumps(got))
+            if path == "/api/llm":
+                # The panel asks this before offering a box to type in: a
+                # model that is not there is worth saying once, clearly,
+                # rather than as a failed request per question.
+                cfg = getattr(store, "llm", None) or {}
+                models = llm_models(cfg.get("url") or ASK_URL)
+                return self._send(200, json.dumps(
+                    {"url": cfg.get("url") or ASK_URL,
+                     "model": cfg.get("model") or (models[0] if models else ""),
+                     "models": models,
+                     "db": bool(store.db),
+                     "skills": _skills(store)}))
+            if path == "/api/states":
+                return self._send(200, json.dumps(
+                    [{"key": k, "label": l, "colour": c}
+                     for k, l, c in MARK_STATES]))
+            return self._send(404, json.dumps({"error": "no such path"}))
+
+        def do_POST(self):
+            path = self.path.split("?")[0]
+            body = self._body()
+            if path == "/api/ask":
+                cfg = getattr(store, "llm", None) or {}
+                if not store.db:
+                    return self._send(404, json.dumps(
+                        {"error": "this run has no database to query"}))
+                body = body or {}
+                try:
+                    # A skill named here replaces the question with its
+                    # playbook. The analyst still sees what they typed - the
+                    # page keeps that - but what the model receives is the
+                    # method, which is the whole point of pressing a button
+                    # instead of phrasing a question.
+                    asked = str(body.get("question") or "")
+                    skill = str(body.get("skill") or "").strip()
+                    question = asked
+                    if skill:
+                        question = _playbook(store, skill, body.get("args"),
+                                             asked)
+                    out = ask(store.db.path, question,
+                              cfg.get("url") or ASK_URL,
+                              body.get("model") or cfg.get("model"),
+                              history=body.get("history"),
+                              remember=(asked or skill) if skill else None)
+                except CaseError as e:
+                    return self._send(200, json.dumps({"error": str(e)}))
+                except Exception as e:
+                    return self._send(200, json.dumps(
+                        {"error": "%s: %s" % (type(e).__name__, e)}))
+                return self._send(200, json.dumps(out))
+            if path == "/api/mark":
+                key = str(body.get("key") or "")
+                if not key:
+                    return self._send(400, json.dumps({"error": "no key"}))
+                entry = store.set_mark(
+                    key, str(body.get("state") or ""),
+                    str(body.get("note") or ""),
+                    [str(x) for x in (body.get("labels") or [])],
+                    body.get("where") or None)
+                return self._send(200, json.dumps({"ok": True, "entry": entry}))
+            if path == "/api/case":
+                for k, v in (body or {}).items():
+                    store.set_case(str(k), v)
+                return self._send(200, json.dumps({"ok": True}))
+            return self._send(404, json.dumps({"error": "no such path"}))
+
+    return Handler
+
+
+def _claim(sock, host, port):
+    """Try to take a port, refusing to take one somebody else is serving.
+
+    SO_REUSEADDR is the reflex here and it is wrong on Windows: it lets a bind
+    to 127.0.0.1:8000 succeed over a process already listening on
+    0.0.0.0:8000, and quietly takes that address away from it. That is how
+    this tool ended up answering on a port Splunk was serving - both were
+    listening, and localhost went to whichever bound last.
+
+    SO_EXCLUSIVEADDRUSE is the Windows way to say "only if it is really free".
+    Elsewhere the default behaviour already refuses, so nothing is set: a
+    forensic tool must not be able to shadow a service by starting up.
+    """
+    opt = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if opt is not None:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, 1)
+        except OSError:
+            pass
+    sock.bind((host, port))
+
+
+def _free_port(host, port):
+    """The requested port, or the next one genuinely free after it."""
+    for candidate in range(port, port + 40):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                _claim(s, host, candidate)
+                return candidate
+            except OSError:
+                continue
+    raise SystemExit("[!] serve: no free port in %d-%d" % (port, port + 39))
+
+
+def parse_bind(text):
+    """'8000', ':8000', '127.0.0.1:8000' -> (host, port)."""
+    host, port = "127.0.0.1", 8000
+    text = (text or "").strip()
+    if text:
+        if ":" in text:
+            h, _, p = text.rpartition(":")
+            host = h or host
+            port = int(p) if p.isdigit() else port
+        elif text.isdigit():
+            port = int(text)
+        else:
+            host = text
+    return host, port
+
+
+def serve(page, case_path, bind="127.0.0.1:8000", open_browser=True,
+          tables=None, meta=None, db_path=None, llm=None):
+    """Run the investigation server until interrupted."""
+    host, port = parse_bind(bind)
+    db = None
+    if db_path:
+        db = CaseDB(db_path)
+        if tables:
+            db.build(tables, meta)
+    store = CaseStore(case_path, db)
+    # Where the Ask panel looks for a model. Held on the store because
+    # the request handler has one of those and nothing else.
+    store.llm = llm or {"url": ASK_URL, "model": ""}
+    asked = port
+    port = _free_port(host, port)
+    class _Server(ThreadingHTTPServer):
+        # HTTPServer sets this to 1, which on Windows is the same hijack the
+        # probe above refuses. The probe having proved the port free, there is
+        # nothing left for it to buy.
+        allow_reuse_address = False
+
+    httpd = _Server((host, port), _handler(page, store))
+    url = "http://%s:%d/" % (host, port)
+
+    if port != asked:
+        status("[*] port %d was in use - taking %d instead" % (asked, port))
+    status("[+] investigation server on %s" % url)
+    status("    case file: %s (%d mark(s) loaded)"
+           % (store.path, len(store.data.get("marks") or {})))
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        status("[!] bound to %s - this serves the parsed contents of the "
+               "evidence to anyone who can reach that address" % host)
+    status("    Ctrl-C to stop")
+    if open_browser:
+        threading.Thread(target=lambda: (time.sleep(0.4),
+                                         webbrowser.open(url)),
+                         daemon=True).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        status("\n[*] case saved to %s" % store.path)
+    finally:
+        httpd.server_close()
+        if db:
+            db.close()
+    return store
 
 # -------------------------------------------------------------------------
 # table writers: CSV, JSON, HTML browser
@@ -24962,8 +31693,16 @@ def _packed_rows(table, limit):
 PINNED_TABLES = ("HACKTOOL_HITS", "HACKTOOL_VARIANTS")
 
 
+def console_html(tables, html_cap=2000, meta=None, tri=None, opts=None,
+                 served=False, css=None, js=None):
+    """The console as a string, for --serve to hand out without a file."""
+    buf = io.StringIO()
+    _write_console(buf, tables, html_cap, meta, tri, opts, served, css, js)
+    return buf.getvalue()
+
+
 def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
-                      opts=None):
+                      opts=None, served=False):
     """The console: triage views and every artifact table in one page.
 
     Self-contained by design - no server, no CDN, no fetch. The box that reads
@@ -24973,28 +31712,34 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
     `tri` is optional: without it the page is the artifact browser alone, which
     is what a single-table export (--process-map p.html) should still produce.
     """
-    esc = htmllib.escape
-    index, tbls, packed = [], {}, {}
+    with open(path, "w", encoding="utf-8") as fh:
+        _write_console(fh, tables, html_cap, meta, tri, opts, served)
+
+
+def _write_console(fh, tables, html_cap, meta, tri, opts, served,
+                   css=None, js=None):
+    """Build the payload and emit the page - shared by the file and the server."""
+    esc, index, tbls, packed = htmllib.escape, [], {}, {}
     for t in tables:
         index.append({"name": t.name, "title": t.title,
                       "category": t.category or "Other", "rows": len(t)})
-        # 0 means every row: the page is meant to carry the whole export so
-        # that a search across all tables is a search across all the evidence
         limit = html_cap or None
-        rows, blob = _packed_rows(t, limit)
+        rows, blob = (None, "") if served else _packed_rows(t, limit)
         d = {"name": t.name, "title": t.title, "category": t.category,
              "description": t.description, "sources": t.sources,
              "columns": t.columns, "row_count": len(t),
              "rows_included": min(len(t), limit) if limit else len(t),
-             "cap": 500}         # rows rendered at once in the DOM
+             "cap": 500}
         if blob:
             packed[t.name] = blob
-        else:
+        elif rows is not None:
             d["rows"] = rows
+        # Served, the rows key is left off entirely rather than set to an
+        # empty list. The page treats "rows is undefined" as "not loaded yet"
+        # and asks the database; an empty list is a loaded table with nothing
+        # in it, so shipping one made all 47 tables look empty and nothing
+        # ever fetched.
         tbls[t.name] = d
-
-    # Which table each console view reads. A view whose table was not built -
-    # a single-table export - simply does not appear in the nav.
     views = {v: n for v, n in (("findings", "FINDINGS"),
                                ("timeline", "TIMELINE"))
              if n in tbls}
@@ -25002,25 +31747,38 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
                "version": VERSION, "index": index, "tables": tbls,
                "views": views,
                "pinned": [n for n in PINNED_TABLES if n in tbls],
-               # what the console reads a row's clock out of, in preference
-               # order. Shared with the NDJSON exporter rather than restated:
-               # two lists of time columns would disagree the first time one
-               # gained a column.
                "tcols": list(CONSOLE_TIME_COLUMNS),
-               "spancols": ["first_utc", "last_utc"]}
+               "spancols": ["first_utc", "last_utc"],
+               # Told to the page rather than sniffed by it: a console served
+               # by --serve keeps its marks in the case file over the API, and
+               # the same page opened from disk keeps them in localStorage.
+               "served": bool(served),
+               # A merged multi-collection export: which collections are in
+               # it, and the column every row carries saying which one. The
+               # page needs both told to it rather than sniffed - the rows
+               # are packed per table and decoded on demand, and scanning
+               # every one at boot to find out is the cost that design exists
+               # to avoid.
+               "hosts": list((meta or {}).get("hosts") or []),
+               "hostcol": (meta or {}).get("host_column") or ""}
     if tri is not None:
         payload.update(_triage_payload(tri, opts))
     elif meta:
         payload["meta"] = [[k, str(v)] for k, v in meta.items() if v]
-
-    host = (tri.meta.get("Hostname") if tri is not None else None) or            (meta or {}).get("Hostname") or "collection"
+    host = (tri.meta.get("Hostname") if tri is not None else None) or \
+           (meta or {}).get("Hostname") or "collection"
     src = tri.col.path if tri is not None else (meta or {}).get("Collection", "")
+    _emit_console(fh, esc, host, src, payload, packed, css, js)
 
-    with open(path, "w", encoding="utf-8") as fh:
+
+def _emit_console(fh, esc, host, src, payload, packed, css=None, js=None):
+    css = css or APP_CSS
+    js = js or APP_JS
+    if True:
         fh.write("<!doctype html><html><head><meta charset='utf-8'>"
                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                  "<title>linsight - %s</title><style>%s</style></head><body>"
-                 % (esc(str(host)), APP_CSS))
+                 % (esc(str(host)), css))
         fh.write("<header><div class='brand'><b>linsight</b>"
                  "<span>PARSE LINUX DEEP. HUNT THE MALICIOUS.</span></div>"
                  "<div class='host'><b>%s</b> &nbsp;<code>%s</code></div>"
@@ -25034,6 +31792,9 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
                  "YYYY-MM-DD HH:MM, -24h, -7d'>"
                  "<button class='clr' id='tclr' title='clear the time window'>"
                  "&times;</button></div>"
+                 "<button class='themebtn' id='theme' "
+                 "title='light / dark'>&#9681;</button>"
+                 "<div class='hf' id='hf'></div>"
                  "<div class='chips' id='chips'></div></header>"
                  "<div class='cal' id='cal'></div>"
                  % (esc(str(host)), esc(str(src))))
@@ -25047,7 +31808,7 @@ def write_tables_html(tables, path, html_cap=2000, meta=None, tri=None,
         for i, (name, blob) in enumerate(sorted(packed.items())):
             fh.write('%s%s:"%s"' % ("," if i else "", json.dumps(name), blob))
         fh.write("};</script>")
-        fh.write("<script>%s</script></body></html>" % APP_JS)
+        fh.write("<script>%s</script></body></html>" % js)
 
 
 def write_single_table(table, path, html_cap=100000):
@@ -25072,7 +31833,7 @@ def _check_output_paths(col, opts):
     It contaminates the collection, and the next run would then parse the
     previous run's own tables back in as artifacts.
     """
-    if col.kind != "dir":
+    if col is None or col.kind != "dir":
         return
     base = os.path.abspath(col.path)
     for path in (opts.export, opts.csv_dir, opts.tables_json, opts.tables_html,
@@ -25131,12 +31892,40 @@ def export_tables(tri, col, opts, tb=None):
              " (--scope %s: %s artifacts only)"
              % (scope, "live response" if scope == "live" else "on-disk")))
 
+    return _emit_outputs(tri, tables, meta, opts, tb)
+
+
+def write_merged_tables(tri, tables, meta, opts):
+    """The same writers, over a table set somebody else built.
+
+    A merged multi-host export has no TableBuilder behind it - the tables were
+    built once per collection and joined afterwards - so the half of
+    export_tables that decides what to write is shared and the half that
+    builds is not.
+    """
+    _check_output_paths(None, opts)
+    status("[*] writing the merged export: %d table(s), %s row(s)"
+           % (len(tables), "{:,}".format(meta.get("rows_total", 0))))
+    return _emit_outputs(tri, tables, meta, opts, None)
+
+
+def _emit_outputs(tri, tables, meta, opts, tb=None):
+    """Whichever formats were asked for, over the tables as they now stand."""
     outdir = opts.export
-    csv_dir = opts.csv_dir or (os.path.join(outdir, "csv") if outdir else None)
+    # Serving, the database is what the console reads and what an examiner
+    # queries; the CSV and NDJSON directories exist for tools outside this
+    # one. Writing all three means serialising every row three times - on a
+    # 3.4M-row collection that is minutes of the wait before the server comes
+    # up, spent on files nothing in the session will open. Asked for
+    # explicitly they are still written; derived from --export they are not.
+    serving = bool(getattr(opts, "serve", None))
+    csv_dir = opts.csv_dir or (None if serving else
+                               (os.path.join(outdir, "csv") if outdir else None))
     # --export writes one .json per table, mirroring the CSV directory.
     # --tables-json FILE still writes the single combined document, for a
     # consumer that wants one file to load.
-    json_dir = os.path.join(outdir, "json") if outdir else None
+    json_dir = None if serving else (os.path.join(outdir, "json")
+                                     if outdir else None)
     json_path = opts.tables_json
     html_path = opts.tables_html or (os.path.join(outdir, "browser.html") if outdir else None)
 
@@ -25159,6 +31948,44 @@ def export_tables(tri, col, opts, tb=None):
         write_tables_json(tables, json_path, meta)
         writer_times.append(("write JSON (combined)", time.perf_counter() - t0))
         print("[+] combined table JSON written to %s" % json_path, file=sys.stderr)
+    # A database without a server. --db asked for one; whether a server is
+    # also wanted is a separate question, and answering "no database" because
+    # --serve was absent is the sort of silent nothing this tool is supposed
+    # not to do.
+    if getattr(opts, "db", None) and not getattr(opts, "serve", None):
+        t0 = time.perf_counter()
+        CaseDB(opts.db).build(tables, tri.meta if tri is not None else meta)
+        writer_times.append(("write SQLite", time.perf_counter() - t0))
+    if getattr(opts, "serve", None):
+        # The server is the output. Building a page as well would write a
+        # second, immediately stale copy of the same console beside the live
+        # one, and leave the examiner unsure which of the two holds the marks.
+        case = (opts.case or (os.path.join(outdir, "case.json") if outdir
+                              else "case.json"))
+        def _page():
+            # Rebuilt per request so that a rebuilt linsight.py reaches an
+            # already-running server on a refresh. In served mode the payload
+            # carries no rows, so this is a few hundred kilobytes of string
+            # work rather than the whole export.
+            css, js = live_assets()
+            return console_html(tables, opts.html_rows, meta, tri, opts,
+                                served=True, css=css, js=js)
+        dbp = getattr(opts, "db", None)
+        if dbp is None:
+            dbp = os.path.join(outdir, "case.db") if outdir else "case.db"
+        # Print the breakdown before handing the process to the server:
+        # serve() blocks until Ctrl-C, so the report at the end of this
+        # function was unreachable and --timing silently did nothing with
+        # --serve - which is the one run where knowing the cost matters most,
+        # because it is the long one.
+        if getattr(opts, "timing", False):
+            print_timing(tb, writer_times)
+        serve(_page, case, opts.serve, tables=tables,
+              meta=(tri.meta if tri is not None else meta),
+              db_path=(dbp or None),
+              llm={"url": getattr(opts, "llm_url", None) or ASK_URL,
+                   "model": getattr(opts, "llm_model", None) or ""})
+        return writer_times
     if html_path:
         t0 = time.perf_counter()
         write_tables_html(tables, html_path, opts.html_rows, meta, tri, opts)
@@ -25491,7 +32318,7 @@ def write_html(tri, path, opts, tb=None):
 
     # What this document is not. It carries the findings - the conclusions,
     # ranked, to read top to bottom and hand to someone - and it deliberately
-    # does not carry the 88 artifact tables, which are a browsable grid rather
+    # does not carry the 94 artifact tables, which are a browsable grid rather
     # than a document and would run to hundreds of megabytes here. Saying so
     # is the point: a reader who does not find the process table in this file
     # must be told where it is, not left to conclude it was never built.
@@ -25526,6 +32353,1317 @@ def write_html(tri, path, opts, tb=None):
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("".join(parts))
     print("[+] HTML report written to %s" % path, file=sys.stderr)
+
+# -------------------------------------------------------------------------
+# cross-host correlation: several collections at once
+# -------------------------------------------------------------------------
+
+"""Cross-host correlation: what several collections say about each other.
+
+One run answers "what happened on this host". An intrusion is rarely about one
+host, and the questions that decide an investigation are the ones no single
+report can answer:
+
+  the same address    a source that brute-forced web01 and then authenticated
+                      successfully on db02 is lateral movement. Each host's
+                      report holds half of that and neither states it.
+  the same binary     one sha256 under /tmp on three machines is a deployed
+                      implant. Three reports each say "an executable in a
+                      world-writable directory", which is a much weaker claim.
+  the same order      an indicator that reaches host B four minutes after host
+                      A says which way the intrusion travelled. That fact only
+                      exists between the two reports.
+
+So this builds one view over several finished runs. It is deliberately not a
+fourth analyzer: it re-reads nothing and re-parses nothing, and every input is
+a projection each host's own run already produced - its indicators, its
+findings, its events, its file hashes. What it adds is the join.
+
+What it will not do is pretend the clocks agree. Every comparison here is
+between two hosts' normalised UTC, which is only as good as the offset each
+run resolved; a host whose zone nothing recorded was read as UTC, and an hour
+wrong there is an hour wrong in every ordering below. That is stated as a
+finding rather than assumed away, because "B, four minutes after A" is the
+kind of sentence a report should not be able to make silently.
+"""
+
+
+
+
+
+#: Where a shared hash stops being "both hosts run the same distribution" and
+#: starts being a file somebody put there. Two hosts built from one image share
+#: every byte of /usr/bin, so an unscoped hash join returns the operating
+#: system and buries the four files that matter.
+NOTABLE_DIRS = TMPFS_DIRS + ("/home/", "/root/", "/usr/local/", "/opt/",
+                             "/var/www/", "/srv/", "/var/spool/")
+
+#: Findings are grouped across hosts by title, and a title carries its own
+#: count - "3 executable file(s)" on one host and "7 executable file(s)" on
+#: the next are one check reported twice, not two different findings.
+_COUNT_RE = re.compile(r"\d[\d,]*")
+
+#: 'T1110 Brute Force / T1078 Valid Accounts' -> T1110, T1078. The same shape
+#: the console's matrix reads, so a technique means one thing in both.
+_TECH_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
+
+
+def _norm_title(title):
+    return _COUNT_RE.sub("#", title or "")
+
+
+def _label_for(path, taken):
+    """A short, stable name for one input, unique within the run.
+
+    The basename of what the analyst typed, because that is what they will
+    look for in the output directory - not the hostname, which is not known
+    until the collection has been read and cannot name a directory that has
+    to exist before the run starts. The hostname is recorded in HOSTS instead,
+    where a disagreement between the two is itself worth seeing.
+    """
+    base = os.path.basename(os.path.abspath(str(path).rstrip("/\\"))) or "host"
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst"):
+        if base.lower().endswith(ext):
+            base = base[: -len(ext)]
+            break
+    else:
+        base = os.path.splitext(base)[0] or base
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-") or "host"
+    name, n = base, 2
+    while name.lower() in taken:
+        name, n = "%s-%d" % (base, n), n + 1
+    taken.add(name.lower())
+    return name
+
+
+#: The column every merged row gains, and the name the console filters on.
+#:
+#: Not "host", which reads better and cannot be used: AUTH_LOG and JOURNAL
+#: already have a column of that name holding the hostname syslog wrote on the
+#: line, and merging into it silently replaced the label with that - three
+#: collections' auth logs all claiming to be one host, which is data rather
+#: than an error and would have been believed. "collection" is free across
+#: every one of the 361 column names the extractors declare, and it is the
+#: more accurate word anyway: what a row came from is a collection or an
+#: image, which is not always one host and is never the host's own idea of
+#: its name.
+HOST_COLUMN = "collection"
+
+
+def host_column(per_host):
+    """The merged column's name, guaranteed not to collide in this run.
+
+    HOST_COLUMN is free across every declared column, but not every column is
+    declared - a Velociraptor artifact result becomes a table whose columns
+    are whatever the artifact emitted. So the name is checked against the
+    tables actually in hand and stepped aside if something already owns it,
+    once for the whole set rather than per table: the console filters on one
+    name, and a name that varied per grid would be no filter at all.
+    """
+    used = set()
+    for _label, tables in per_host:
+        for t in tables:
+            used.update(t.columns)
+    name = HOST_COLUMN
+    while name in used:
+        name = "_" + name
+    return name
+
+
+def merge_tables(per_host):
+    """Several runs' table sets -> one set, each row carrying its host.
+
+    The alternative was a directory per collection, and it is the wrong shape
+    for the question people actually bring to three disks: not "show me web01"
+    but "show me every process on any of them, then let me narrow". Three
+    directories answer the first and make the second a manual join across
+    three exports. One table with a host column answers both - grep it, filter
+    the column in a spreadsheet, add `WHERE host = 'db02'` in SQL, or pick a
+    host in the console and watch every grid narrow at once.
+
+    Tables are merged by name and columns by name, not by position. Two hosts
+    do not necessarily produce the same columns for one table: drop_empty_
+    columns removes what a collection never filled, so a UAC tar and a disk
+    image both make FILE_INVENTORY and only one of them has crtime in it.
+    Merging on position would silently slide crtime into the time_source
+    column for half the rows, which is the kind of corruption that reads as
+    data. A column that only one host has is kept, and is simply empty for the
+    hosts that never had it.
+    """
+    column = host_column(per_host)
+    order, byname = [], {}
+    for label, tables in per_host:
+        for t in tables:
+            if t.name not in byname:
+                order.append(t.name)
+                byname[t.name] = []
+            byname[t.name].append((label, t))
+    out = []
+    for name in order:
+        parts = byname[name]
+        cols = [column]
+        for _label, t in parts:
+            for c in t.columns:
+                if c not in cols:
+                    cols.append(c)
+        first = parts[0][1]
+        merged = Table(
+            name, first.title, cols, first.category,
+            (first.description or "")
+            + ("  Merged from %d collections; `%s` says which one each row "
+               "came from, and no filter on it is all of them."
+               % (len(parts), column) if len(parts) > 1 else ""),
+            sorted(set(s for _l, t in parts for s in (t.sources or []))))
+        for label, t in parts:
+            at = [cols.index(c) for c in t.columns]
+            width = len(cols)
+            for row in t.iter_rows():
+                new = [""] * width
+                for i, value in zip(at, row):
+                    new[i] = value
+                new[0] = label      # after the row, never before: the label is
+                merged.add(*new)    # the one cell the source table cannot own
+        out.append(merged)
+    return out, column
+
+
+def merge_triage(cases, opts, tris):
+    """One Triage over several, for the outputs that render findings.
+
+    --html, --json and --timeline are documents about a host, and a merged run
+    still has to produce one of each rather than three files with no way to
+    say which is which. So the findings are pooled with the host written into
+    the artifact column - the one place a reader already looks to ask "where
+    did this come from" - and the events likewise. Titles are left alone: a
+    finding's title is the claim it makes, and prefixing three hundred of them
+    with a hostname would make every list in the report unreadable to save
+    looking one column across.
+    """
+    merged = Triage(_CorrelationSource(cases), opts)
+    merged.meta["Hostname"] = "%d collections" % len(cases)
+    merged.meta["Hosts"] = ", ".join(c.label for c in cases)
+    merged.meta["Collections"] = ", ".join(c.path for c in cases)
+    for case, tri in zip(cases, tris):
+        for f in tri.findings:
+            merged.findings.append(Finding(
+                f.severity, f.category, f.title, f.detail, f.evidence,
+                ("%s: %s" % (case.label, f.source)) if f.source else case.label,
+                f.mitre, f.first_seen, f.last_seen, f.count))
+        merged.events.extend(tri.events)
+    merged.findings.sort(key=lambda f: (SEV_RANK[f.severity], f.category,
+                                        f.title))
+    merged.events.sort(key=lambda e: e.ts)
+    return merged
+
+
+class HostCase(object):
+    """One finished run, reduced to what a cross-host view needs.
+
+    Taken as projections rather than as the run itself: three collections'
+    worth of artifact tables held at once is three times the memory of the
+    largest of them, for a join that touches five columns. The tables are
+    released with the run that built them; what survives is this.
+    """
+
+    def __init__(self, label, path, tri, tables=None):
+        self.label = label
+        self.path = str(path)
+        self.meta = dict(tri.meta)
+        self.hostname = (tri.meta.get("Hostname")
+                         or tri.meta.get("hostname") or "")
+        # The collection-time note explains at length where the anchor came
+        # from, which belongs in that run's own metadata rather than in a
+        # column three hosts wide. The instant is the part that joins.
+        self.collected = (tri.meta.get("Collection finished", "")
+                          or "").split(" (")[0].strip()
+        self.tz_offset = tri.meta.get("Host UTC offset", "")
+        self.distro = tri.meta.get("Distribution", "")
+        # Off the collection rather than out of meta: the layout is a fact
+        # about the container, and the run records it in the METADATA table
+        # instead of in tri.meta - which left this column empty for every host.
+        col = getattr(tri, "col", None)
+        self.layout = (getattr(col, "display_layout", "")
+                       or getattr(col, "layout", "")
+                       or getattr(col, "kind", "")
+                       or tri.meta.get("Collection layout", ""))
+        self.findings = [(f.severity, f.category, f.title, f.mitre or "",
+                          f.first_seen or "", f.last_seen or "", f.count or 0)
+                         for f in tri.findings]
+        self.events = [(_ts_text(e.ts), e.severity, e.category,
+                        e.description, e.source or "")
+                       for e in tri.events]
+        self.iocs = {}
+        for value, whys in tri.iocs.items():
+            span = tri.ioc_span.get(value) or ["", ""]
+            self.iocs[value] = {
+                "why": ", ".join(sorted(whys)),
+                "sources": ", ".join(sorted(tri.ioc_sources.get(value, ()))),
+                "count": tri.ioc_count.get(value, 0),
+                "first": span[0] or "",
+                "last": span[1] or "",
+            }
+        self.hashes = {}          # sha256 or md5 -> [paths]
+        self.addresses = set()    # every address this host answers on
+        self.names = set()        # every name this host answers to
+        self.sessions = []        # inbound logins, with where they came from
+        self.commands = []        # commands that name a host somewhere
+        self.accounts = {}        # username -> what /etc/passwd said about it
+        self.keys = {}            # authorized key -> [the files holding it]
+        self.persist = {}         # (kind, value) -> where it was found
+        self.techniques = {}      # ATT&CK id -> worst severity that carried it
+        self._take_identity(tables)
+        self._take_sessions(tables)
+        self._take_commands(tables)
+        self._take_hashes(tables)
+        self._take_accounts(tables)
+        self._take_keys(tables)
+        self._take_persistence(tables)
+        self._take_techniques()
+
+    def _take_hashes(self, tables):
+        """sha256 where the collection hashed anything, md5 where it did not.
+
+        Keyed on one digest per file rather than on both: a host that produced
+        only MD5 and a host that produced only SHA-256 have nothing to join on
+        anyway, and indexing both would report the same pair of files twice.
+        """
+        t = next((x for x in (tables or []) if x.name == "FILE_HASHES"), None)
+        if t is None:
+            return
+        cols = {c: i for i, c in enumerate(t.columns)}
+        ip, i256, imd5 = cols.get("path"), cols.get("sha256"), cols.get("md5")
+        if ip is None:
+            return
+        for row in t.iter_rows():
+            digest = ""
+            if i256 is not None and len(row) > i256:
+                digest = (row[i256] or "").strip().lower()
+            if not digest and imd5 is not None and len(row) > imd5:
+                digest = (row[imd5] or "").strip().lower()
+            path = (row[ip] or "").strip()
+            if digest and path:
+                self.hashes.setdefault(digest, []).append(path)
+
+    @staticmethod
+    def _cells(tables, name, wanted):
+        """Rows of one table as dicts of the columns asked for, or nothing.
+
+        By column name, never by position: an extractor that drops a column no
+        row filled shifts every index after it, and a projection built on
+        offsets would read the shell out of the home directory on exactly the
+        collections where a column happened to be empty.
+        """
+        t = next((x for x in (tables or []) if x.name == name), None)
+        if t is None:
+            return []
+        at = dict((c, i) for i, c in enumerate(t.columns))
+        if not all(c in at for c in wanted):
+            return []
+        out = []
+        for row in t.iter_rows():
+            out.append(dict((c, (row[at[c]] if at[c] < len(row) else "") or "")
+                            for c in wanted))
+        return out
+
+    def _take_identity(self, tables):
+        """Every address and name this collection answers to.
+
+        This is what turns two reports into one network. A login on db02 from
+        10.0.0.14 is a fact about db02 and nothing more - until you know that
+        10.0.0.14 is web01, which is sitting in the same case. The addresses
+        come off the interface list rather than out of the logs, because what
+        a host calls itself is the only reliable way to recognise it as the
+        far end of somebody else's connection.
+        """
+        if self.hostname:
+            self.names.add(self.hostname.lower())
+            self.names.add(self.hostname.split(".")[0].lower())
+        self.names.add(self.label.lower())
+        for r in self._cells(tables, "INTERFACES", ("name", "addresses")):
+            if r["name"] in ("lo", "lo0"):
+                continue
+            for addr in re.split(r"[,\s]+", r["addresses"]):
+                addr = addr.split("/")[0].strip()
+                if addr and not addr.startswith(("127.", "::1", "fe80:")):
+                    self.addresses.add(addr)
+        for r in self._cells(tables, "DEVICE_PROFILE", ("category", "value")):
+            if r["category"] == "hostname" and r["value"]:
+                self.names.add(r["value"].strip().lower())
+        self.names.discard("")
+        self.names.discard("localhost")
+
+    def _take_sessions(self, tables):
+        """Every login this host accepted, and the address it came from.
+
+        Both halves of the authentication record, because they answer
+        different halves of the question: AUTH_LOG carries the attempts with
+        their result, LOGINS carries the sessions that actually existed. A
+        successful login present in one and missing from the other is worth
+        seeing, and dropping either would hide it.
+        """
+        for r in self._cells(tables, "AUTH_LOG",
+                             ("timestamp_utc", "event", "user", "source_ip",
+                              "result", "process")):
+            if r["source_ip"]:
+                self.sessions.append({
+                    "when": r["timestamp_utc"], "user": r["user"],
+                    "from": r["source_ip"].strip(),
+                    "result": r["result"] or r["event"],
+                    "service": r["process"], "source": "AUTH_LOG"})
+        for r in self._cells(tables, "LOGINS",
+                             ("user", "service", "source_host", "start",
+                              "result")):
+            if r["source_host"]:
+                self.sessions.append({
+                    "when": r["start"], "user": r["user"],
+                    "from": r["source_host"].strip(),
+                    "result": r["result"] or "session",
+                    "service": r["service"], "source": "LOGINS"})
+
+    #: What a command looks like when it reaches another machine. Deliberately
+    #: narrow: `ssh`, `scp`, `rsync` and the rest name their target, and the
+    #: target is the whole point. A grep for a hostname anywhere in any command
+    #: would match a comment, a filename and a log path, and the resulting
+    #: table would be noise wearing the word "lateral".
+    REMOTE_CMD_RE = re.compile(
+        r"\b(ssh|scp|sftp|rsync|ansible|ansible-playbook|salt|pssh|"
+        r"clusterssh|mosh|telnet|ftp|curl|wget|nc|ncat|socat)\b", re.I)
+
+    def _take_commands(self, tables):
+        """Commands that invoke something capable of reaching another host."""
+        for name, cols, cmd_col, who_col in (
+                ("SHELL_HISTORY", ("user", "timestamp_utc", "command", "file"),
+                 "command", "user"),
+                ("CRON", ("run_as", "command", "file"), "command", "run_as"),
+                ("PROCESSES", ("user", "start_utc", "args"), "args", "user")):
+            for r in self._cells(tables, name, cols):
+                cmd = (r.get(cmd_col) or "").strip()
+                if not cmd or not self.REMOTE_CMD_RE.search(cmd):
+                    continue
+                self.commands.append({
+                    "who": r.get(who_col) or "", "cmd": cmd,
+                    "when": r.get("timestamp_utc") or r.get("start_utc") or "",
+                    "source": name, "where": r.get("file") or ""})
+
+    def _take_accounts(self, tables):
+        for r in self._cells(tables, "USERS",
+                             ("username", "uid", "home", "shell",
+                              "password_status", "privileged_groups",
+                              "authorized_keys")):
+            if r["username"]:
+                self.accounts[r["username"]] = r
+
+    def _take_keys(self, tables):
+        """The key material itself, not the line it sat on.
+
+        An authorized_keys line is 'ssh-rsa AAAAB3... user@box', and the
+        comment at the end is whatever the client that generated it felt like
+        writing - so two hosts trusting one key can disagree about its name.
+        The base64 body is the key; that is what is joined on.
+        """
+        for r in self._cells(tables, "SSH", ("type", "path", "detail")):
+            if r["type"] != "authorized_keys" or not r["detail"]:
+                continue
+            parts = r["detail"].split()
+            body = next((p for p in parts if len(p) > 40), "")
+            if body:
+                self.keys.setdefault(body, []).append(r["path"])
+
+    def _take_persistence(self, tables):
+        """What runs without anybody asking, across the three usual places."""
+        for r in self._cells(tables, "CRON", ("command", "run_as", "file")):
+            if r["command"]:
+                self.persist[("cron", r["command"].strip())] = \
+                    "%s (as %s)" % (r["file"], r["run_as"] or "?")
+        for r in self._cells(tables, "SYSTEMD_UNITS", ("unit", "exec_start")):
+            if r["exec_start"]:
+                self.persist[("systemd", r["exec_start"].strip())] = r["unit"]
+        for r in self._cells(tables, "LD_PRELOAD", ("path", "entry")):
+            if r["entry"]:
+                self.persist[("ld.so.preload", r["entry"].strip())] = r["path"]
+
+    def _take_techniques(self):
+        for sev, _cat, _title, mitre, _f, _l, _n in self.findings:
+            for tech in _TECH_RE.findall(mitre or ""):
+                have = self.techniques.get(tech)
+                if have is None or SEV_RANK[sev] < SEV_RANK[have]:
+                    self.techniques[tech] = sev
+
+    def counts(self):
+        n = defaultdict(int)
+        for sev, _c, _t, _m, _f, _l, _n in self.findings:
+            n[sev] += 1
+        return n
+
+
+class _CorrelationSource(object):
+    """Stands in for the collection a Triage is normally built over.
+
+    The correlation has findings, a timeline and metadata like any run, and
+    reusing Triage for those means reusing every renderer that reads one. What
+    it does not have is a collection - its evidence is three other runs - so
+    the one attribute those renderers ask for is answered here rather than by
+    inventing a directory that does not exist.
+    """
+
+    kind = "correlation"
+    layout = "correlation"
+
+    def __init__(self, cases):
+        self.path = " + ".join(c.path for c in cases)
+
+
+class Correlator(object):
+    """Several HostCases, and what is true of more than one of them."""
+
+    #: Evidence lines per finding. The table carries every row; a finding is
+    #: an argument, and an argument that runs to four hundred lines is a dump.
+    EVIDENCE = 30
+
+    #: Rows kept for hashes that sit where a package put them. Unbounded, this
+    #: is the operating system listed twice; the finding still counts them all.
+    PACKAGED_ROW_CAP = 2000
+
+    def __init__(self, cases, opts):
+        self.cases = list(cases)
+        self.opts = opts
+        self.tri = Triage(_CorrelationSource(self.cases), opts)
+        self.tables = []
+        self.tri.meta["Hostname"] = "correlation of %d hosts" % len(self.cases)
+        self.tri.meta["Hosts"] = ", ".join(c.label for c in self.cases)
+        self.tri.meta["Collections"] = ", ".join(c.path for c in self.cases)
+
+    # -- helpers ----------------------------------------------------------
+    def table(self, name, title, columns, category, description):
+        t = Table(name, title, columns, category, description)
+        self.tables.append(t)
+        return t
+
+    def add(self, *a, **kw):
+        self.tri.add(*a, **kw)
+
+    #: The cross-host tables, in the order the Correlation tab shows them:
+    #: the strongest claim first. A shared indicator or a shared key is
+    #: evidence of one intrusion; a shared technique is evidence of one
+    #: playbook, which is weaker and much more often innocent.
+    CROSS_TABLES = ("CROSS_SESSIONS", "CROSS_COMMANDS", "CROSS_IOCS",
+                    "CROSS_HASHES", "CROSS_KEYS", "CROSS_ACCOUNTS",
+                    "CROSS_PERSISTENCE", "CROSS_FINDINGS", "CROSS_TECHNIQUES",
+                    "HOSTS")
+
+    def run(self):
+        self.t_hosts()
+        self.check_clocks()
+        self.t_cross_sessions()
+        self.t_cross_commands()
+        self.t_cross_iocs()
+        self.t_cross_hashes()
+        self.t_cross_keys()
+        self.t_cross_accounts()
+        self.t_cross_persistence()
+        self.t_cross_findings()
+        self.t_cross_techniques()
+        self.tri.findings.sort(key=lambda f: (SEV_RANK[f.severity], f.category,
+                                              f.title))
+        self.t_findings()
+        self.t_timeline()
+        return self.tables
+
+    # -- 1. the hosts themselves -------------------------------------------
+    def t_hosts(self):
+        t = self.table("HOSTS", "The collections in this correlation",
+                       [HOST_COLUMN, "input", "hostname", "distribution", "layout",
+                        "collected_utc", "host_utc_offset", "findings",
+                        "critical", "high", "medium", "low", "info",
+                        "indicators", "events", "hashed_files"],
+                       "Correlation",
+                       "One row per input. `collection` is the label every "
+                       "other table joins on - the same column a merged export "
+                       "carries and the console filters by; `hostname` is what "
+                       "the collection itself says it was, which is not always "
+                       "the same thing and is worth reading when it is not.")
+        for c in self.cases:
+            n = c.counts()
+            t.add(c.label, c.path, c.hostname, c.distro, c.layout,
+                  c.collected, c.tz_offset, len(c.findings),
+                  n["CRITICAL"], n["HIGH"], n["MEDIUM"], n["LOW"], n["INFO"],
+                  len(c.iocs), len(c.events), len(c.hashes))
+        self.add("INFO", "Correlation",
+                 "%d collection(s) correlated" % len(self.cases),
+                 "Every cross-host statement below is a join over these, and "
+                 "over nothing else. A host that was not passed to this run "
+                 "is not absent from the intrusion - it is absent from the "
+                 "question.",
+                 evidence=["%-16s %-20s %-24s %s"
+                           % (c.label, c.hostname or "(hostname not recorded)",
+                              c.distro or "-", c.path) for c in self.cases],
+                 source="the inputs", count=len(self.cases))
+
+    # -- 2. can these clocks be compared at all? ---------------------------
+    def check_clocks(self):
+        """Say what every ordering below rests on, before making one.
+
+        Cross-host ordering is arithmetic on normalised UTC, and the
+        normalisation is only as good as the offset each run resolved. A host
+        whose zone nothing recorded was read as UTC; if it was not on UTC,
+        every "four minutes after" in this report is wrong by that offset and
+        wrong in one direction. That is not a caveat to bury in a footnote -
+        it decides whether the sequence means anything.
+        """
+        unknown = [c for c in self.cases if not c.tz_offset
+                   or "unknown" in c.tz_offset.lower()]
+        rows = ["%-16s %-34s %s" % (c.label, c.tz_offset or "not recorded",
+                                    c.collected or "collection time not recorded")
+                for c in self.cases]
+        if unknown:
+            self.add("MEDIUM", "Correlation",
+                     "%d host(s) did not record the offset their clock ran at"
+                     % len(unknown),
+                     "Their local log timestamps were read as UTC. If those "
+                     "hosts were not on UTC, every ordering in this "
+                     "correlation involving them is wrong by that offset - "
+                     "which is exactly the error that makes a sequence of "
+                     "events look like a different sequence rather than like "
+                     "nonsense.",
+                     evidence=rows, source="the inputs", count=len(unknown))
+        else:
+            self.add("INFO", "Correlation",
+                     "Every host recorded the offset its clock ran at",
+                     "Cross-host ordering below is arithmetic over these.",
+                     evidence=rows, source="the inputs", count=len(self.cases))
+
+    # -- 2b. one of these machines signing in to another -------------------
+    def _who_is(self, value):
+        """Which collection answers to this address or name, if any."""
+        v = (value or "").strip().lower()
+        if not v:
+            return None
+        for c in self.cases:
+            if v in c.addresses or v in c.names or v.split(".")[0] in c.names:
+                return c.label
+        return None
+
+    def t_cross_sessions(self):
+        """Logins into one collection from another collection in this case.
+
+        This is the table the whole exercise is for. Every other cross-host
+        row says two machines have something in common; this one says one of
+        them logged into the other, names the account it used and says whether
+        it worked. A shared indicator is a lead. A session from web01 to db02
+        at 03:14 as root is the intrusion moving, written down.
+
+        It is only possible because both ends are in the case: the address in
+        db02's auth log is just an address until web01's interface list says
+        that address is web01.
+        """
+        t = self.table("CROSS_SESSIONS",
+                       "Sign-ins from one of these machines to another",
+                       ["timestamp_utc", "from_collection", "to_collection",
+                        "user", "result", "service", "source_address",
+                        "evidence"],
+                       "Correlation",
+                       "A login recorded on one collection whose source "
+                       "address belongs to another collection in this case - "
+                       "resolved against the interface list each host "
+                       "reported, not guessed from a name. `result` is the "
+                       "difference between an attempt and a foothold.")
+        rows, pairs = [], defaultdict(lambda: {"ok": 0, "fail": 0, "users": set(),
+                                               "first": "", "last": ""})
+        for c in self.cases:
+            for sess in c.sessions:
+                origin = self._who_is(sess["from"])
+                if not origin or origin == c.label:
+                    continue
+                ok = "fail" not in (sess["result"] or "").lower()
+                rows.append((sess["when"], origin, c.label, sess["user"],
+                             sess["result"], sess["service"], sess["from"],
+                             sess["source"]))
+                p = pairs[(origin, c.label)]
+                p["ok" if ok else "fail"] += 1
+                if sess["user"]:
+                    p["users"].add(sess["user"])
+                if sess["when"]:
+                    if not p["first"] or sess["when"] < p["first"]:
+                        p["first"] = sess["when"]
+                    if not p["last"] or sess["when"] > p["last"]:
+                        p["last"] = sess["when"]
+        rows.sort()
+        for r in rows:
+            t.add(*r)
+        if not pairs:
+            return
+        good = [(a, b, p) for (a, b), p in pairs.items() if p["ok"]]
+        if good:
+            self.add("CRITICAL", "Correlation",
+                     "%d machine-to-machine sign-in path(s) succeeded between "
+                     "these collections" % len(good),
+                     "One host in this case authenticated to another. That is "
+                     "lateral movement stated rather than inferred - the "
+                     "source address is an address the destination logged and "
+                     "the origin reported as its own. Follow the account: if "
+                     "it is a service account or root, the same credential "
+                     "probably reaches further than these two.",
+                     evidence=["%s -> %-14s %d ok / %d failed as %s   %s .. %s"
+                               % (a, b, p["ok"], p["fail"],
+                                  ", ".join(sorted(p["users"])) or "(no user)",
+                                  p["first"] or "?", p["last"] or "?")
+                               for a, b, p in good[: self.EVIDENCE]],
+                     source="CROSS_SESSIONS", count=len(good),
+                     times=[p["first"] for _a, _b, p in good if p["first"]],
+                     mitre="T1021.004 Remote Services: SSH / T1078 Valid Accounts")
+        bad = [(a, b, p) for (a, b), p in pairs.items() if p["fail"] and not p["ok"]]
+        if bad:
+            self.add("HIGH", "Correlation",
+                     "%d machine-to-machine sign-in(s) were attempted and "
+                     "failed" % len(bad),
+                     "One of these hosts tried to authenticate to another and "
+                     "did not get in. A host that is scanning or guessing at "
+                     "its neighbours is already compromised; the failure says "
+                     "where it did not reach, not that nothing happened.",
+                     evidence=["%s -> %-14s %d failed as %s"
+                               % (a, b, p["fail"],
+                                  ", ".join(sorted(p["users"])) or "(no user)")
+                               for a, b, p in bad[: self.EVIDENCE]],
+                     source="CROSS_SESSIONS", count=len(bad),
+                     mitre="T1021 Remote Services / T1110 Brute Force")
+
+    # -- 2c. one of these machines being told to run something on another ---
+    def t_cross_commands(self):
+        """Commands on one collection that name another collection.
+
+        The other half of movement, and the half that survives when the
+        destination's logs do not: `ssh root@10.0.0.14` in web01's shell
+        history is evidence about db02 even if db02's auth log was rotated
+        away. Scoped to commands that can actually reach a host - ssh, scp,
+        rsync, ansible and the rest - because a hostname can appear in any
+        string on the box, and a table of every mention would be noise
+        wearing the word 'lateral'.
+        """
+        t = self.table("CROSS_COMMANDS",
+                       "Commands on one machine naming another",
+                       ["timestamp_utc", "from_collection", "to_collection",
+                        "user", "matched", "command", "source", "where"],
+                       "Correlation",
+                       "A command recorded on one collection that names "
+                       "another collection in this case, by address or by "
+                       "name, and that invokes something able to reach it. "
+                       "Read with CROSS_SESSIONS: the command is the "
+                       "intention and the session is what happened.")
+        rows, pairs = [], defaultdict(lambda: {"n": 0, "users": set(), "eg": ""})
+        for c in self.cases:
+            for cmd in c.commands:
+                text = cmd["cmd"].lower()
+                for other in self.cases:
+                    if other.label == c.label:
+                        continue
+                    hit = next((tok for tok in
+                                sorted(other.addresses | other.names, key=len,
+                                       reverse=True)
+                                if len(tok) > 3 and tok in text), "")
+                    if not hit:
+                        continue
+                    rows.append((cmd["when"], c.label, other.label, cmd["who"],
+                                 hit, trunc(cmd["cmd"], 200), cmd["source"],
+                                 cmd["where"]))
+                    p = pairs[(c.label, other.label)]
+                    p["n"] += 1
+                    if cmd["who"]:
+                        p["users"].add(cmd["who"])
+                    if not p["eg"]:
+                        p["eg"] = trunc(cmd["cmd"], 90)
+                    break
+        rows.sort()
+        for r in rows:
+            t.add(*r)
+        if pairs:
+            self.add("HIGH", "Correlation",
+                     "%d path(s) where one machine was told to reach another"
+                     % len(pairs),
+                     "A command on one of these hosts names another of them "
+                     "and is capable of reaching it. Where CROSS_SESSIONS "
+                     "shows the same pair, the two corroborate each other; "
+                     "where it does not, either the destination did not log "
+                     "the connection or it never happened - and which of "
+                     "those it is, is worth ten minutes.",
+                     evidence=["%s -> %-14s %d command(s) as %s\n      %s"
+                               % (a, b, p["n"],
+                                  ", ".join(sorted(p["users"])) or "?", p["eg"])
+                               for (a, b), p in list(pairs.items())[: self.EVIDENCE]],
+                     source="CROSS_COMMANDS", count=len(pairs),
+                     mitre="T1021 Remote Services / T1570 Lateral Tool Transfer")
+
+    # -- 3. the same indicator on more than one host -----------------------
+    def t_cross_iocs(self):
+        t = self.table("CROSS_IOCS", "Indicators seen on more than one host",
+                       ["indicator", "type", "host_count", "hosts", "why",
+                        "first_host", "first_utc", "last_host", "last_utc",
+                        "spread", "total_mentions", "per_host"],
+                       "Correlation",
+                       "An indicator each host's own run extracted, joined on "
+                       "the value. `first_host` is where it was seen "
+                       "earliest and `spread` how long it took to reach the "
+                       "last - the direction an intrusion travelled, which no "
+                       "single host's report can state.")
+        shared = defaultdict(dict)
+        for c in self.cases:
+            for value, info in c.iocs.items():
+                shared[value][c.label] = info
+        rows = []
+        for value, by_host in shared.items():
+            if len(by_host) < 2:
+                continue
+            seen = sorted(((info["first"], host) for host, info in by_host.items()
+                           if info["first"]))
+            first_host, first_utc = (seen[0][1], seen[0][0]) if seen else ("", "")
+            last = sorted(((info["last"], host) for host, info in by_host.items()
+                           if info["last"]))
+            last_host, last_utc = (last[-1][1], last[-1][0]) if last else ("", "")
+            whys = sorted(set(w for info in by_host.values()
+                              for w in info["why"].split(", ") if w))
+            rows.append((len(by_host), value, {
+                "type": ioc_type(value),
+                "hosts": ", ".join(sorted(by_host)),
+                "why": ", ".join(whys),
+                "first_host": first_host, "first_utc": first_utc,
+                "last_host": last_host, "last_utc": last_utc,
+                "spread": _gap(first_utc, last_utc),
+                "total": sum(info["count"] for info in by_host.values()),
+                "per_host": " | ".join(
+                    "%s x%d%s" % (host, info["count"],
+                                  " @ %s" % info["first"] if info["first"] else "")
+                    for host, info in sorted(by_host.items())),
+            }))
+        rows.sort(key=lambda r: (-r[0], -r[2]["total"], r[1]))
+        for n, value, d in rows:
+            t.add(value, d["type"], n, d["hosts"], d["why"], d["first_host"],
+                  d["first_utc"], d["last_host"], d["last_utc"], d["spread"],
+                  d["total"], d["per_host"])
+        if not rows:
+            return
+
+        every = [r for r in rows if r[0] == len(self.cases)] \
+            if len(self.cases) > 2 else []
+        ordered = [r for r in rows if r[2]["spread"]]
+        self.add("HIGH", "Correlation",
+                 "%d indicator(s) appear on more than one host" % len(rows),
+                 "An address, hash or path that each host's run extracted "
+                 "independently, joined on the value. One indicator on two "
+                 "hosts is the shortest evidence there is that the two "
+                 "incidents are one incident.",
+                 evidence=["%-42s %-12s %d host(s): %s%s"
+                           % (trunc(value, 42), d["type"], n, d["hosts"],
+                              "  [%s -> %s, %s]"
+                              % (d["first_host"], d["last_host"], d["spread"])
+                              if d["spread"] else "")
+                           for n, value, d in rows[: self.EVIDENCE]],
+                 source="CROSS_IOCS", count=len(rows),
+                 mitre="T1021 Remote Services",
+                 times=[r[2]["first_utc"] for r in rows if r[2]["first_utc"]])
+        if every:
+            self.add("HIGH", "Correlation",
+                     "%d indicator(s) appear on every host in this correlation"
+                     % len(every),
+                     "Present everywhere that was looked at, which is either "
+                     "the intrusion's common infrastructure or something this "
+                     "estate has in common for an innocent reason - a "
+                     "monitoring agent, a shared jump host, an internal "
+                     "resolver. Both are worth knowing and they are told "
+                     "apart by what the indicator is, not by how many hosts "
+                     "carry it.",
+                     evidence=["%-42s %-12s %s" % (trunc(v, 42), d["type"], d["why"])
+                               for _n, v, d in every[: self.EVIDENCE]],
+                     source="CROSS_IOCS", count=len(every),
+                     times=[d["first_utc"] for _n, _v, d in every if d["first_utc"]])
+        if ordered:
+            ordered.sort(key=lambda r: r[2]["first_utc"])
+            self.add("MEDIUM", "Correlation",
+                     "%d indicator(s) reached one host before another"
+                     % len(ordered),
+                     "The order is the direction. Read it against the clock "
+                     "finding above: this is arithmetic on each host's "
+                     "normalised UTC, so it is exactly as trustworthy as the "
+                     "offsets those runs resolved.",
+                     evidence=["%-38s %s %s  ->  %s %s  (%s)"
+                               % (trunc(v, 38), d["first_host"], d["first_utc"],
+                                  d["last_host"], d["last_utc"], d["spread"])
+                               for _n, v, d in ordered[: self.EVIDENCE]],
+                     source="CROSS_IOCS", count=len(ordered),
+                     mitre="T1021 Remote Services",
+                     times=[d["first_utc"] for _n, _v, d in ordered])
+
+    # -- 4. the same conclusion on more than one host ----------------------
+    def t_cross_findings(self):
+        t = self.table("CROSS_FINDINGS", "Findings raised on more than one host",
+                       ["severity", "category", "finding", "technique",
+                        "host_count", "hosts", "first_utc", "last_utc",
+                        "total_occurrences", "per_host"],
+                       "Correlation",
+                       "The same check firing on several hosts, grouped by "
+                       "title with its counts masked - '3 executable file(s)' "
+                       "and '7 executable file(s)' are one finding reported "
+                       "twice. Severity is the worst any host gave it.")
+        groups = defaultdict(dict)
+        for c in self.cases:
+            for sev, cat, title, mitre, first, last, n in c.findings:
+                key = (cat, _norm_title(title))
+                cur = groups[key].get(c.label)
+                if cur is None or SEV_RANK[sev] < SEV_RANK[cur[0]]:
+                    groups[key][c.label] = (sev, mitre, first, last, n, title)
+        rows = []
+        for (cat, norm), by_host in groups.items():
+            if len(by_host) < 2:
+                continue
+            sev = min((v[0] for v in by_host.values()), key=lambda s: SEV_RANK[s])
+            mitre = next((v[1] for v in by_host.values() if v[1]), "")
+            first, last = span_of([v[2] for v in by_host.values()]
+                                  + [v[3] for v in by_host.values()])
+            rows.append((SEV_RANK[sev], -len(by_host), cat, norm, sev, mitre,
+                         by_host, first, last))
+        rows.sort()
+        for _r, _n, cat, norm, sev, mitre, by_host, first, last in rows:
+            t.add(sev, cat, norm, mitre, len(by_host),
+                  ", ".join(sorted(by_host)), first, last,
+                  sum(v[4] for v in by_host.values()),
+                  " | ".join("%s: %s" % (h, v[5])
+                             for h, v in sorted(by_host.items())))
+        if not rows:
+            return
+        loud = [r for r in rows if r[4] in ("CRITICAL", "HIGH")]
+        worst = rows[0][4]
+        self.add(worst if loud else "INFO", "Correlation",
+                 "%d finding(s) were raised on more than one host" % len(rows),
+                 "The same conclusion reached independently on several hosts. "
+                 "Where that conclusion is CRITICAL or HIGH it is the shape "
+                 "of the intrusion repeating, and the hosts that share it are "
+                 "the ones to work first.",
+                 evidence=["[%-8s] %-52s %d hosts: %s"
+                           % (sev, trunc("%s / %s" % (cat, norm), 52),
+                              len(by_host), ", ".join(sorted(by_host)))
+                           for _r, _n, cat, norm, sev, _m, by_host, _f, _l
+                           in rows[: self.EVIDENCE]],
+                 source="CROSS_FINDINGS", count=len(rows),
+                 times=[r[7] for r in rows if r[7]])
+
+    # -- 5. the same bytes on more than one host ---------------------------
+    def t_cross_hashes(self):
+        t = self.table("CROSS_HASHES", "File hashes present on more than one host",
+                       ["digest", "host_count", "hosts", "notable",
+                        "same_path", "paths", "per_host"],
+                       "Correlation",
+                       "One file's digest found on several hosts. Two "
+                       "machines built from one image share every byte of "
+                       "/usr/bin, so `notable` marks the rows where at least "
+                       "one copy sits somewhere a package would not put it - "
+                       "and `same_path` says whether it was moved, because a "
+                       "shared binary at two different paths is a deployment "
+                       "rather than a distribution. Every notable row is here; "
+                       "the packaged ones are capped, because unbounded they "
+                       "are the operating system listed once per file.")
+        shared = defaultdict(dict)
+        for c in self.cases:
+            for digest, paths in c.hashes.items():
+                shared[digest][c.label] = sorted(set(paths))
+        rows = []
+        for digest, by_host in shared.items():
+            if len(by_host) < 2:
+                continue
+            allpaths = sorted(set(p for ps in by_host.values() for p in ps))
+            notable = any(p.startswith(NOTABLE_DIRS) for p in allpaths)
+            same = len(allpaths) == 1
+            rows.append((not notable, not same, -len(by_host), digest,
+                         by_host, allpaths, notable, same))
+        rows.sort()
+        # Every notable row, and a bounded sample of the rest. Two hosts built
+        # from one image share tens of thousands of files under /usr, all of
+        # them uninteresting and all of them in this table - which made
+        # CROSS_HASHES the largest thing in the export and the slowest panel
+        # in the console, for rows whose whole content is "these machines run
+        # the same distribution". The count on the finding stays exact.
+        kept = 0
+        for _a, _b, _c2, digest, by_host, allpaths, notable, same in rows:
+            if not notable:
+                kept += 1
+                if kept > self.PACKAGED_ROW_CAP:
+                    continue
+            t.add(digest, len(by_host), ", ".join(sorted(by_host)),
+                  "yes" if notable else "", "yes" if same else "no",
+                  " | ".join(allpaths[:8]),
+                  " | ".join("%s: %s" % (h, ", ".join(p[:4]))
+                             for h, p in sorted(by_host.items())))
+        if not rows:
+            return
+        notables = [r for r in rows if r[6]]
+        if notables:
+            self.add("HIGH", "Correlation",
+                     "%d file(s) with the same contents on more than one host, "
+                     "outside the packaged tree" % len(notables),
+                     "Identical bytes under /tmp, /home, /opt, /usr/local or "
+                     "a web root on several machines is one file that was put "
+                     "on all of them. A distribution does not deliver files "
+                     "there; a deployment does.",
+                     evidence=["%s  %d hosts: %s\n      %s"
+                               % (r[3][:32], len(r[4]), ", ".join(sorted(r[4])),
+                                  " | ".join(r[5][:4]))
+                               for r in notables[: self.EVIDENCE]],
+                     source="CROSS_HASHES", count=len(notables),
+                     mitre="T1105 Ingress Tool Transfer")
+        rest = len(rows) - len(notables)
+        if rest:
+            self.add("INFO", "Correlation",
+                     "%d further file(s) are byte-identical across hosts" % rest,
+                     "Every one of them sits where a package puts files, "
+                     "which on machines built from one image is what being "
+                     "built from one image looks like. Listed in CROSS_HASHES "
+                     "rather than here.",
+                     source="CROSS_HASHES", count=rest)
+
+    # -- 5b. the same key trusted by more than one host --------------------
+    def t_cross_keys(self):
+        t = self.table("CROSS_KEYS", "SSH keys trusted by more than one host",
+                       ["key_type", "fingerprint_head", "host_count", "hosts",
+                        "comment", "paths"],
+                       "Correlation",
+                       "One public key found in authorized_keys on several "
+                       "hosts, joined on the key material rather than on the "
+                       "comment after it - the comment is whatever the client "
+                       "that generated the key felt like writing, and two "
+                       "hosts trusting one key often disagree about its name. "
+                       "Shared keys are ordinary in a managed estate and are "
+                       "how one stolen private key becomes every host in it.")
+        shared = defaultdict(dict)
+        for c in self.cases:
+            for body, paths in c.keys.items():
+                shared[body][c.label] = sorted(set(paths))
+        rows = [(len(by), body, by) for body, by in shared.items() if len(by) > 1]
+        rows.sort(key=lambda r: -r[0])
+        for n, body, by in rows:
+            t.add(_key_type(body), body[:24] + "...", n, ", ".join(sorted(by)),
+                  "", " | ".join("%s: %s" % (h, ", ".join(p))
+                                 for h, p in sorted(by.items())))
+        if rows:
+            self.add("HIGH" if any(r[0] == len(self.cases) for r in rows)
+                     else "MEDIUM", "Correlation",
+                     "%d SSH key(s) are trusted by more than one host" % len(rows),
+                     "Whoever holds the private half can reach every host "
+                     "listed against it, with no password and usually with no "
+                     "log entry that looks unusual. Check each against the "
+                     "keys your estate is supposed to have - a shared "
+                     "management key is expected, and an attacker's key added "
+                     "to three hosts looks exactly the same from here.",
+                     evidence=["%-12s %s...  %d host(s): %s"
+                               % (_key_type(b), b[:28], n, ", ".join(sorted(by)))
+                               for n, b, by in rows[: self.EVIDENCE]],
+                     source="CROSS_KEYS", count=len(rows),
+                     mitre="T1098.004 SSH Authorized Keys")
+
+    # -- 5c. the same account on more than one host ------------------------
+    def t_cross_accounts(self):
+        t = self.table("CROSS_ACCOUNTS", "Accounts present on more than one host",
+                       ["username", "uid", "host_count", "hosts", "consistent",
+                        "shells", "homes", "password_status", "privileged_on"],
+                       "Correlation",
+                       "One username on several hosts. `consistent` is whether "
+                       "uid, shell and home agree everywhere - a name that "
+                       "means one thing on web01 and something else on db02 is "
+                       "either a naming collision or an account somebody added "
+                       "by hand to look like the others. System accounts the "
+                       "distribution creates are excluded: every Linux host "
+                       "has daemon and www-data, and saying so is noise.")
+        shared = defaultdict(dict)
+        for c in self.cases:
+            for name, info in c.accounts.items():
+                shared[name][c.label] = info
+        rows = []
+        for name, by_host in shared.items():
+            if len(by_host) < 2 or not _interesting_account(name, by_host):
+                continue
+            uids = sorted(set(i["uid"] for i in by_host.values()))
+            shells = sorted(set(i["shell"] for i in by_host.values() if i["shell"]))
+            homes = sorted(set(i["home"] for i in by_host.values() if i["home"]))
+            priv = sorted(h for h, i in by_host.items() if i["privileged_groups"])
+            rows.append((-len(by_host), name, uids, shells, homes, by_host, priv))
+        rows.sort()
+        for _n, name, uids, shells, homes, by_host, priv in rows:
+            consistent = len(uids) == 1 and len(shells) <= 1 and len(homes) <= 1
+            t.add(name, ", ".join(uids), len(by_host),
+                  ", ".join(sorted(by_host)), "yes" if consistent else "no",
+                  ", ".join(shells), ", ".join(homes),
+                  ", ".join(sorted(set(i["password_status"]
+                                       for i in by_host.values() if i["password_status"]))),
+                  ", ".join(priv))
+        odd = [r for r in rows
+               if len(r[2]) > 1 or len(r[3]) > 1 or len(r[4]) > 1]
+        if odd:
+            self.add("MEDIUM", "Correlation",
+                     "%d account(s) are defined differently on the hosts that "
+                     "share them" % len(odd),
+                     "One username, two definitions. A managed estate creates "
+                     "an account the same way everywhere; a name that carries "
+                     "a different uid, shell or home on one host was added "
+                     "there separately, which is what an intruder's account "
+                     "made to blend in looks like.",
+                     evidence=["%-18s uid %-14s %s"
+                               % (r[1], "/".join(r[2]), ", ".join(sorted(r[5])))
+                               for r in odd[: self.EVIDENCE]],
+                     source="CROSS_ACCOUNTS", count=len(odd),
+                     mitre="T1136 Create Account")
+        elif rows:
+            self.add("INFO", "Correlation",
+                     "%d non-system account(s) exist on more than one host"
+                     % len(rows),
+                     "Consistently defined on every host that has them, which "
+                     "is what central account management looks like.",
+                     evidence=["%-18s uid %-8s %s"
+                               % (r[1], "/".join(r[2]), ", ".join(sorted(r[5])))
+                               for r in rows[: self.EVIDENCE]],
+                     source="CROSS_ACCOUNTS", count=len(rows))
+
+    # -- 5d. the same thing set to run on more than one host ---------------
+    def t_cross_persistence(self):
+        t = self.table("CROSS_PERSISTENCE",
+                       "Autostart entries on more than one host",
+                       ["kind", "value", "host_count", "hosts", "where"],
+                       "Correlation",
+                       "A cron command, a systemd ExecStart or an "
+                       "ld.so.preload entry that appears on several hosts. "
+                       "Configuration management puts the same entries "
+                       "everywhere and so does an intruder who scripted the "
+                       "install; what tells them apart is what the command "
+                       "does, which is why the command itself is the column.")
+        shared = defaultdict(dict)
+        for c in self.cases:
+            for (kind, value), where in c.persist.items():
+                shared[(kind, value)][c.label] = where
+        rows = [(-len(by), kind, value, by)
+                for (kind, value), by in shared.items() if len(by) > 1]
+        rows.sort()
+        for _n, kind, value, by in rows:
+            t.add(kind, value, len(by), ", ".join(sorted(by)),
+                  " | ".join("%s: %s" % (h, w) for h, w in sorted(by.items())))
+        if rows:
+            preload = [r for r in rows if r[1] == "ld.so.preload"]
+            self.add("HIGH" if preload else "INFO", "Correlation",
+                     "%d autostart entry(ies) appear on more than one host"
+                     % len(rows),
+                     "The same thing set to run on several machines. An "
+                     "ld.so.preload entry shared across hosts is a userland "
+                     "rootkit deployed to all of them and is why this is HIGH "
+                     "when one is present; a shared cron line is as likely to "
+                     "be the configuration management that built the estate."
+                     if preload else
+                     "The same thing set to run on several machines - which "
+                     "on a managed estate is what management looks like. Read "
+                     "the commands rather than the count.",
+                     evidence=["%-14s %-3d host(s)  %s"
+                               % (r[1], -r[0], trunc(r[2], 84))
+                               for r in rows[: self.EVIDENCE]],
+                     source="CROSS_PERSISTENCE", count=len(rows),
+                     mitre="T1053 Scheduled Task/Job / T1574.006 LD_PRELOAD")
+
+    # -- 5e. the shape of the intrusion, per host --------------------------
+    def t_cross_techniques(self):
+        t = self.table("CROSS_TECHNIQUES", "ATT&CK techniques by host",
+                       ["technique", "severity", "host_count", "hosts",
+                        "missing_from"],
+                       "Correlation",
+                       "Which hosts raised which technique, and - the column "
+                       "worth reading - which did not. A technique on every "
+                       "host but one is either a host that escaped that step "
+                       "or a host where the evidence for it was not "
+                       "collected, and those are very different answers.")
+        by_tech = defaultdict(dict)
+        for c in self.cases:
+            for tech, sev in c.techniques.items():
+                by_tech[tech][c.label] = sev
+        labels = [c.label for c in self.cases]
+        rows = []
+        for tech, by_host in by_tech.items():
+            sev = min(by_host.values(), key=lambda s: SEV_RANK[s])
+            rows.append((SEV_RANK[sev], -len(by_host), tech, sev, by_host))
+        rows.sort()
+        for _r, _n, tech, sev, by_host in rows:
+            t.add(tech, sev, len(by_host), ", ".join(sorted(by_host)),
+                  ", ".join(h for h in labels if h not in by_host))
+        shared = [r for r in rows if len(r[4]) > 1]
+        if shared:
+            self.add(shared[0][3] if shared[0][3] in ("CRITICAL", "HIGH")
+                     else "INFO", "Correlation",
+                     "%d technique(s) were observed on more than one host"
+                     % len(shared),
+                     "The same step of the same playbook, reached "
+                     "independently on several machines. Where a technique is "
+                     "on every host but one, look at that host before "
+                     "concluding it was spared - an artifact that was never "
+                     "collected raises no finding either.",
+                     evidence=["%-12s [%-8s] %d host(s): %s"
+                               % (r[2], r[3], len(r[4]), ", ".join(sorted(r[4])))
+                               for r in shared[: self.EVIDENCE]],
+                     source="CROSS_TECHNIQUES", count=len(shared))
+
+    # -- 6. the two views the console is built on --------------------------
+    def t_findings(self):
+        """The correlation's own findings, in the shape the console reads.
+
+        Named FINDINGS rather than CROSS_ANYTHING on purpose: the console's
+        findings view, its severity chips and its ATT&CK matrix are all
+        computed from a table of that name, so a correlation written this way
+        opens in the same page as a single host and needs no second console.
+        """
+        t = self.table("FINDINGS", "Correlation findings",
+                       ["severity", "category", "title", "mitre", "source",
+                        "count", "first_utc", "last_utc", "detail",
+                        "evidence_count", "evidence"],
+                       "Analysis",
+                       "What is true of more than one of these collections. "
+                       "Each host's own findings stayed in that host's own "
+                       "report; these exist only between them.")
+        for f in self.tri.findings:
+            ev = f.evidence or []
+            t.add(f.severity, f.category, f.title, f.mitre, f.source, f.count,
+                  f.first_seen, f.last_seen, (f.detail or "").replace("\n", " | "),
+                  len(ev), "\n".join(str(e) for e in ev))
+
+    def t_timeline(self):
+        """Every host's timeline, merged, with the host on every row.
+
+        The merge is the point: two hosts' events interleaved in one ordering
+        is the sequence an intrusion actually had, and it is a sort rather
+        than an analysis because each run already normalised its own clocks to
+        UTC. The host column is what makes a spike in the chart answerable -
+        one machine being noisy, or three machines at once.
+        """
+        t = self.table("TIMELINE", "Merged event timeline",
+                       ["timestamp_utc", "host", "severity", "category",
+                        "description", "source"],
+                       "Analysis",
+                       "Every dated event from every collection here, in one "
+                       "ordering, each row carrying the host it came from. "
+                       "The correlation's own findings are on it too, under "
+                       "the host '(correlation)'.")
+        rows = []
+        for c in self.cases:
+            for ts, sev, cat, desc, src in c.events:
+                if ts:
+                    rows.append((ts, c.label, sev, cat, desc, src))
+        for f in self.tri.findings:
+            if f.first_seen:
+                rows.append((f.first_seen, "(correlation)", f.severity,
+                             f.category, f.title, f.source or "(finding)"))
+        rows.sort()
+        for r in rows:
+            t.add(*r)
+
+
+#: uid below this is the distribution's own, not somebody's account. Every
+#: Linux host has daemon, bin, sys and www-data; reporting them as "shared
+#: across your estate" is true and useless.
+SYSTEM_UID_MAX = 999
+
+#: Names that carry a real uid but are still the distribution's.
+SYSTEM_NAMES = frozenset(("root", "nobody", "sync", "shutdown", "halt",
+                          "operator"))
+
+
+def _interesting_account(name, by_host):
+    """Is this account somebody's, or the distribution's?"""
+    if name in SYSTEM_NAMES:
+        return False
+    for info in by_host.values():
+        try:
+            uid = int(info.get("uid") or -1)
+        except (TypeError, ValueError):
+            return True             # unreadable uid is itself worth a look
+        if uid > SYSTEM_UID_MAX or uid == 0:
+            return True             # a second uid-0 account is the point
+    return False
+
+
+def _key_type(body):
+    """'AAAAB3NzaC1yc2E...' -> 'ssh-rsa'. The type is encoded in the key.
+
+    Read from the body rather than from the prefix on the line, because the
+    body is what these rows are joined on and a line's prefix can disagree
+    with it - an authorized_keys line edited by hand can say ssh-rsa in front
+    of an ed25519 key, and the key is the fact.
+
+    Only the head is decoded. The type is a length-prefixed string in the
+    first bytes of the blob, and 52 base64 characters cover the longest name
+    there is - sk-ecdsa-sha2-nistp256@openssh.com, at 34 - so that is where
+    the read stops. Stopping there means a body that is truncated, padded
+    wrong or damaged further along still names its type instead of failing
+    whole, and it avoids decoding a kilobyte of key to read nine bytes of it.
+    """
+    head = (body or "")[:52]
+    head = head[: len(head) // 4 * 4]      # base64 only decodes whole quads
+    if len(head) < 8:
+        return ""
+    try:
+        import base64
+        raw = base64.b64decode(head, validate=False)
+    except Exception:
+        return ""
+    if len(raw) < 5:
+        return ""
+    n = int.from_bytes(raw[:4], "big")
+    if 0 < n <= len(raw) - 4:
+        return raw[4:4 + n].decode("ascii", "replace")
+    return ""
+
+
+def _gap(first, last):
+    """'2026-03-24 03:01:12' and '... 03:14:40' -> '13m'. Empty when equal."""
+    if not first or not last or first == last:
+        return ""
+    try:
+        fmt = "%Y-%m-%d %H:%M:%S"
+        d = datetime.strptime(last[:19], fmt) - datetime.strptime(first[:19], fmt)
+    except (ValueError, TypeError):
+        return ""
+    secs = int(d.total_seconds())
+    if secs <= 0:
+        return ""
+    if secs >= 172800:
+        return "%d days" % (secs // 86400)
+    if secs >= 3600:
+        h, m = secs // 3600, (secs % 3600) // 60
+        return "%dh%dm" % (h, m) if m else "%dh" % h
+    if secs >= 120:
+        return "%dm" % (secs // 60)
+    return "%ds" % secs
+
+
+def write_correlation(cases, outdir, opts):
+    """Correlate the finished runs and write the result beside them.
+
+    Three formats, always, rather than mirroring the per-host output flags:
+    the correlation is one small artifact and the question "which of my nine
+    flags applied to it" is not worth making an analyst answer. The console is
+    the one to open; the CSVs and the JSON are for everything else.
+    """
+    if len(cases) < 2:
+        status("[!] --correlate needs at least two collections; skipped")
+        return None
+    cor = Correlator(cases, opts)
+    tables = cor.run()
+    os.makedirs(outdir, exist_ok=True)
+    meta = {"collection": "correlation of %d collections" % len(cases),
+            "hostname": ", ".join(c.label for c in cases),
+            "collected": "", "scope": "correlation", "layout": "correlation",
+            "tables": len(tables),
+            "rows_total": sum(len(t) for t in tables)}
+    csv_dir = os.path.join(outdir, "csv")
+    json_path = os.path.join(outdir, "tables.json")
+    html_path = os.path.join(outdir, "console.html")
+    n = write_tables_csv(tables, csv_dir)
+    write_tables_json(tables, json_path, meta)
+    write_tables_html(tables, html_path, getattr(opts, "html_rows", 0), meta,
+                      cor.tri, opts)
+    status("[+] correlation: %d table(s), %s row(s), %d finding(s)"
+           % (len(tables), "{:,}".format(meta["rows_total"]),
+              len(cor.tri.findings)))
+    print("[+] correlation written to %s (console.html, tables.json, %d CSVs)"
+          % (outdir, n), file=sys.stderr)
+    return cor
 
 # -------------------------------------------------------------------------
 # the command line
@@ -25722,6 +33860,105 @@ def list_volumes(path):
         image.close()
 
 
+def _skill_args(opts):
+    """What a playbook was pointed at, from --skill-arg name=value."""
+    out = {}
+    for pair in opts.skill_arg or []:
+        name, _sep, value = str(pair).partition("=")
+        if not _sep:
+            raise CaseError("--skill-arg wants name=value, not %r" % pair)
+        out[name.strip()] = value.strip()
+    return out
+
+
+def _list_skills():
+    """The playbooks, so --skill has something to name."""
+    print("")
+    print("playbooks - run one with --skill NAME, and point it with "
+          "--skill-arg name=value")
+    print("")
+    for sk in SKILLS:
+        need = [a for a, _d, r in sk["args"] if r]
+        print("  %-22s %s%s" % (sk["name"], sk["about"],
+                                (" (needs --skill-arg %s=...)"
+                                 % need[0]) if need else ""))
+    print("")
+    return 0
+
+
+def _ask_once(opts):
+    """One question, answered against a case that already exists.
+
+    The steps are printed under the answer for the same reason the panel shows
+    them: a local model's answer is worth what the queries behind it are
+    worth, and an analyst who cannot see them has been handed a rumour rather
+    than a finding.
+    """
+    path = opts.db or _case_db_beside(opts)
+    question = opts.ask or ""
+    try:
+        if opts.skill:
+            # The playbook goes to the model in place of the question, and
+            # what the analyst typed goes on the end of it. A skill run from
+            # the command line is the same thing the button in the page does,
+            # by the same route, so the two cannot drift apart.
+            db = _open(path)
+            try:
+                question = render(opts.skill, db, _skill_args(opts))
+            finally:
+                db.close()
+            if opts.ask:
+                question += (chr(10) * 2 + "The analyst asked it this way, "
+                             "so answer that, using the method above: "
+                             + opts.ask)
+        out = ask(path, question,
+                  opts.llm_url or ASK_URL, opts.llm_model)
+    except CaseError as e:
+        status("[!] ask: %s" % e)
+        return 2
+    except KeyboardInterrupt:
+        status("[!] ask: interrupted")
+        return 130
+    answer = (out.get("answer") or "").strip()
+    print("")
+    print(answer or "(the model answered with nothing)")
+    bad = out.get("unsupported") or []
+    if bad:
+        print("")
+        print("!! %d figure(s) above appear in NO query result: %s"
+              % (len(bad), ", ".join(bad)))
+        print("   Those did not come from this case. Treat the answer as "
+              "unreliable and check the queries below yourself.")
+    steps = out.get("steps") or []
+    if steps:
+        print("")
+        print("-- what it looked at, in order " + "-" * 46)
+        for st in steps:
+            print("   %s" % st.get("note") or st.get("tool"))
+            sql = (st.get("args") or {}).get("sql")
+            if sql:
+                print("      %s" % str(sql).replace(chr(10), " "))
+    print("")
+    status("[*] ask: answered by %s against %s"
+           % (out.get("model") or "?", os.path.basename(path)))
+    return 0
+
+
+def _case_db_beside(opts):
+    """The database --serve or --db would have written, if any.
+
+    --export DIR puts case.db in DIR, which is where an examiner who
+    ran the triage yesterday will look for it today. Falling back to
+    the working directory means "linsight --mcp" works from inside
+    the export without naming anything.
+    """
+    for cand in (os.path.join(opts.export or "", "case.db"),
+                 os.path.join(os.getcwd(), "case.db")):
+        if cand and os.path.isfile(cand):
+            return cand
+    return os.path.join(opts.export or os.getcwd(), "case.db")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Parse a UAC or Velociraptor Linux collection, or a disk "
@@ -25729,96 +33966,57 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  python linsight.py ./uac-host-linux-20260324\n"
-               "  python linsight.py collection.tar.gz --html report.html --json out.json\n"
-               "  python linsight.py ./coll --min-severity HIGH --timeline timeline.csv\n"
-               "  python linsight.py ./coll --pivot /dev/shm/kit --pivot libymv.so.3\n"
-               "  python linsight.py ./disk.dd            # a raw disk image\n"
-               "  python linsight.py evidence.E01         # the whole E01 set\n"
-               "  python linsight.py vm.qcow2 --html report.html\n"
-               "  python linsight.py ./disk.dd --list-volumes  # what is on it\n"
-               "  sudo python linsight.py /dev/sda        # the live disk\n"
-               "  python linsight.py --file /var/log/auth.log\n"
-               "  python linsight.py --file ./loose-logs/ --file ps.txt\n"
+               "  python linsight.py collection.tar.gz --html report.html\n"
+               "  python linsight.py evidence.E01 --export ./out\n"
+               "  python linsight.py ./disk.dd --list-volumes\n"
+               "  python linsight.py ./coll --pivot @iocs.txt\n"
+               "  python linsight.py ./coll --sigma ./detections\n"
+               "  python linsight.py ./coll --update-sigma\n"
                "  python linsight.py --file capture.txt:/var/log/auth.log\n"
-               "  python linsight.py ./coll --export ./triage_out\n"
-               "  python linsight.py ./coll --csv-dir ./tables --quiet\n"
-               "  python linsight.py ./coll --export ./live --scope live\n"
-               "  python linsight.py ./coll --export ./disk --scope offline\n"
-               "  python linsight.py ./coll --update-sigma   # fetch SigmaHQ, then hunt\n"
-               "  python linsight.py ./coll --sigma-cached   # hunt offline with the cache\n"
-               "  python linsight.py --update-sigma          # refresh the cache only\n")
+               "\n"
+               "more: README.md\n")
     ap.add_argument("--file", dest="files", action="append", metavar="PATH[:DEST]",
-                    help="parse loose files instead of a collection. Repeatable, "
-                         "and PATH may be a directory. Each file is mounted at "
-                         "the path its parser looks for, chosen from the name "
-                         "('auth.log' -> /var/log/auth.log, 'ps.txt' -> the "
-                         "process listing); a directory whose top level looks "
-                         "like a host tree (etc/, var/, ...) is mounted as it "
-                         "stands. Append ':/host/path' to say what a file is "
-                         "when the name does not: "
-                         "--file capture.txt:/var/log/auth.log")
-    ap.add_argument("collection", nargs="?", metavar="COLLECTION|DISK",
-                    help="a collection directory, .tar, .tar.gz or .zip (UAC "
-                         "output or a Velociraptor offline collector zip), or "
-                         "a disk: a raw/dd image, an E01 set, a qcow2, vmdk, "
-                         "vhdx or vhd, or a device such as /dev/sda. Which of "
-                         "the two it is, and for a collection which tool "
-                         "produced it, is detected rather than declared. "
-                         "Optional only when --update-sigma is refreshing "
-                         "rules on its own")
+                    help="parse loose files instead of a collection (repeatable; PATH "
+                         "may be a directory). Append ':/host/path' when the name does "
+                         "not say what a file is: --file capture.txt:/var/log/auth.log")
+    ap.add_argument("collections", nargs="*", metavar="COLLECTION|DISK",
+                    help="a collection (directory, .tar, .tar.gz, .zip) or a disk "
+                         "(raw/dd, E01, qcow2, vmdk, vhdx, vhd, or /dev/sda). Which it "
+                         "is, is detected. Repeatable: several are read one after "
+                         "another, each into its own directory under --out. Optional "
+                         "only with --update-sigma on its own.")
     dg = ap.add_argument_group(
         "disks",
-        "Point the same parsers at a disk instead of a collection. The image "
-        "is read directly - no loop device, no mount, no root, nothing "
-        "written to the evidence. Partition tables, LVM volume groups and "
-        "LUKS containers are walked through; the root filesystem is the one "
-        "that holds /etc, and whatever /etc/fstab places is mounted where the "
-        "host had it. A volume that cannot be opened is reported by name, "
-        "because an encrypted partition and an absence of evidence must not "
-        "look alike in the output.")
-    dg.add_argument("--disk", metavar="PATH",
-                    help="read PATH as a disk even when it would not be "
-                         "recognised as one - a headerless image, a damaged "
-                         "partition table, a device node")
+        "Read a disk image directly - no loop device, no mount, no root, nothing written to the evidence.")
+    dg.add_argument("--disk", metavar="PATH", action="append",
+                    help="read PATH as a disk even when it does not look like one "
+                         "(repeatable)")
 
     ig = ap.add_argument_group(
         "saying what the input is",
-        "What the argument is - a collection directory, an archive, a disk, "
-        "an AD1 - is worked out from the thing itself, and these are here for "
-        "when that goes wrong or when you would rather be explicit. Each one "
-        "takes the place of the positional argument and forces one reader, so "
-        "a wrong guess becomes an error naming what it could not read instead "
-        "of a report with the wrong half of the evidence in it.")
+        "Force one reader when the automatic detection guesses wrong, or when you would rather be explicit.")
     ig.add_argument("-d", "--dir", metavar="PATH", dest="dir_input",
-                    help="read PATH as a directory: an extracted UAC or "
-                         "Velociraptor collection, or a mounted filesystem "
-                         "root (one whose top level is etc/, var/, usr/ ...), "
-                         "which is what a forensic mounter gives you")
-    ig.add_argument("--archive", metavar="PATH",
-                    help="read PATH as a collection archive - .tar, .tar.gz "
-                         "or .zip - rather than as anything else it might "
-                         "look like")
-    ig.add_argument("--ad1", metavar="PATH",
-                    help="read PATH as an AccessData/FTK logical image, and "
-                         "gather the rest of its .ad2/.ad3 segments")
+                    action="append",
+                    help="read PATH as a directory: an extracted collection, or a "
+                         "mounted filesystem root (repeatable)")
+    ig.add_argument("--archive", metavar="PATH", action="append",
+                    help="read PATH as a collection archive (.tar, .tar.gz, .zip) "
+                         "(repeatable)")
+    ig.add_argument("--ad1", metavar="PATH", action="append",
+                    help="read PATH as an AccessData/FTK logical image, with its "
+                         ".ad2/.ad3 parts (repeatable)")
     dg.add_argument("--list-volumes", action="store_true",
-                    help="print what is on the disk - container, partitions, "
-                         "logical volumes, filesystems - and stop. The first "
-                         "thing to run against an unfamiliar image: it costs "
-                         "one pass over the metadata, not a filesystem walk.")
+                    help="print the disk's volumes and stop - run this first on an "
+                         "unfamiliar image")
     dg.add_argument("--disk-volume", metavar="NAME",
-                    help="read this volume (part1, p2, vg/lv) instead of the "
-                         "one that holds /etc")
+                    help="read this volume (part1, p2, vg/lv) instead of the one holding "
+                         "/etc")
     dg.add_argument("--disk-max-files", type=int, default=DEFAULT_MAX_FILES,
                     metavar="N",
-                    help="stop the filesystem walk after N names (default "
-                         "%s). A truncated walk becomes a HIGH finding, "
-                         "because an absence in a partial read is not evidence "
-                         "of absence." % format(DEFAULT_MAX_FILES, ","))
+                    help="stop the filesystem walk after N names (default 3,000,000); a "
+                         "truncated walk becomes a finding")
     dg.add_argument("--no-deleted", action="store_true",
-                    help="skip the deleted-inode scan. It reads every inode "
-                         "table on the filesystem, which on a multi-terabyte "
-                         "disk is the slowest part of the load.")
+                    help="skip the deleted-inode scan - the slowest part of a large disk")
     ap.add_argument("--min-severity", default="INFO", choices=SEVERITIES,
                     help="lowest severity to print on the console (default INFO)")
     ap.add_argument("--window", type=int, default=72, metavar="H",
@@ -25827,13 +34025,8 @@ def main(argv=None):
                     help="evidence lines printed per finding on the console (default 25)")
     ap.add_argument("--json", metavar="PATH", help="write full findings as JSON")
     ap.add_argument("--html", metavar="PATH",
-                    help="write a self-contained HTML report of the findings - "
-                         "a document to read top to bottom and hand to "
-                         "someone. The artifact tables are a browsable grid "
-                         "rather than a document and are not in it: --export "
-                         "DIR writes those, as browser.html plus csv/ and "
-                         "json/. This report lists them and says where they "
-                         "went.")
+                    help="write a self-contained HTML findings report (artifact tables "
+                         "go to --export, which this report points at)")
     ap.add_argument("--timeline", metavar="PATH", help="write the event timeline as CSV")
     ap.add_argument("--show-timeline", action="store_true",
                     help="also print the timeline on the console")
@@ -25842,136 +34035,167 @@ def main(argv=None):
     ap.add_argument("--timeline-limit", type=int, default=3000,
                     help="max file events kept in the timeline (default 3000)")
     ap.add_argument("--pivot", action="append", metavar="TERM",
-                    help="search every collected artifact for TERM, case-"
-                         "insensitively (repeatable). Use '@file' to read a "
-                         "list of indicators, one per line, '#' for comments - "
-                         "all terms are matched in one pass, so a long list "
-                         "costs no more than a short one.")
+                    help="search every artifact for TERM, case-insensitively "
+                         "(repeatable). '@file' reads an indicator list - one per line, "
+                         "'#' comments, defanged forms accepted - all matched in a "
+                         "single pass.")
     ap.add_argument("--count-iocs", action="store_true",
-                    help="also count every extracted indicator across the "
-                         "whole collection, filling count/first_utc/last_utc "
-                         "in the IOCS table for all of them rather than only "
-                         "for the terms that were pivoted on. It folds them "
-                         "into the same single pass --pivot makes, but that "
-                         "pass then reads every text artifact against a much "
-                         "larger pattern: on a 31 GB image it took a four "
-                         "minute run to twenty. The indicators, their types "
-                         "and their provenance are in IOCS either way.")
+                    help="also count every indicator the analyzers extracted, not just "
+                         "the pivoted ones. Same single pass, larger pattern: minutes on "
+                         "a big image.")
     ap.add_argument("--pivot-limit", type=int, default=500,
                     help="max indicators to search for (default 500)")
     ap.add_argument("--deep", action="store_true",
                     help="also scan memory_dump/*strings* (slow, multi-GB)")
     rg = ap.add_argument_group(
         "detection rules",
-        "Hunt with your own rules. Both engines are built in - nothing to "
-        "install - and cover the constructs Linux IR rules use; PyYAML is used "
-        "for Sigma if it happens to be importable. A rule the engine cannot "
-        "represent faithfully is rejected and listed in RULE_ERRORS rather "
-        "than half-applied, because a rule that silently matches nothing looks "
-        "exactly like a clean result. Sigma rules go stale the same way: "
-        "--update-sigma keeps a local copy of the public ruleset current, and "
-        "is the only thing here that uses the network.")
+        "Hunt with your own rules. Both engines are built in. A rule this engine cannot represent faithfully is rejected into RULE_ERRORS rather than half-applied.")
     rg.add_argument("--yara", action="append", metavar="PATH",
-                    help="YARA rule file or directory (repeatable). Scans the "
-                         "collected filesystem and the per-process memory "
-                         "strings; add --deep for the memory image strings.")
+                    help="YARA rule file or directory (repeatable); scans collected "
+                         "files and per-process memory strings")
     rg.add_argument("--no-hunt", action="store_true",
-                    help="skip the built-in offensive-tool keyword sweep. The "
-                         "sweep reads the normalised tables, so it costs the "
-                         "table build even when no export was asked for - on a "
-                         "mid-size collection that is roughly 12s to 65s. Use "
-                         "this when you want the analyzer findings only.")
+                    help="skip the built-in offensive-tool keyword sweep")
     rg.add_argument("--keywords", action="append", metavar="PATH",
-                    help="file of extra terms to hunt for, one per line "
-                         "(repeatable). Matched the same way as the built-in "
-                         "tool names, across every artifact - use it for "
-                         "case-specific names, hostnames or filenames.")
+                    help="file of extra terms to hunt for, one per line (repeatable)")
     rg.add_argument("--sigma", action="append", metavar="PATH",
-                    help="Sigma rule file or directory (repeatable). Runs "
-                         "against the normalised tables - auth, journal, "
-                         "auditd, processes, cron, web logs - routed by each "
-                         "rule's logsource.")
+                    help="Sigma rule file or directory (repeatable), routed to the "
+                         "normalised tables by each rule's logsource")
     rg.add_argument("--update-sigma", action="store_true",
-                    help="fetch the current SigmaHQ ruleset into a local cache "
-                         "and hunt with it. Keeps the rules that can reach a "
-                         "table this tool builds - the Linux and web-log ones - "
-                         "and skips the ~3000 Windows event log rules, which "
-                         "would only slow the load and fill RULE_ERRORS. The "
-                         "fetch is conditional: an unchanged ruleset is a 304 "
-                         "and no download. Works with no collection argument "
-                         "when you just want the cache refreshed.")
+                    help="fetch the current SigmaHQ ruleset into the cache and hunt with "
+                         "it. Conditional - unchanged means no download. The only option "
+                         "that uses the network.")
     rg.add_argument("--sigma-cached", action="store_true",
-                    help="hunt with the cached ruleset as last fetched, without "
-                         "touching the network - the offline half of "
-                         "--update-sigma.")
+                    help="hunt with the cached ruleset, offline")
     rg.add_argument("--sigma-dir", metavar="DIR",
-                    help="where the cached ruleset lives (default "
-                         "~/.linsight/sigma, or $LINSIGHT_SIGMA_DIR). It is a "
-                         "plain directory of .yml files, so --sigma takes it "
-                         "too.")
+                    help="where the cache lives (default: your own temp directory, or "
+                         "$LINSIGHT_SIGMA_DIR)")
     rg.add_argument("--sigma-source", metavar="URL|ZIP|DIR",
-                    help="what --update-sigma reads instead of SigmaHQ's "
-                         "master zip: another ruleset's URL, a zip already "
-                         "downloaded, or a directory - for the evidence "
-                         "workstation with no route out, and for your own "
-                         "rule repository.")
+                    help="what --update-sigma reads instead of SigmaHQ's zip: a URL, a "
+                         "downloaded zip, or a directory")
     rg.add_argument("--sigma-all", action="store_true",
-                    help="cache every rule --update-sigma finds, including the "
-                         "ones for platforms this tool builds no table for. "
-                         "SIGMA_COVERAGE then says, rule by rule, why each one "
-                         "could not fire here.")
+                    help="cache every rule found, including ones for platforms this tool "
+                         "builds no table for")
+    mg = ap.add_argument_group(
+        "several collections at once",
+        "Read more than one collection or image in one command. Each gets its own "
+        "directory of output; --correlate then asks what is true of more than one "
+        "of them.")
+    mg.add_argument("--split", metavar="DIR", dest="out",
+                    help="keep the collections apart instead of merging them: "
+                         "one directory of output per input, as DIR/<name>/, "
+                         "named after the input's own file or folder. On its "
+                         "own it writes a full export per input - csv/, json/ "
+                         "and browser.html.")
+    mg.add_argument("--correlate", action="store_true",
+                    help="also work out what is true of more than one of them - "
+                         "the indicators, findings and file hashes several hosts "
+                         "share, and which host saw each first. Adds CROSS_IOCS, "
+                         "CROSS_FINDINGS, CROSS_HASHES and HOSTS to the export; "
+                         "under --split it writes DIR/_correlation/ instead. "
+                         "Needs two or more inputs.")
     tg = ap.add_argument_group(
         "artifact tables",
-        "Normalise every interesting artifact into browsable grids - one table "
-        "per artifact type, with a source column keeping the originating file.")
+        "Normalise every artifact into browsable grids - one table per artifact type, each row keeping its source file.")
     tg.add_argument("--scope", choices=TableBuilder.SCOPES, default="full",
-                    help="which half of the collection to build tables from: "
-                         "'live' = the volatile snapshot (processes, sockets, "
-                         "open files, modules, live sessions); 'offline' = what "
-                         "a dead-box exam recovers (filesystem, config, logs, "
-                         "persistence, bodyfile); 'full' = both (default). "
-                         "Findings and the timeline always use the whole "
-                         "collection - they are cross-artifact by nature.")
+                    help="which half of the collection to build tables from: 'live' "
+                         "(processes, sockets, modules), 'offline' (filesystem, config, "
+                         "logs), or 'full' (default). Findings and the timeline always "
+                         "use everything.")
     tg.add_argument("--export", metavar="DIR",
-                    help="write every table format into DIR "
-                         "(csv/ and json/, one file per table, plus "
-                         "browser.html - the console)")
+                    help="write every table into DIR - csv/, json/ and browser.html")
     tg.add_argument("--csv-dir", metavar="DIR",
                     help="write one CSV per table into DIR")
     tg.add_argument("--tables-json", metavar="PATH",
                     help="write every table as a single JSON document")
     tg.add_argument("--tables-html", metavar="PATH",
-                    help="write the self-contained console: findings, ATT&CK, "
-                         "timeline, indicators and every artifact table")
+                    help="write the self-contained console: findings, timeline, "
+                         "indicators and every table")
     tg.add_argument("--process-map", metavar="PATH",
-                    help="write ONLY the correlated one-row-per-PID process table "
-                         "to a single file (.csv/.html/.json by extension)")
+                    help="write only the one-row-per-PID process table (.csv/.html/.json "
+                         "by extension)")
+    tg.add_argument("--serve", nargs="?", const="127.0.0.1:8000",
+                    metavar="[HOST:]PORT",
+                    help="open the investigation server instead of writing a "
+                         "page: the same console, plus marking, labelling, "
+                         "scoring and notes saved to a case file. Builds the "
+                         "SQLite database and skips the CSV/JSON exports "
+                         "unless --csv-dir or --tables-json ask for them. "
+                         "Loopback only unless a host is named.")
+    tg.add_argument("--ask", metavar="QUESTION",
+                    help="put one question to a local model with the "
+                         "case behind it, and print what it found and "
+                         "the queries it ran. Reads a case an earlier "
+                         "run wrote; parses nothing. Same engine as "
+                         "the Ask panel and --mcp.")
+    tg.add_argument("--skill", nargs="?", const="", metavar="NAME",
+                    help="run an investigative playbook instead of a bare "
+                         "question - the sequence an examiner follows, with "
+                         "the tables and the joins named for the model. "
+                         "Name it with no value to list them. Combines with "
+                         "--ask, which then says how to answer it.")
+    tg.add_argument("--skill-arg", action="append", metavar="NAME=VALUE",
+                    help="what to point a playbook at: "
+                         "--skill-arg address=209.141.62.185. Repeatable. "
+                         "A playbook that needs one and is not given it is "
+                         "refused rather than pointed at a guess.")
+    tg.add_argument("--llm-url", metavar="URL",
+                    help="an OpenAI-compatible endpoint for the Ask "
+                         "panel - Ollama, LM Studio, llama.cpp, vLLM. "
+                         "Default http://127.0.0.1:11434/v1, which is "
+                         "Ollama. The server calls it; the page never "
+                         "does, and nothing leaves the machine.")
+    tg.add_argument("--llm-model", metavar="NAME",
+                    help="which model to ask. Default: whatever the "
+                         "runtime lists first. It must support tool "
+                         "calling, because the model queries the case "
+                         "rather than being handed it.")
+    tg.add_argument("--mcp", nargs="?", const="", metavar="DB",
+                    help="answer MCP over stdin/stdout against a case "
+                         "database an earlier run wrote, so a model can "
+                         "query the case itself - read-only, and "
+                         "nothing leaves the machine. Defaults to "
+                         "case.db beside --export. Parses nothing: "
+                         "point it at a case that already exists.")
+    tg.add_argument("--db", metavar="PATH",
+                    help="write every artifact table into a SQLite database "
+                         "as well - one SQL table each, plus the marks when "
+                         "--serve is used. Implied by --serve, which defaults "
+                         "it to case.db beside the export.")
+    tg.add_argument("--case", metavar="PATH",
+                    help="where --serve keeps its marks and notes (default: "
+                         "case.json beside the export, or in the working "
+                         "directory)")
     tg.add_argument("--html-rows", type=int, default=0, metavar="N",
-                    help="rows per table embedded in the HTML browser. 0, the "
-                         "default, embeds every row, so the page carries the "
-                         "whole export and 'Search all' really does search "
-                         "all of it. Set a number to cap it when the page "
-                         "would be too large to open comfortably - the size "
-                         "is printed either way, and the CSV and JSON exports "
-                         "are unaffected.")
+                    help="rows per table embedded in the HTML browser (0, the default, "
+                         "embeds every row)")
 
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colour")
     ap.add_argument("--quiet", action="store_true", help="suppress the console report")
     ap.add_argument("--debug", action="store_true", help="re-raise analyzer exceptions")
     ap.add_argument("--low-memory", action="store_true",
-                    help="spill large tables to a temp file instead of holding "
-                         "every row in memory - roughly halves peak memory on a "
-                         "large collection and costs about 20%% of the run time")
+                    help="spill large tables to a temp file - roughly half the peak "
+                         "memory, about a fifth more time")
     ap.add_argument("--timing", action="store_true",
-                    help="report wall time per table extractor and per output "
-                         "writer - use it to find which artifact a slow "
-                         "collection is spending its minutes on")
+                    help="report wall time per table extractor and per output writer")
     opts = ap.parse_args(argv)
 
     # set before any table is built, because a table that has already buffered
     # its rows cannot be made to have spilled them
     if opts.low_memory and "LINSIGHT_SPILL_AFTER" not in os.environ:
         Table.SPILL_AFTER = 20000
+
+    # Before the banner, and before anything else can print: stdout is
+    # the protocol here, and one stray line of it is a client that
+    # cannot parse the stream and an error that looks like anything but
+    # this. Nothing is parsed either - the case has to exist already.
+    if opts.mcp is not None:
+        path = opts.mcp or opts.db or _case_db_beside(opts)
+        return serve_mcp(path, quiet=opts.quiet)
+
+    if opts.skill == "":
+        return _list_skills()
+    if opts.ask or opts.skill:
+        return _ask_once(opts)
 
     opts.color = (not opts.no_color) and sys.stdout.isatty()
     if opts.color and os.name == "nt":
@@ -26030,79 +34254,242 @@ def main(argv=None):
             status("[*] sigma: cached %s" % opts.sigma_note)
         opts.sigma = (opts.sigma or []) + [cache]
 
-    # Exactly one thing may say what is being read. Each of these names a
-    # different reader, and silently preferring one over another is how an
-    # analyst ends up with a report about half the evidence.
-    chosen = [(name, value) for name, value in
-              (("--disk", opts.disk), ("-d/--dir", opts.dir_input),
-               ("--archive", opts.archive), ("--ad1", opts.ad1),
-               ("--file", opts.files)) if value]
-    if opts.collection and chosen:
-        ap.error("%s says what to read; do not also pass it as the plain "
-                 "argument" % chosen[0][0])
-    if len(chosen) > 1:
-        ap.error("%s and %s each name what to read; pass one"
-                 % (chosen[0][0], chosen[1][0]))
-
-    # What the input is, is worked out from the input. The explicit flags
-    # above override that, and exist because a guess can be wrong - a
-    # headerless image, an archive with no extension - and because saying it
-    # outright is sometimes just clearer.
-    forced = ""
-    if opts.disk:
-        forced, opts.collection = "disk", opts.disk
-    elif opts.dir_input:
-        forced, opts.collection = "dir", opts.dir_input
-    elif opts.archive:
-        forced, opts.collection = "archive", opts.archive
-    elif opts.ad1:
-        forced, opts.collection = "ad1", opts.ad1
-
-    if forced and forced != "disk" and not os.path.exists(opts.collection):
-        ap.error("%s not found: %s" % (forced, opts.collection))
-    if forced == "dir" and not os.path.isdir(opts.collection):
-        ap.error("-d/--dir wants a directory; %s is a file. For an archive "
-                 "use --archive, for a disk image use --disk."
-                 % opts.collection)
-    if forced == "archive" and os.path.isdir(opts.collection):
-        ap.error("--archive wants a .tar/.tar.gz/.zip; %s is a directory - "
-                 "use -d instead" % opts.collection)
-
-    # With nothing declared, the argument identifies itself - and says so.
-    # A directory holding one Webserver.E01 is not a collection with two files
-    # in it; reading it as one built five empty tables and reported a host
-    # with nothing on it.
-    detected = ""
-    disk_path = opts.disk
-    if not forced and opts.collection:
-        kind, target, why = identify_input(opts.collection)
-        detected = why
-        opts.collection = target
-        if kind == "disk":
-            disk_path = target
-        elif kind == "ad1":
-            opts.ad1 = target
-    if detected and not opts.quiet:
-        status("[*] reading %s - %s" % (os.path.basename(opts.collection.rstrip("/\\"))
-                                        or opts.collection, detected))
-
-    if not disk_path and not opts.collection and not opts.files:
+    targets = _resolve_targets(ap, opts)
+    if not targets:
         if opts.update_sigma:
             return 0                    # a rule refresh on its own
         ap.error("a collection, a disk or --file is required (or "
                  "--update-sigma on its own to refresh the rule cache)")
 
     if opts.list_volumes:
-        if not disk_path:
+        disks = [t for t in targets if t[0] == "disk"]
+        if len(targets) > 1:
+            ap.error("--list-volumes reads one disk; pass one")
+        if not disks:
             ap.error("--list-volumes needs a disk; pass an image, a device, "
                      "or --disk PATH")
-        return list_volumes(disk_path)
+        return list_volumes(disks[0][1])
+
+    _check_multi(ap, opts, targets)
+
+    # One input keeps the flags exactly as they were typed: a single run has
+    # nowhere to collide with, and rewriting its paths under --out when --out
+    # was not given would be a change of behaviour for every existing command.
+    if len(targets) == 1 and not opts.out:
+        return _run_one(ap, opts, targets[0][0], targets[0][1])
+
+    labels, taken = [], set()
+    for _kind, path in targets:
+        labels.append(_label_for(path, taken))
+    status("[*] %d collection(s) to read: %s"
+           % (len(targets), ", ".join(labels)))
+
+    # Two shapes, and they answer different questions. --split keeps each
+    # collection in a directory of its own, which is what you want when the
+    # hosts are separate cases. The default merges them into one export with a
+    # host column on every row, which is what you want when they are one case:
+    # an unfiltered console then shows every host at once, and choosing one
+    # narrows every grid - rather than opening three exports and joining by
+    # eye. The cost is that the merged set is held whole; --low-memory spills
+    # it, which is what that flag is for.
+    merging = not opts.out
+    cases, tris, per_host, worst = [], [], [], 0
+    for i, ((kind, path), label) in enumerate(zip(targets, labels)):
+        status("")
+        status("[*] === %s (%d of %d): %s ===" % (label, i + 1, len(labels), path))
+        hopts = _host_opts(opts, label)
+        if merging:
+            # every output is written once at the end, over the merged set
+            for attr in ("export",) + OUTPUT_PATHS:
+                setattr(hopts, attr, None)
+            hopts.serve = None
+        rc, tri, tables = _run_one(ap, hopts, kind, path, collect=True)
+        worst = max(worst, rc)
+        if tri is None:
+            continue
+        cases.append(HostCase(label, path, tri, tables))
+        tris.append(tri)
+        if merging:
+            per_host.append((label, tables))
+
+    if not merging:
+        if opts.correlate:
+            status("")
+            write_correlation(cases, os.path.join(opts.out, "_correlation"), opts)
+        return worst
+
+    status("")
+    tables, hostcol = merge_tables(per_host)
+    cor = None
+    if opts.correlate:
+        cor = Correlator(cases, opts)
+        # the cross-host tables join the export rather than becoming a second
+        # one: the console carrying every host's rows is also where "which of
+        # these hosts share this" is the natural next question
+        tables += [t for t in cor.run()
+                   if t.name not in ("FINDINGS", "TIMELINE")]
+    status("[*] merged %d table(s) from %d collections, %s row(s) total"
+           % (len(tables), len(per_host),
+              "{:,}".format(sum(len(t) for t in tables))))
+    merged = merge_triage(cases, opts, tris)
+    if cor is not None:
+        merged.findings.extend(cor.tri.findings)
+        merged.findings.sort(key=lambda f: (SEVERITIES.index(f.severity),
+                                            f.category, f.title))
+    _write_merged(merged, tables, labels, hostcol, opts)
+    return worst
+
+
+def _write_merged(tri, tables, labels, hostcol, opts):
+    """Every output this run asked for, once, over the merged table set."""
+    if opts.json:
+        write_json(tri, opts.json)
+    if opts.html:
+        write_html(tri, opts.html, opts, None)
+    if opts.timeline:
+        write_timeline(tri, opts.timeline)
+    if not any((opts.export, opts.csv_dir, opts.tables_json, opts.tables_html,
+                opts.process_map, opts.serve, opts.db)):
+        return
+    meta = {"collection": ", ".join(labels),
+            "hostname": tri.meta.get("Hostname", ""),
+            "collected": "", "scope": getattr(opts, "scope", "full"),
+            "layout": "merged", "hosts": list(labels),
+            "host_column": hostcol,
+            "tables": len(tables),
+            "rows_total": sum(len(t) for t in tables)}
+    write_merged_tables(tri, tables, meta, opts)
+
+
+def _resolve_targets(ap, opts):
+    """Every input this run was given, as [(forced kind, path)].
+
+    The forcing flags each name a reader, and each may be repeated: a run over
+    three images is three --disk, or three plain arguments, and mixing the two
+    is refused because "which of these did I mean to force" has no good
+    answer. What is not refused any more is repeating one flag - argparse used
+    to overwrite silently, so `--disk a.dd --disk b.dd` read b.dd and reported
+    on it as though a.dd had never been named.
+
+    --file is the exception that stays singular: several loose files are one
+    synthetic collection by construction, not several inputs.
+    """
+    named = [("--disk", "disk", list(opts.disk or [])),
+             ("-d/--dir", "dir", list(opts.dir_input or [])),
+             ("--archive", "archive", list(opts.archive or [])),
+             ("--ad1", "ad1", list(opts.ad1 or []))]
+    used = [(flag, kind, vals) for flag, kind, vals in named if vals]
+    if opts.collections and (used or opts.files):
+        ap.error("%s says what to read; do not also pass it as a plain argument"
+                 % (used[0][0] if used else "--file"))
+    if opts.files and used:
+        ap.error("--file and %s each name what to read; pass one" % used[0][0])
+
+    if opts.files:
+        return [("files", "")]
+
+    targets = []
+    for _flag, kind, vals in used:
+        for path in vals:
+            if kind != "disk" and not os.path.exists(path):
+                ap.error("%s not found: %s" % (kind, path))
+            if kind == "dir" and not os.path.isdir(path):
+                ap.error("-d/--dir wants a directory; %s is a file. For an "
+                         "archive use --archive, for a disk image use --disk."
+                         % path)
+            if kind == "archive" and os.path.isdir(path):
+                ap.error("--archive wants a .tar/.tar.gz/.zip; %s is a "
+                         "directory - use -d instead" % path)
+            targets.append((kind, path))
+
+    # With nothing declared, each argument identifies itself - and says so.
+    # A directory holding one Webserver.E01 is not a collection with two files
+    # in it; reading it as one built five empty tables and reported a host
+    # with nothing on it.
+    for raw in opts.collections:
+        if not os.path.exists(raw):
+            ap.error("collection not found: %s" % raw)
+        kind, target, why = identify_input(raw)
+        if why and not opts.quiet:
+            status("[*] reading %s - %s"
+                   % (os.path.basename(target.rstrip("/\\")) or target, why))
+        targets.append((kind if kind in ("disk", "ad1") else "", target))
+    return targets
+
+
+#: Every output flag that names a path, and the attribute holding it. Under
+#: --out each becomes a name inside that input's own directory, so three runs
+#: cannot write three reports over one another.
+OUTPUT_PATHS = ("csv_dir", "tables_json", "tables_html", "json", "html",
+                "timeline", "process_map", "db", "case")
+
+
+def _check_multi(ap, opts, targets):
+    """Refuse the combinations that cannot mean what they look like."""
+    if opts.correlate and len(targets) < 2:
+        ap.error("--correlate compares collections with each other; it needs "
+                 "at least two")
+    if len(targets) > 1 and opts.out and opts.serve:
+        # merged, --serve is one console over every host and works; split, it
+        # would have to serve three at once from one blocking process
+        ap.error("--serve and --split are different answers to the same "
+                 "question: --serve wants one console, --split writes one "
+                 "export per collection. Drop --split to serve the merged "
+                 "set, or drop --serve and open the export you want")
+
+
+def _host_opts(opts, label):
+    """This input's own copy of the options, writing into its own directory.
+
+    Shallow: the lists and dictionaries on opts are read, never mutated, so
+    the copies share them. What is rewritten is every path an output would be
+    written to - and only its basename is kept, because an absolute path
+    given once cannot name three different files.
+    """
+    o = copy.copy(opts)
+    o.collections, o.disk, o.dir_input, o.archive, o.ad1 = [], None, None, None, None
+    if not opts.out:
+        # Console-only: nothing is written, so there is nothing to move. The
+        # per-host header above is the whole separation these runs need.
+        return o
+    hdir = os.path.join(opts.out, label)
+    # Made here rather than by each writer: --export creates its own directory
+    # but --html and --tables-json do not, and a run that parses a disk for a
+    # minute and then fails on a missing parent has wasted the minute.
+    os.makedirs(hdir, exist_ok=True)
+    if opts.export:
+        # --export already means "a directory of everything"; under --out that
+        # directory is the host's own, rather than one nested inside it
+        o.export = hdir
+    for attr in OUTPUT_PATHS:
+        value = getattr(opts, attr, None)
+        if value:
+            setattr(o, attr, os.path.join(hdir, os.path.basename(str(value))))
+    if not any(getattr(o, a, None) for a in ("export",) + OUTPUT_PATHS):
+        # --out on its own has to mean something, and the something an
+        # analyst wants from it is the export they would have asked for
+        o.export = hdir
+    return o
+
+
+def _run_one(ap, opts, forced, target, collect=False):
+    """Read one collection and write whatever this run asked for.
+
+    Returns the exit code on a single-input run, and (code, triage, tables)
+    when a caller is gathering several - the correlation needs what each run
+    concluded, and the tables are handed over rather than re-read.
+    """
+    disk_path = target if forced == "disk" else ""
+    ad1_path = target if forced == "ad1" else ""
+    opts.collection = target
+    if forced == "dir":
+        opts.dir_input = target
+    elif forced == "archive":
+        opts.archive = target
 
     # An AD1 is a logical image - a tree of files, not a disk - so it lands on
     # the collection side. Like every other container it is recognised rather
     # than declared.
-    ad1_path = opts.ad1 or ""
-
     if ad1_path:
         try:
             col = Ad1Collection(ad1_path, quiet=opts.quiet,
@@ -26176,12 +34563,13 @@ def main(argv=None):
         write_timeline(tri, opts.timeline)
 
     if any((opts.export, opts.csv_dir, opts.tables_json,
-            opts.tables_html, opts.process_map)):
+            opts.tables_html, opts.process_map, getattr(opts, "serve", None))):
         export_tables(tri, col, opts, tb)
 
     crit = sum(1 for f in tri.findings if f.severity == "CRITICAL")
     high = sum(1 for f in tri.findings if f.severity == "HIGH")
-    return 2 if crit else (1 if high else 0)
+    code = 2 if crit else (1 if high else 0)
+    return (code, tri, (tb.tables if tb is not None else [])) if collect else code
 
 
 if __name__ == "__main__":
