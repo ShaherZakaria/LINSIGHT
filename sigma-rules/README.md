@@ -1,7 +1,9 @@
 # Vendored Sigma rules
 
-411 rules from [SigmaHQ](https://github.com/SigmaHQ/sigma), filtered to the
-Linux and web-log rules this tool can actually route to a table.
+334 rules from [SigmaHQ](https://github.com/SigmaHQ/sigma), filtered to the
+Linux and web-log rules this tool can actually route to a table — including
+the **`rules-emerging-threats/`** tree, which is where the per-CVE exploitation
+rules live: 107 rules naming 74 CVEs.
 
 ```bash
 python linsight.py <collection> --sigma ./sigma-rules/ --export ./parse
@@ -12,9 +14,31 @@ python linsight.py <collection> --sigma ./sigma-rules/ --export ./parse
 | | |
 |---|---|
 | source | `https://codeload.github.com/SigmaHQ/sigma/zip/refs/heads/master` |
-| fetched | 2026-08-23 |
+| fetched | 2026-08-26 |
 | considered | 4,265 rules in the upstream ruleset |
-| kept here | 411 — the rest declare a product this tool builds no table for |
+| kept here | 334 — the rest declare a product this tool builds no table for |
+
+### What changed from the 2026-08-23 snapshot
+
+The count went *down*, from 411 to 334, and the set is better for it.
+
+| tree | was | now | |
+|---|---|---|---|
+| `rules-emerging-threats/` | 0 | **107** | the per-CVE rules, absent before |
+| `rules/linux` | 210 | 207 | |
+| `rules/web` | 45 | 16 | |
+| `rules/application` | 99 | 0 | `product: bitbucket`, `kubernetes`, `django` … |
+| `rules/network` | 53 | 0 | `product: cisco`, `zeek` |
+
+Of the previous 411, only **227 could ever route to a table here**. The other
+184 declared a product this tool builds no table for, and were vendored with a
+looser filter than `sigma_rule_wanted` now applies — they inflated the count
+and could never fire. Routable rules went 227 → 334.
+
+Eight of the new rules are `category: file_event`, which became fetchable only
+when the filesystem tables were added to `SIGMA_STREAMS`: the fetch filter
+keeps a rule if its logsource matches a stream, and until then nothing carried
+a `file_event` alias.
 
 ## Licence
 

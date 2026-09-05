@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import zipfile
 
@@ -1404,11 +1405,29 @@ def sigma_rule_wanted(text):
 
 
 def sigma_cache_dir(explicit=None):
-    """Where the fetched ruleset lives - outside any collection, by design."""
+    """Where the fetched ruleset lives - outside any collection, by design.
+
+    Defaults into the running user's own temporary directory, which resolves
+    per user with nothing to configure: tempfile.gettempdir() reads TMPDIR,
+    TEMP and TMP, so every account lands in its own temp - under AppData on
+    Windows, TMPDIR or /tmp on Unix.
+
+    An environment variable cannot express that. A machine-scope LINSIGHT_
+    SIGMA_DIR holding a percent-TEMP-percent reference expands against the
+    system environment, so every user would share the Windows temp directory,
+    which is the opposite of per-user; and a user-scope one has to be set once
+    per account, which is the thing being avoided.
+
+    The trade is that a temporary directory is one the operating system is
+    entitled to empty. Losing the cache costs a re-fetch and nothing else:
+    --sigma-cached refuses with "run --update-sigma once" rather than hunting
+    with an empty ruleset, so a cleared cache is a visible failure and not a
+    quiet one. Set LINSIGHT_SIGMA_DIR to somewhere durable to opt out.
+    """
     path = explicit or os.environ.get("LINSIGHT_SIGMA_DIR")
     if path:
         return os.path.abspath(os.path.expanduser(path))
-    return os.path.join(os.path.expanduser("~"), ".linsight", "sigma")
+    return os.path.join(tempfile.gettempdir(), "linsight", "sigma")
 
 
 def sigma_cache_manifest(dest):
@@ -1608,6 +1627,7 @@ def update_sigma_rules(dest, source=None, keep_all=False, timeout=60, quiet=Fals
     staging = dest.rstrip("/\\") + ".new"
     shutil.rmtree(_win_long(staging), ignore_errors=True)
     kept = seen = 0
+    carried = []
     try:
         for rel, text in _sigma_members(data, source_dir):
             seen += 1
@@ -1642,6 +1662,38 @@ def update_sigma_rules(dest, source=None, keep_all=False, timeout=60, quiet=Fals
         with open(os.path.join(staging, "manifest.json"), "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2, sort_keys=True)
 
+        # Carry across whatever the fetch did not produce.
+        #
+        # The swap below replaces the destination wholesale, which is right for
+        # rule trees - a rule deleted upstream must not linger - and wrong for
+        # everything else in the directory. A vendored snapshot keeps a README
+        # naming the licence its rules are under, and pointing --sigma-dir at
+        # it would delete that notice while keeping the rules it applies to.
+        # Someone who nests their own rules beside the fetched ones loses those
+        # instead. Neither is a thing to discover afterwards.
+        #
+        # So: a top-level entry the fetch did not create is copied into the new
+        # ruleset and survives the swap. Rule trees the fetch *did* create are
+        # still replaced entirely. Each carried entry is named on stderr, so
+        # the one case this reads wrong - a whole tree dropped upstream, which
+        # lingers rather than going - is visible rather than silent.
+        if os.path.isdir(dest):
+            for name in sorted(os.listdir(_win_long(dest))):
+                if name == "manifest.json" or os.path.exists(
+                        _win_long(os.path.join(staging, name))):
+                    continue
+                src = _win_long(os.path.join(dest, name))
+                dst = _win_long(os.path.join(staging, name))
+                try:
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                except OSError as e:
+                    status("[!] sigma: cannot preserve %s: %s" % (name, e))
+                    continue
+                carried.append(name)
+
         # swap: the old ruleset stays readable until the new one is complete
         backup = dest.rstrip("/\\") + ".old"
         shutil.rmtree(_win_long(backup), ignore_errors=True)
@@ -1664,4 +1716,8 @@ def update_sigma_rules(dest, source=None, keep_all=False, timeout=60, quiet=Fals
            % (kept, dest,
               " (of %d in the source; the rest target a platform this tool "
               "builds no table for)" % seen if kept < seen else ""))
+    if carried:
+        status("[*] sigma: kept %d existing entr%s the fetch does not provide: %s"
+               % (len(carried), "y" if len(carried) == 1 else "ies",
+                  ", ".join(carried)))
     return kept
