@@ -1111,6 +1111,19 @@ function egBuild(){
 /* Which declared arrowhead goes with which stroke colour. */
 var EGMK={'var(--edge)':0,'var(--HIGH)':1,'var(--MEDIUM)':2,
           'var(--gold)':3,'var(--edgehot)':4};
+/* An arrowhead means direction, so only the edges that have one carry it.
+   'seen in this collection' is membership - the address is not travelling
+   into the host, it is in the host's rows - and drawing a head on it says
+   something the data does not. Its colour is a node colour rather than an
+   edge token, so it has no marker declared either, and asking for one by
+   name produced url(#egarundefined) on every dashed line. The hover path
+   then recoloured the edge under the pointer to --edgehot, which *is*
+   declared, so membership lines grew an arrowhead when you pointed at them
+   and lost it again when you moved away. */
+function egMark(e,c){
+ return (e.kind==='in'||EGMK[c]===undefined) ? '' :
+        'url(#egar'+EGMK[c]+')';
+}
 /* A line from the edge of one circle to the edge of the next, leaving room
    for the arrowhead. Centre-to-centre buries the head under the target. */
 function egSeg(e){
@@ -1247,7 +1260,7 @@ function viewEntities(){
      '" stroke="'+c+'" stroke-width="'+
      (e.kind==='in'?1:move?2.6:(1.4+3*e.n/maxn)).toFixed(2)+
      (e.kind==='in'?'" stroke-dasharray="4 4':'')+
-     '" marker-end="url(#egar'+EGMK[c]+')"'+
+     '" marker-end="'+egMark(e,c)+'"'+
      ' opacity="'+(e.kind==='in'?'.35':'.9')+'"><title>'+
      esc(e.a.id+' \u2192 '+e.b.id+'  ('+e.n+' row(s), '+
          (e.kind==='move'?'reached after ':'')+e.why+')')+
@@ -1359,7 +1372,7 @@ function egWire(){
     var e=EG.edges[i],c=egEdgeColour(e);
     L.style.opacity=(e.kind==='in')?0.35:0.9;
     L.setAttribute('stroke',c);
-    L.setAttribute('marker-end','url(#egar'+EGMK[c]+')');});
+    L.setAttribute('marker-end',egMark(e,c));});
    return;}
   var keep=neighbours(nd);
   EG.nodes.forEach(function(n2,i){
@@ -1368,7 +1381,7 @@ function egWire(){
    var on=(e.a===nd||e.b===nd),c=on?'var(--edgehot)':egEdgeColour(e);
    lines[i].style.opacity=on?1:0.07;
    lines[i].setAttribute('stroke',c);
-   lines[i].setAttribute('marker-end','url(#egar'+EGMK[c]+')');});
+   lines[i].setAttribute('marker-end',egMark(e,c));});
  }
  function evHtml(title,sub,ev){
   var h='<div class="mkhead"><span class="mkstate">'+esc(title)+
