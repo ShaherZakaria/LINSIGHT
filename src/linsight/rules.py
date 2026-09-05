@@ -898,7 +898,8 @@ class Keywords:
         #   costs one pass over the haystack rather than ten.
         inners, always = [], False
         for v in self.values:
-            inner = _wildcard_re(str(v).lower(), True).pattern[1:-1]
+            low = str(v).lower()
+            inner = _wildcard_re(low, True).pattern[1:-1]
             # same wildcard-stripping as _anchored: an unanchored leading or
             # trailing .* is redundant under search() and is the quadratic
             # backtracking trap
@@ -907,13 +908,45 @@ class Keywords:
             while inner.endswith(".*"):
                 inner = inner[:-2]
             if inner:
-                inners.append(inner)
+                inners.append(self._left_bounded(low, inner))
             else:
                 always = True       # a bare '*' keyword matches any row
         self.always = always
         self.pat = (None if always or not inners else
                     re.compile("|".join("(?:%s)" % i for i in inners)))
 
+
+    # A keyword may not start in the middle of a word.
+    #
+    # Keyword blocks are substring searches over the whole row, and on a
+    # free-text log table that reads a keyword out of the middle of an
+    # unrelated token. The PROVENANCE fix below is one instance of this - 'rm'
+    # found inside 'SIGTERM'. The general case is worse: SigmaHQ's stable
+    # 'Remote File Copy' rule lists the keyword 'scp ', and on a 2016 Ubuntu
+    # build it matched the kernel line 'ACPI: Added _OSI(3.0 _SCP Extensions)'
+    # in every rotation of kern.log, syslog and dmesg - 80-odd rows of a
+    # firmware string reported as file transfer.
+    #
+    # So a keyword whose first character is a word character must not be
+    # preceded by one. Deliberately one-sided: requiring a boundary on the
+    # right as well would stop the keyword 'xmrig' matching 'xmrig_v2', and a
+    # keyword that is the *prefix* of a longer token is usually the hit you
+    # want. A keyword that is the *suffix* of one - the 'rm' of 'SIGTERM', the
+    # 'scp' of '_SCP' - essentially never is.
+    #
+    # This is also closer to what a real Sigma backend does. Elasticsearch and
+    # Splunk resolve a keyword to a full-text match over analysed tokens, not
+    # to a substring scan, and neither would return '_SCP Extensions' for
+    # 'scp'.
+    WORD_CHAR = "0123456789abcdefghijklmnopqrstuvwxyz_"
+
+    @classmethod
+    def _left_bounded(cls, low, inner):
+        """Forbid a word character immediately before a word-initial keyword."""
+        lead = low.lstrip("*")
+        if lead[:1] and lead[0] in cls.WORD_CHAR:
+            return "(?<![%s])%s" % (cls.WORD_CHAR, inner)
+        return inner
 
     # Columns this export adds to say where a row came from. They are not part
     # of the event, and folding them into the keyword haystack invents matches:
@@ -1055,6 +1088,165 @@ class SigmaCondParser:
         raise RuleError("empty condition")
 
 
+#: Modifiers whose values are not plain text in the row, so no literal can be
+#: read out of them for the gate below.
+_GATE_SKIP = frozenset(("re", "base64", "base64offset", "cidr", "expand",
+                        "windash", "utf16", "utf16le", "utf16be", "wide"))
+
+
+def _literal_of(value):
+    """The longest run of ordinary characters in a Sigma value, lowered.
+
+    A value is a literal with '*' and '?' as wildcards, so the longest stretch
+    between them is text that must appear verbatim if the value matches at
+    all. '/etc/cron.d/*' gives '/etc/cron.d/'; a bare '*' gives nothing.
+    """
+    best = ""
+    cur = []
+    i = 0
+    v = str(value).lower()
+    while i < len(v):
+        c = v[i]
+        if c == chr(92) and i + 1 < len(v):
+            cur.append(v[i + 1])
+            i += 2
+            continue
+        if c in "*?":
+            if len("".join(cur)) > len(best):
+                best = "".join(cur)
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if len("".join(cur)) > len(best):
+        best = "".join(cur)
+    return best
+
+
+def _gate_of_matcher(m):
+    """(selectivity, literals) one matcher insists on, or None for nothing.
+
+    A keyword block has no modifiers and searches the whole row, which is
+    exactly what this gate does - so it gates perfectly. A Matcher carries
+    modifiers, some of which mean the value is not plain text in the row at
+    all.
+    """
+    if _GATE_SKIP & set(getattr(m, "mods", ())):
+        return None
+    if getattr(m, "always", False):
+        return None                     # a bare '*' keyword matches anything
+    # The gate reads the whole-row haystack, and that haystack leaves out the
+    # columns this export adds to say where a row came from. A matcher on one
+    # of those - 'path' above all - can be satisfied by text the haystack
+    # never contains, so gating on its literal discards real matches. It cost
+    # the one row that named /tmp/apache-xTRhUVX, which is the payload the
+    # rule exists for.
+    if set(getattr(m, "candidates", ())) & Keywords.PROVENANCE:
+        return None
+    lits = []
+    for v in getattr(m, "values", ()):
+        if v is None:
+            return None                 # 'field: null' asks for an absence
+        lit = _literal_of(v)
+        if len(lit) < 4:                # too common to be worth testing
+            return None
+        lits.append(lit)
+    if not lits:
+        return None
+    if getattr(m, "all", False):
+        # every value must be present, so insisting on the longest one alone
+        # is both sound and the most selective single test available
+        best = max(lits, key=len)
+        return (len(best), [best])
+    return (min(len(x) for x in lits), lits)
+
+
+def _gate_and(a, b):
+    """Both must hold, so the more selective of the two is enough."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a[0] >= b[0] else b
+
+
+def _gate_or(a, b):
+    """Either may fire, so the row must hold something from either side.
+
+    A branch that insists on nothing sinks the whole gate: there would be a
+    way for the rule to match with none of the literals present.
+    """
+    if a is None or b is None:
+        return None
+    return (min(a[0], b[0]), a[1] + b[1])
+
+
+def _gate_of_selection(sel):
+    """A selection is an OR over its groups and an AND inside each one."""
+    out = None
+    for group in sel.groups:
+        best = None
+        for m in group:
+            best = _gate_and(best, _gate_of_matcher(m))
+        if best is None:
+            return None
+        out = best if out is None else _gate_or(out, best)
+    return out
+
+
+def _gate_node(node, sels):
+    """Walk the condition the way eval_sigma does, collecting what it forces."""
+    k = node.kind
+    if k == "sel":
+        sel = sels.get(node.name)
+        return _gate_of_selection(sel) if sel is not None else None
+    if k == "and":
+        return _gate_and(_gate_node(node.a, sels), _gate_node(node.b, sels))
+    if k == "or":
+        return _gate_or(_gate_node(node.a, sels), _gate_node(node.b, sels))
+    if k == "of":
+        if node.n <= 0:                 # '0 of them' is true of every row
+            return None
+        gates = [_gate_of_selection(sels[n]) if n in sels else None
+                 for n in node.names]
+        if node.n >= len(node.names):   # all of them: an AND
+            out = None
+            for g in gates:
+                out = _gate_and(out, g)
+            return out
+        out = None                      # any n of them: an OR
+        for g in gates:
+            if g is None:
+                return None
+            out = g if out is None else _gate_or(out, g)
+        return out
+    return None                         # 'not' forces nothing, nor does the
+                                        # unknown - both mean "no gate"
+
+
+def _gate_for(cond, sels):
+    """One OR-group of literals a row must contain, or None.
+
+    The point is to answer "could this rule possibly match this row" with a
+    handful of str.__contains__ calls instead of a regex per matcher. Python's
+    substring search is C and very fast; the rule engine underneath is not.
+
+    It is a pure skip: when the gate passes, the rule is evaluated exactly as
+    it was, so a match set cannot change. What makes that safe is that every
+    step above weakens rather than strengthens - an AND may keep either side,
+    an OR must keep both, and anything not understood gives up entirely. The
+    result is a necessary condition for the rule, never a sufficient one.
+
+    The first version of this only looked at selections an AND forced, and
+    gave up on 'sel_a or sel_b' and on any selection written as a list of
+    maps. That is how a rule comes to be evaluated against all 1.19M rows of
+    VAR_LOG: 31 of the 44 rules written for this collection are shaped that
+    way, and they cost more than the 334-rule SigmaHQ set put together.
+    """
+    got = _gate_node(cond, sels)
+    return got[1] if got else None
+
+
 def eval_sigma(node, sels, row):
     k = node.kind
     if k == "and":
@@ -1113,6 +1305,10 @@ class SigmaRule:
             self.selections[name] = Selection(spec, alias)
         self.cond = SigmaCondParser(self.condition_src,
                                     list(self.selections)).parse()
+        # A cheap "could this row possibly match" test, worked out once here
+        # rather than per row. None means the rule insists on nothing a
+        # substring search can check, and it is evaluated as before.
+        self.gate = _gate_for(self.cond, self.selections)
 
     def test(self, row):
         return eval_sigma(self.cond, self.selections, row)

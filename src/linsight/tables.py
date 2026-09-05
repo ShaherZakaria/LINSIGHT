@@ -26,6 +26,7 @@ from .common import (
     SENSITIVE_FILE_RE, PRIVATE_KEY_DIR, PUBLIC_CERT_DIR,
     HACKTOOL_VARIANT_OTHER, NDJSON_TIME_COLUMNS, PRIVILEGED_GROUPS,
     PRIV_HINT_RE, TMPFS_DIRS, _printable, _ts_text, _tz_delta, clean_addr,
+    _trie_alt,
     epoch,
     hexip_to_str, human_size, ioc_mitre, ioc_type, match_failed_login,
     norm_ip, norm_log_ts, span_add, split_hostport, variant_add)
@@ -6796,11 +6797,50 @@ class TableBuilder:
     # firing on a request that returned 200 is a breach; the same request
     # returning 404 is a scanner being ignored, and the row read identically.
     SIGMA_SUMMARY_KEYS = {
-        "WEB_LOG": ("status", "method", "resource", "client_ip", "user_agent"),
+        # message last of the leaders but present: on an error row it is
+        # the whole of the evidence - the request body mod_dumpio wrote,
+        # or a CGI process's stderr - and it is the 18th column, so
+        # without naming it here the field cap dropped it every time.
+        "WEB_LOG": ("status", "method", "resource", "client_ip",
+                    "user_agent", "message"),
     }
 
+    @staticmethod
+    def _evidence(text, cap, anchors):
+        """`cap` characters of `text`, centred on what the rule fired on.
+
+        A long log line carries its boilerplate at the front. Apache's
+        mod_dumpio writes seventy characters of client address and hook name
+        before the request body starts, so the head of the line is the same
+        for every row and the interesting part - the command someone posted -
+        is past the cut. Measured on this collection: of the 303 error rows
+        naming a downloader, 94% have it beyond an 80-character head, the
+        median sits at 93 and the worst at 824. Those rows all read
+        'mod_dumpio.c(103): [client ...] mod_dumpio:  dumpio_in (data-HEAP)'
+        and nothing else, which is evidence of nothing.
+
+        The anchors are the rule's own gate literals - the text it insists a
+        row contains - so the window lands on the reason this row is in the
+        table. When none of them is in this particular field, or the field is
+        short enough anyway, the value is returned exactly as before.
+        """
+        if len(text) <= cap:
+            return text
+        low = text.lower()
+        at = -1
+        for a in anchors or ():
+            i = low.find(a)
+            if i >= 0 and (at < 0 or i < at):
+                at = i
+        if at < 0:
+            return trunc(text, cap)
+        start = max(0, at - cap // 4)      # a little context before the match
+        end = start + cap
+        return ("..." if start else "") + text[start:end] + (
+            "..." if end < len(text) else "")
+
     @classmethod
-    def _sigma_summary(cls, tname, d, limit=8):
+    def _sigma_summary(cls, tname, d, limit=8, anchors=()):
         """One matched row as 'key=value; ...' for SIGMA_MATCHES.matched_row.
 
         Fields named for this table lead and are never lost to the cap; the
@@ -6811,7 +6851,12 @@ class TableBuilder:
                 if d.get(k) not in (None, "")]
         rest = [k for k in d if k not in lead]
         keys = (lead + rest)[:max(limit, len(lead))]
-        return "; ".join("%s=%s" % (k, trunc(str(d[k]), 80)) for k in keys)
+        # _s, not str: a datetime rendered with str() carries '+00:00', which
+        # is not how the same value appears in the table this row came from -
+        # so the summary quoted a timestamp that matched nothing when it was
+        # read back to find the row it describes.
+        return "; ".join("%s=%s" % (k, cls._evidence(_s(d[k]), 80, anchors))
+                         for k in keys)
     SIGMA_SERVICE_HINTS = {
         "cron": ("cron", "anacron", "crond"),
         "sshd": ("sshd", "ssh"),
@@ -7262,19 +7307,36 @@ class TableBuilder:
             #   [rule, ts index, service filter, kept samples, hits, stopped,
             #    span]
             #
-            # A table-wide keyword prefilter was tried here and removed: one
-            # alternation over the 49 keyword patterns of a table's gated rules
-            # measured 153us per row against 101us for running those 49
-            # searches separately, for identical results. Python's engine
-            # optimises a small pattern with a literal prefix and cannot do
-            # that for a 10KB alternation full of .* branches, so combining
-            # them past a handful inverts the win. Alternation helps for many
-            # short literals (the hacktool sweep); it hurts here.
+            # A table-wide prefilter was tried here once and removed, over the
+            # rules' keyword *patterns* - a 10KB alternation full of '.*'
+            # branches, which measured slower than running the searches
+            # separately. What is built below is a different thing and wins:
+            # an alternation over the gate *literals*, which are plain text
+            # with no wildcards left in them, factored into a trie so a shared
+            # prefix is walked once. It answers "could any gated rule match
+            # this row" in one C call, where the loop underneath asks the same
+            # question once per rule in Python - and on this collection 71% of
+            # rows contain no gate literal at all, so that one call replaces
+            # 233 of them. Measured 310us -> 105us per row, identical
+            # survivors. The rows it does not settle fall through to exactly
+            # the loop that was there before, so a match cannot be lost: the
+            # scan only ever skips rows where no gated rule had a literal to
+            # find.
             prepared = [[rule, cols.index(ts_col) if ts_col in cols else -1,
                          (self._service_filter(rule.service or rule.category)
                           if tname in self.SIGMA_MIXED_STREAMS else None),
-                         [], 0, False, ["", ""]]
+                         [], 0, False, ["", ""], getattr(rule, "gate", None)]
                         for rule, ts_col in entries]
+            gated = [e for e in prepared if e[7]]
+            plain = [e for e in prepared if not e[7]]
+            # Only where it pays for itself: building and compiling the pattern
+            # costs tens of milliseconds, which a forty-row table would never
+            # earn back.
+            pre = None
+            if len(gated) >= 8 and len(tb) >= 5000:
+                pre = re.compile(_trie_alt(sorted({l for e in gated
+                                                   for l in e[7]})))
+            stopped_n = 0
             for rn, row in enumerate(tb.iter_rows()):
                 if not rn & 0x3FFF:            # every 16k rows, not every row
                     sig_prog.step("%s (%d rule%s)"
@@ -7283,14 +7345,30 @@ class TableBuilder:
                                   n=seen_rows + rn)
                 d = Row((cols[i], row[i]) for i in range(min(ncol, len(row)))
                         if row[i] not in (None, ""))
-                live = False
-                for e in prepared:
+                # Nothing a gated rule insists on is anywhere in this row,
+                # so only the ungated ones are worth walking.
+                batch = prepared
+                if pre is not None and pre.search(d.hay_lower()) is None:
+                    batch = plain
+                for e in batch:
                     if e[5]:
                         continue
-                    live = True
                     rule, ts_i, keep = e[0], e[1], e[2]
                     if keep is not None and not keep(d):
                         continue
+                    # The literal gate: one or two str.__contains__ calls
+                    # against the row's own text, answering "could this rule
+                    # match at all" before a single regex is compiled into
+                    # action. A rule whose required literal is absent cannot
+                    # match, so skipping it changes nothing but the clock.
+                    gate = e[7]
+                    if gate:
+                        hay = d.hay_lower()
+                        for lit in gate:
+                            if lit in hay:
+                                break
+                        else:
+                            continue
                     if not rule.test(d):
                         continue
                     e[4] += 1
@@ -7303,13 +7381,14 @@ class TableBuilder:
                     span_add(e[6], _ts_text(when))
                     if e[4] > 200:          # one noisy rule cannot flood
                         e[5] = True
+                        stopped_n += 1
                         continue
-                    summary = self._sigma_summary(tname, d)
+                    summary = self._sigma_summary(tname, d, anchors=gate)
                     e[3].append((when, summary))
-                if not live:                # every rule here has had its fill
+                if stopped_n >= len(prepared):   # all of them have had their fill
                     break
             seen_rows += len(tb)
-            for rule, _ts_i, _keep, kept, hits, stopped, span in prepared:
+            for rule, _ts_i, _keep, kept, hits, stopped, span, _gate in prepared:
                 for when, summary in kept:
                     t.add(rule.title, rule.severity, rule.level, tname,
                           hits, span[0], span[1], when,
