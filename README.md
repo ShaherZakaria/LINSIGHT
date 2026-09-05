@@ -218,9 +218,16 @@ python linsight.py web01.tar db02.dd app03.dd --export ./case --correlate
 
 | table | |
 |---|---|
+| `CROSS_SESSIONS` | **one of these machines signed in to another** — resolved against the interface list each host reported, not guessed from a name. A successful path is `CRITICAL`, a failed-only path `HIGH`, and a login from an address outside the case is not reported at all |
+| `CROSS_PATHS` | two of those sign-ins that chain — `web01 -> db02 -> app03` inside a day, drawn as one route rather than two rows. `reached` only where every hop succeeded |
+| `CROSS_COMMANDS` | a command on one machine that names and can reach another — `ssh`, `scp`, `rsync`, `ansible`. The half of movement that survives when the destination's logs do not |
+| `CROSS_TRANSFERS` | the same bytes on two hosts **with a direction**: the earlier creation time names the source, and `basis` says whether that rests on `crtime` — written by the filesystem that received the file — or on `mtime`, which travels with a copy |
 | `CROSS_IOCS` | indicators each run extracted independently, joined on the value — with which host saw it **first**, which saw it last, and the spread between them |
+| `CROSS_WEB_CLIENTS` | one address in the access logs of several hosts, with how many of its requests were answered rather than refused |
+| `CROSS_WEB_REQUESTS` | the same resource asked for on several hosts — a pattern even when every request came from a different address, which is what a distributed scan looks like |
 | `CROSS_HASHES` | files that are byte-identical across hosts, marked `notable` when a copy sits somewhere a package would not put it, and `same_path` when it did not move |
 | `CROSS_KEYS` | one public key trusted by several hosts, joined on the key material rather than the comment after it — whoever holds the private half reaches every host listed |
+| `CROSS_PRIVILEGE` | a sudoers rule, or a name in a privileged group, present on more than one host — shared privilege is shared reach, and `nopasswd` marks the grants that need no credential at all |
 | `CROSS_ACCOUNTS` | one username on several hosts, with `consistent` saying whether uid, shell and home agree everywhere. Distribution accounts are excluded; a second uid‑0 account is not |
 | `CROSS_PERSISTENCE` | a cron command, a systemd `ExecStart` or an `ld.so.preload` entry present on several hosts |
 | `CROSS_FINDINGS` | the same check firing on several hosts, grouped by title with its counts masked so `3 executable file(s)` and `7 executable file(s)` are one row |

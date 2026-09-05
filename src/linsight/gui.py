@@ -557,9 +557,10 @@ var HT='HACKTOOL_HITS';
 /* The cross-host tables, strongest claim first. A shared indicator or a shared
    key says these collections are one incident; a shared technique says they
    were worked the same way, which is weaker and much more often innocent. */
-var CROSS=['CROSS_SESSIONS','CROSS_COMMANDS','CROSS_IOCS','CROSS_HASHES',
-           'CROSS_KEYS','CROSS_ACCOUNTS','CROSS_PERSISTENCE','CROSS_FINDINGS',
-           'CROSS_TECHNIQUES','HOSTS'];
+var CROSS=['CROSS_SESSIONS','CROSS_PATHS','CROSS_COMMANDS','CROSS_TRANSFERS',
+           'CROSS_IOCS','CROSS_WEB_CLIENTS','CROSS_WEB_REQUESTS','CROSS_HASHES',
+           'CROSS_KEYS','CROSS_PRIVILEGE','CROSS_ACCOUNTS','CROSS_PERSISTENCE',
+           'CROSS_FINDINGS','CROSS_TECHNIQUES','HOSTS'];
 function crossTables(){
  return CROSS.filter(function(n){return TB[n]&&TB[n].row_count;});
 }
@@ -2786,14 +2787,24 @@ function viewCorrelation(){
  }
  h+=crossPanel('CROSS_SESSIONS',
    ['timestamp_utc','from_collection','to_collection','user','result','service']);
+ h+=crossPanel('CROSS_PATHS',
+   ['path','first_utc','last_utc','elapsed','users','result']);
  h+=crossPanel('CROSS_COMMANDS',
    ['timestamp_utc','from_collection','to_collection','user','matched','command']);
+ h+=crossPanel('CROSS_TRANSFERS',
+   ['from_collection','to_collection','gap','basis','to_path','first_utc']);
  h+=crossPanel('CROSS_IOCS',
    ['indicator','type','host_count','hosts','first_host','first_utc','spread']);
+ h+=crossPanel('CROSS_WEB_CLIENTS',
+   ['client','host_count','hosts','requests','answered','first_utc','spread']);
+ h+=crossPanel('CROSS_WEB_REQUESTS',
+   ['method','resource','host_count','hosts','requests','answered','status_codes']);
  h+=crossPanel('CROSS_KEYS',
    ['key_type','fingerprint_head','host_count','hosts']);
  h+=crossPanel('CROSS_HASHES',
    ['digest','host_count','hosts','notable','same_path','paths']);
+ h+=crossPanel('CROSS_PRIVILEGE',
+   ['kind','grant','host_count','hosts','notable','nopasswd']);
  h+=crossPanel('CROSS_ACCOUNTS',
    ['username','uid','host_count','hosts','consistent','shells']);
  h+=crossPanel('CROSS_PERSISTENCE',['kind','value','host_count','hosts']);
