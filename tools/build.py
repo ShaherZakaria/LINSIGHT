@@ -61,8 +61,13 @@ MODULES = [
     ("triage",    "the triage engine"),
     ("tables",    "artifact tables - every artifact as a browsable grid"),
     ("gui",       "the GUI: one self-contained page carrying the triage picture"),
+    ("mcp",       "an MCP server over a finished case"),
+    ("skills",    "playbooks: the moves an examiner makes, for a model"),
+    ("ask",       "a local model, given the case and told to look"),
+    ("serve",     "the investigation server: the console plus a case file"),
     ("writers",   "table writers: CSV, JSON, HTML browser"),
     ("report",    "reporting"),
+    ("correlate", "cross-host correlation: several collections at once"),
     ("cli",       "the command line"),
 ]
 
@@ -251,6 +256,65 @@ def main(argv=None):
         with io.open(opts.output, encoding="utf-8") as fh:
             old = fh.read()
     rel = os.path.relpath(opts.output, ROOT)
+    # Two different ways a backslash in embedded JavaScript goes wrong, and
+    # only one of them is noisy.
+    #
+    #   \d, \s, \w  - not Python escapes. A SyntaxWarning today, an error in
+    #                 some future Python. The compile() below catches these.
+    #
+    #   \n, \b, \t  - *valid* Python escapes, which is worse. Python turns
+    #                 them into the control character before JavaScript ever
+    #                 sees them, so /\n/g becomes a regex containing a real
+    #                 newline and 'a\nb' becomes a string literal broken over
+    #                 two lines. No warning, and the page dies at parse time
+    #                 with something unrelated-looking like "Invalid regular
+    #                 expression: missing /".
+    #
+    # The second kind is invisible to compile(), so the embedded blocks are
+    # read as source and every backslash in them is looked at. Write the
+    # character class ([0-9] not \d), or String.fromCharCode(10) for a
+    # newline, and neither problem exists.
+    import re as _re
+    _BS = chr(92)
+    for _blk in ("APP_CSS", "APP_JS"):
+        _src = open(os.path.join(PKG, "gui.py"), encoding="utf-8").read()
+        _i = _src.find(_blk + ' = """')
+        if _i < 0:
+            continue
+        _i += len(_blk) + 6
+        _j = _src.find('"""', _i)
+        _body = _src[_i:_j]
+        _bad = [(_body[:m.start()].count("\n") + 1, m.group(0))
+                for m in _re.finditer(_re.escape(_BS) + r"(.)", _body)
+                if m.group(1) not in ("u", _BS)]
+        if _bad:
+            print("[!] build: %d backslash escape(s) inside %s that Python "
+                  "will consume before JavaScript sees them:" % (len(_bad), _blk),
+                  file=sys.stderr)
+            for _ln, _esc in _bad[:8]:
+                print("      line %d of the block: %r" % (_ln, _esc),
+                      file=sys.stderr)
+            print("    use a character class, or String.fromCharCode(N)",
+                  file=sys.stderr)
+            return 1
+
+    # The embedded CSS and JS live inside ordinary Python strings, so a
+    # JavaScript regex such as a backslash-d is an invalid Python escape. It
+    # still does the right thing today, stops doing it in a future Python, and
+    # says nothing in between - four of them reached this file before anything
+    # looked. Refusing to write is the only point at which it is cheap to fix.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SyntaxWarning)
+        try:
+            compile(text, "linsight.py", "exec")
+        except (SyntaxWarning, SyntaxError) as exc:
+            print("[!] build: %s" % exc, file=sys.stderr)
+            print("    an escape inside an embedded CSS/JS string - write it "
+                  "as a character\n    class ([0-9] for a digit), or double "
+                  "the backslash", file=sys.stderr)
+            return 1
+
     if opts.check:
         if old != text:
             print("[!] %s is out of date - run 'python tools/build.py'" % rel,
