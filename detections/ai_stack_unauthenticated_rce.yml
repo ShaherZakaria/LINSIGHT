@@ -1,0 +1,64 @@
+title: Unauthenticated RCE against a self-hosted AI orchestration service
+id: e28de7f8-4037-4634-b84b-af06d63ca364
+status: experimental
+description: |
+  The endpoints of the AI-stack services that ship listening on 0.0.0.0 with
+  no authentication and evaluate user-supplied Python.
+    - Langflow CVE-2025-3248 and CVE-2026-9198 - '/api/v1/validate/code'
+      compiles and exec()s the posted code; the 2026 chain reaches it by first
+      calling '/api/v1/auto_login', which mints a SUPERUSER token for any
+      caller. CISA added CVE-2026-9198 to KEV on 4 August 2026; exploitation
+      was observed from 6 July, eleven days before disclosure.
+    - Ray - the dashboard's job-submission API runs an arbitrary entrypoint on
+      the cluster, and is unauthenticated by design.
+  These belong in a Linux web-log ruleset because that is where they run, and
+  because the service itself usually logs nothing useful: a reverse proxy in
+  front of Langflow may hold the only record of the request.
+  Not derived from evidence on the hosts in this repository - written from the
+  published advisories and negative-tested against 511 K web-log rows, where
+  it matches nothing.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2025-3248
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+  - https://github.com/langflow-ai/langflow/security/advisories/GHSA-vwmf-pq79-vjvx
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  langflow:
+    resource|contains:
+      - '/api/v1/validate/code'
+      - '/api/v1/auto_login'
+  ray:
+    resource|contains:
+      - '/api/jobs/'
+      - '/api/job_agent/'
+      - '/worker/'
+  ray_dashboard:
+    resource|contains:
+      - '/api/version'
+      - '/nodes'
+      - '/api/cluster_status'
+  condition: langflow or (ray and ray_dashboard)
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - size
+  - user_agent
+falsepositives:
+  - A host that genuinely runs Langflow will call '/api/v1/auto_login' from
+    its own front end on every page load, so on such a host read client_ip
+    first - the finding is the call arriving from outside. The
+    '/api/v1/validate/code' half has no benign remote caller.
+  - The Ray selection is deliberately two-part because '/api/jobs/' is a
+    common path in unrelated applications.
+level: critical
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - attack.execution
+  - attack.t1059.006

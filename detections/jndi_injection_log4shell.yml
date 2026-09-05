@@ -1,0 +1,86 @@
+title: JNDI lookup injected into a web request (Log4Shell)
+id: a4adbd5f-d090-49d0-8526-75237f1c753d
+status: experimental
+description: |
+  A '${jndi:...}' expression anywhere a Java application might log it - the
+  URI, the User-Agent, the Referer, or a request body captured by the error
+  log. Where the receiving application logs the string through a vulnerable
+  log4j2, the lookup resolves and the JNDI provider fetches and instantiates a
+  remote class.
+  The obfuscated forms are here because they are the common case, not the
+  exception: '${${::-j}${::-n}${::-d}${::-i}:', '${lower:j}', and the
+  percent-encoded '%24%7Bjndi' all reach the same parser, and a rule that
+  matches only the literal string misses most real traffic.
+  Not derived from evidence on the hosts in this repository - written from the
+  published advisories and negative-tested against 511 K web-log rows, where
+  it matches nothing.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-44228
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-45046
+  - https://en.wikipedia.org/wiki/Log4Shell
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  jndi:
+    resource|contains:
+      - '${jndi:'
+      - '%24%7Bjndi'
+      - '%24%7bjndi'
+      - '${jndi'
+      - '${lower:j'
+      - '${upper:j'
+      - '${::-j}'
+      - '${env:'
+      - '${sys:'
+      - '${date:'
+      - 'jndi:ldap:'
+      - 'jndi:rmi:'
+      - 'jndi:dns:'
+      - 'jndi:iiop:'
+      - 'jndi:corba:'
+      - 'jndi:nis:'
+  jndi_header:
+    user_agent|contains:
+      - '${jndi'
+      - '${lower:j'
+      - '${::-j}'
+      - 'jndi:ldap:'
+      - 'jndi:rmi:'
+      - 'jndi:dns:'
+  jndi_referer:
+    referer|contains:
+      - '${jndi'
+      - 'jndi:ldap:'
+      - 'jndi:rmi:'
+  jndi_body:
+    message|contains:
+      - '${jndi'
+      - '%24%7Bjndi'
+      - 'jndi:ldap:'
+      - 'jndi:rmi:'
+      - 'jndi:dns:'
+  condition: 1 of jndi*
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - user_agent
+  - referer
+falsepositives:
+  - Vulnerability scanners and bug-bounty testers send these deliberately. The
+    string in the log proves the attempt reached the server, not that anything
+    resolved it - correlate with outbound LDAP/RMI from the host to say
+    whether it worked.
+  - The ${env:} and ${sys:} lookups are ordinary log4j2 syntax and appear in
+    this rule only because they are the obfuscation prefix; expect them to be
+    the noisiest entries if this host puts its own templates into a URL.
+level: critical
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - attack.execution
+  - attack.t1059

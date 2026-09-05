@@ -1,0 +1,58 @@
+title: Web request with a command parameter that returned 2xx
+id: 7472c999-871c-418e-ac57-6e5bf716fbdb
+status: experimental
+description: |
+  A request carrying 'cmd=', 'exec=', 'command=' or 'shell=' that the server
+  answered with 2xx. Where that parameter is the interface of a web shell -
+  or of a script that passes it to system() - the response body is the
+  command's output, and the row is one execution as the web server's user.
+  The status is the whole rule. These parameter names appear in scanner
+  wordlists constantly and answer 404 every time; the one that answers 200 is
+  the one where the file exists.
+  On the host this was written against there is exactly one, and its shape
+  says everything: 'GET /jabc/scripts/update.php' 200 at 11:17:48, then
+  'GET /jabc/scripts/update.php?cmd=ls' 200 six seconds later, same client -
+  a web shell being found and then used.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  command_param:
+    resource|contains:
+      - '\?cmd='
+      - '&cmd='
+      - '\?exec='
+      - '&exec='
+      - '\?command='
+      - '&command='
+      - '\?shell='
+      - '&shell='
+      - '\?execute='
+      - '\?system='
+      - '\?passthru='
+      - '\?run='
+      - '\?whoami'
+  answered:
+    status|startswith: '2'
+  condition: command_param and answered
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - size
+  - user_agent
+falsepositives:
+  - Administrative and monitoring interfaces that legitimately take a 'cmd'
+    parameter - some appliance UIs and older PHP admin panels do. Check
+    whether the client_ip is an administrator's, and whether the same address
+    requested the bare path first, which is what finding a shell looks like
+    and what using an admin panel does not.
+level: critical
+tags:
+  - attack.execution
+  - attack.t1059.004
+  - attack.persistence
+  - attack.t1505.003

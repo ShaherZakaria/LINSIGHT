@@ -1,0 +1,88 @@
+title: Daemon account carrying an interactive login shell
+id: 7ed4f711-7d1d-401a-97fb-ea78507b7647
+status: experimental
+description: |
+  An account that exists to run a service, with a real shell in /etc/passwd
+  and the ability to log in. Distributions ship these accounts with
+  /usr/sbin/nologin precisely so that a credential for one is worth nothing;
+  changing the shell is a deliberate act, and on a compromised host it is
+  usually the persistence.
+  On VulnOSv2 the row is 'mail', uid 8, /bin/bash, in the sudo group - the
+  account the intruder brute-forced over SSH and then used to reach root. The
+  same host also has 'php', uid 999, created during the intrusion; it is not
+  named here because the list below is the standard daemon accounts, and an
+  attacker-chosen name will not be on any list. That one is caught from the
+  auth log instead, by system_account_created_with_shell_and_sudo - the two
+  rules exist because either half of the evidence may be all that survives.
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: user_account
+detection:
+  daemon_account:
+    username:
+      - 'daemon'
+      - 'bin'
+      - 'sys'
+      - 'sync'
+      - 'games'
+      - 'man'
+      - 'lp'
+      - 'mail'
+      - 'news'
+      - 'uucp'
+      - 'proxy'
+      - 'www-data'
+      - 'apache'
+      - 'httpd'
+      - 'nginx'
+      - 'backup'
+      - 'list'
+      - 'irc'
+      - 'gnats'
+      - 'nobody'
+      - 'ftp'
+      - 'postfix'
+      - 'sshd'
+      - 'syslog'
+      - 'messagebus'
+      - 'uuidd'
+      - 'tss'
+      - 'landscape'
+      - 'pollinate'
+      - 'memcache'
+      - 'memcached'
+      - 'rabbitmq'
+      - 'zabbix'
+      - 'nagios'
+  interactive_shell:
+    shell|endswith:
+      - '/bash'
+      - '/sh'
+      - '/zsh'
+      - '/dash'
+      - '/ksh'
+      - '/csh'
+      - '/tcsh'
+      - '/fish'
+  condition: daemon_account and interactive_shell
+fields:
+  - username
+  - uid
+  - shell
+  - home
+  - login_capable
+  - privileged_groups
+  - authorized_keys
+  - last_login_utc
+falsepositives:
+  - postgres and mysql are deliberately absent from the account list - both
+    ship with a shell on many distributions and are su'd to by hand routinely.
+  - Some appliances give a service account a shell for support access. Read
+    login_capable and password_status alongside this - an account with a shell
+    and no usable credential is a smaller problem than one with both.
+level: high
+tags:
+  - attack.persistence
+  - attack.t1078.003

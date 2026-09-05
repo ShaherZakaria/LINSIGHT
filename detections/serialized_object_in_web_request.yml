@@ -1,0 +1,78 @@
+title: Serialized object payload carried in a web request
+id: 83a22ec3-e8e8-47dc-83a6-1936d66152fa
+status: experimental
+description: |
+  A serialized object where a web request should hold a value. Serialized data
+  arriving from a client is only ever dangerous in one direction: something on
+  the server calls readObject(), unserialize() or pickle.loads() on it, and a
+  gadget chain in the application's own classpath turns that into execution.
+  The markers are the format headers, not any particular gadget:
+    - 'rO0AB' is base64 for the Java serialization magic AC ED 00 05; 'aced0005'
+      is the same bytes hex-encoded.
+    - 'H4sIA' is a gzip header in base64, which is how the Java payload is
+      usually wrapped to get under a size limit.
+    - 'O:8:' and 'a:2:{' are PHP serialization; '__PHP_Incomplete_Class' is
+      what a failed one leaves behind.
+    - '\x80\x04\x95' base64-encodes to 'gASV', the Python pickle protocol-4
+      opening.
+  CISA's August 2026 KEV entry for Apache Tomcat records exactly this shape -
+  Java deserialization reverse shells posted at vulnerable servers.
+  Not derived from evidence on the hosts in this repository - written from the
+  format specifications and negative-tested against 511 K web-log rows, where
+  it matches nothing.
+references:
+  - https://attack.mitre.org/techniques/T1190/
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  java_serialized:
+    resource|contains:
+      - 'rO0AB'
+      - 'rO0ABX'
+      - '%72%4f%30%41%42'
+      - 'aced0005'
+      - 'AC%ED%00%05'
+  python_pickle:
+    resource|contains:
+      - 'gASV'
+      - 'gAJ9'
+      - 'Y3Bvc2l4CnN5c3RlbQ'
+  php_serialized:
+    resource|contains:
+      - '__PHP_Incomplete_Class'
+      - 'O:8:"stdClass"'
+      - 'phar://'
+      - 'TzoyMjoi'
+  body:
+    message|contains:
+      - 'rO0AB'
+      - 'aced0005'
+      - 'gASV'
+      - 'Y3Bvc2l4CnN5c3RlbQ'
+      - '__PHP_Incomplete_Class'
+      - 'phar://'
+  condition: 1 of them
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - size
+  - user_agent
+falsepositives:
+  - Java applications that legitimately round-trip a serialized token through
+    the client - some older JSF and Struts applications put a serialized view
+    state in the URL, and those will match 'rO0AB' on every request. On such a
+    host this rule is noise and should be dropped rather than tuned; on every
+    other host it has no benign form.
+  - The phar:// marker is included because it is the PHP deserialization
+    trigger rather than a payload, and will match a scanner probing for it.
+level: high
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - attack.execution

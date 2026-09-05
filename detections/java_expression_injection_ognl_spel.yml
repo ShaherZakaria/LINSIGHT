@@ -1,0 +1,89 @@
+title: OGNL / SpEL / classloader expression injected into a web request
+id: 83dd0bd4-46c2-4aa7-b400-73061109d557
+status: experimental
+description: |
+  Java expression-language injection: OGNL against Struts and Confluence, SpEL
+  and the Tomcat classloader binding against Spring, reached through a URI,
+  a query parameter or a captured request body.
+  Three families, one shape - the request carries a program rather than a
+  value:
+    - Confluence CVE-2021-26084 puts OGNL in 'queryString' on
+      /pages/createpage-entervariables.action; CVE-2022-26134 puts it in the
+      URI path itself as '/${(#a=...)}/'.
+    - Spring4Shell CVE-2022-22965 walks 'class.module.classLoader' to
+      repoint Tomcat's access-log valve at a JSP it then writes.
+    - Struts OGNL reaches Runtime.getRuntime().exec through
+      '@java.lang.Runtime@' or a '%{(#...)}' expression.
+  Not derived from evidence on the hosts in this repository - written from the
+  published advisories and negative-tested against 511 K web-log rows, where
+  it matches nothing. Note that the vendored SigmaHQ "Server Side Template
+  Injection Strings" rule fires four times on that same evidence, every one of
+  them Apache's own '${DOC}' placeholder in an error line; the patterns here
+  require the expression body, not a bare '${'.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-26084
+  - https://nvd.nist.gov/vuln/detail/CVE-2022-26134
+  - https://nvd.nist.gov/vuln/detail/CVE-2022-22965
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-50164
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  category: webserver
+detection:
+  classloader:
+    resource|contains:
+      - 'class.module.classLoader'
+      - 'class.classLoader'
+      - 'classLoader.resources.context.parent.pipeline'
+      - 'Class.module.classLoader'
+  ognl_expression:
+    resource|contains:
+      - '${(#'
+      - '%24%7B%28%23'
+      - '%{(#'
+      - '%25%7B%28%23'
+      - '@java.lang.Runtime@'
+      - '%40java.lang.Runtime%40'
+      - 'java.lang.ProcessBuilder'
+      - 'ognl.OgnlContext'
+      - '#context['
+      - '#_memberAccess'
+      - 'getRuntime().exec'
+      - 'getruntime%28%29.exec'
+  confluence_endpoint:
+    resource|contains:
+      - 'createpage-entervariables.action'
+      - '/pages/doenterpagevariables.action'
+      - '/pages/createpage.action'
+  confluence_param:
+    resource|contains:
+      - 'queryString='
+      - 'linkCreation='
+  body:
+    message|contains:
+      - 'class.module.classLoader'
+      - '${(#'
+      - '%{(#'
+      - '@java.lang.Runtime@'
+      - '#_memberAccess'
+      - 'ognl.OgnlContext'
+  condition: classloader or ognl_expression or (confluence_endpoint and confluence_param) or body
+fields:
+  - client_ip
+  - method
+  - resource
+  - status
+  - user_agent
+falsepositives:
+  - A Confluence instance genuinely creating pages will request
+    createpage-entervariables.action with a queryString parameter. The
+    selection is deliberately two-part rather than endpoint-only for that
+    reason, but a busy wiki will still produce some - read the parameter
+    value, which for an exploit is an expression and not a search term.
+level: high
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - attack.execution
+  - attack.t1059

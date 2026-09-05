@@ -1,0 +1,92 @@
+title: Container escape to the host
+id: 730b8328-49cf-42f3-8781-1eb390b3be95
+status: experimental
+description: |
+  The handful of moves that turn code inside a container into code on the
+  host. Each is a one-liner, and none of them has an innocent form inside a
+  workload container.
+    - The Docker socket. Anything that can talk to /var/run/docker.sock can
+      start a privileged container with the host root filesystem mounted,
+      which is root on the host. This is the most common escape by a wide
+      margin, because the socket gets mounted into CI and monitoring
+      containers on purpose.
+    - 'nsenter -t 1 -m -u -i -n -p' - entering PID 1's namespaces, which from
+      a privileged container is simply a host shell.
+    - The cgroup v1 release_agent, written from inside a container with
+      CAP_SYS_ADMIN, which the kernel then runs on the host.
+    - '/proc/self/exe' - the runc CVE-2019-5736 overwrite, where the container
+      rewrites the host's runc binary through its own procfs entry.
+    - 'chroot /host' and mounting the host device, the endgame of every
+      privileged-container escape.
+  Not derived from evidence on the hosts in this repository - neither ran
+  containers. Written from the published techniques.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2019-5736
+  - https://attack.mitre.org/techniques/T1611/
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  docker_socket:
+    cmdline|contains:
+      - '/var/run/docker.sock'
+      - '/run/docker.sock'
+      - 'docker.sock:/var/run/docker.sock'
+      - 'unix:///var/run/docker.sock'
+  nsenter_pid1:
+    cmdline|contains:
+      - 'nsenter -t 1'
+      - 'nsenter --target 1'
+      - 'nsenter -t1'
+  release_agent:
+    cmdline|contains:
+      - 'release_agent'
+      - 'notify_on_release'
+      - 'rdma/release_agent'
+  runc_self_exe:
+    cmdline|contains:
+      - '/proc/self/exe'
+      - '/proc/1/root'
+      - '/proc/1/cwd'
+  privileged_run:
+    cmdline|contains:
+      - 'docker run --privileged'
+      - 'docker run -v /:/'
+      - 'docker run --pid=host'
+      - 'docker run --net=host -v'
+      - 'ctr run --privileged'
+      - 'crictl exec'
+  host_chroot:
+    cmdline|contains:
+      - 'chroot /host'
+      - 'chroot /mnt/host'
+      - 'mount /dev/sda1 /mnt'
+      - 'mount /dev/vda1 /mnt'
+  raw:
+    message|contains:
+      - '/var/run/docker.sock'
+      - 'a0="nsenter" a1="-t" a2="1"'
+      - 'release_agent'
+      - '/proc/self/exe'
+      - 'a0="chroot" a1="/host"'
+  condition: 1 of them
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+  - message
+falsepositives:
+  - Docker-in-Docker CI runners, and monitoring agents such as cAdvisor and
+    Datadog, mount the socket by design and will match the docker_socket
+    selection continuously. On a host that does that, the finding is the
+    process that touched it, not the fact that it was touched.
+  - The /proc/self/exe marker appears in some legitimate self-relaunching
+    daemons and in Go's own process handling.
+level: critical
+tags:
+  - attack.privilege_escalation
+  - attack.t1611
+  - attack.lateral_movement

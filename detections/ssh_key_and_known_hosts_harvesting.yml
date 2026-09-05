@@ -1,0 +1,76 @@
+title: SSH private keys and known_hosts read together - worm lateral movement
+id: 41bff78f-db29-4e4a-a204-526dec72f976
+status: experimental
+description: |
+  Reading a user's SSH private keys and the list of hosts they have connected
+  to, in the same breath. That pairing is what an SSH worm does before it
+  spreads: known_hosts (or .ssh/config, or the shell history) names the next
+  targets, and id_rsa is the credential that reaches them without a password.
+  SSH-Snake automates exactly this and nothing else. RedTail's 2026 variant
+  added it. Every Linux worm that moves without an exploit moves this way,
+  because on a fleet of servers the keys are already trusted in both
+  directions.
+  The rule wants the two halves together. Reading id_rsa alone is what ssh
+  itself does on every connection; reading known_hosts alone is ordinary. A
+  command line naming both, or a loop over known_hosts feeding ssh, is not.
+  Not derived from evidence on the hosts in this repository - written from the
+  technique.
+references:
+  - https://attack.mitre.org/techniques/T1552/004/
+  - https://attack.mitre.org/techniques/T1021/004/
+author: linsight
+date: 2026-08-26
+logsource:
+  product: linux
+  service: journald
+detection:
+  keys:
+    cmdline|contains:
+      - 'id_rsa'
+      - 'id_ed25519'
+      - 'id_ecdsa'
+      - 'id_dsa'
+      - '.ssh/identity'
+      - 'authorized_keys'
+  targets:
+    cmdline|contains:
+      - 'known_hosts'
+      - '.ssh/config'
+      - '/etc/hosts'
+      - 'bash_history'
+  harvest_loop:
+    cmdline|contains:
+      - 'cat ~/.ssh/known_hosts'
+      - 'cat /root/.ssh/known_hosts'
+      - 'grep -oE "[0-9]{1,3}\.[0-9]{1,3}" known_hosts'
+      - 'awk "{print $1}" known_hosts'
+      - 'for i in $(cat known_hosts'
+  named_tools:
+    cmdline|contains:
+      - 'ssh-snake'
+      - 'Snake.sh'
+      - 'sshpass -p'
+      - 'sshpass -f'
+  raw_pair:
+    message|contains:
+      - 'known_hosts" a'
+      - 'a1="known_hosts"'
+      - 'name="/root/.ssh/id_rsa"'
+  condition: (keys and targets) or harvest_loop or named_tools
+fields:
+  - timestamp_utc
+  - uid
+  - comm
+  - cmdline
+falsepositives:
+  - Configuration management - Ansible, Salt, cloud-init - touches both halves
+    routinely, and ssh-copy-id names authorized_keys and known_hosts in one
+    run. Read the account it ran as - a deployment tool runs as an operator or
+    a dedicated CI account, a worm runs as the account the web server uses.
+  - Backup scripts that archive a home directory will name the key files.
+level: high
+tags:
+  - attack.credential_access
+  - attack.t1552.004
+  - attack.lateral_movement
+  - attack.t1021.004
