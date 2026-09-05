@@ -823,10 +823,46 @@ class TableBuilder:
                           m.group(6).strip(), rel)
 
     def t_proc_environ(self):
-        t = self.table("PROC_ENVIRON", "Process environment variables",
+        """One row per process, and one per variable beside it.
+
+        PROC_ENVIRON is what an examiner opens, so it holds what an
+        examiner wants to read: a process and its whole environment, on
+        one line. Forty rows that have to be gathered back together by
+        eye before they mean anything is a table asking its reader to do
+        the work it exists to do.
+        The per-variable form is still built, because a search for a
+        tool name wants the value on its own rather than buried in a
+        line of them - that is what the hacktool sweep reads, and it is
+        pointed at PROC_ENVIRON_VARIABLES rather than here.
+        """
+        t = self.table("PROC_ENVIRON",
+                       "Process environments, one row per process",
+                       ["pid", "process", "user", "container", "variables",
+                        "ld_preload", "ld_library_path", "path", "pwd", "home",
+                        "shell", "environment", "source"], "Process",
+                       "/proc/<pid>/environ - LD_PRELOAD and friends "
+                       "live here. variables counts them; environment "
+                       "is every one of them in the order the file "
+                       "recorded, which is the order the kernel holds "
+                       "them, so a variable appended after the process "
+                       "started sits at the end. The variables worth reading "
+                       "on their own get their own column - LD_PRELOAD and "
+                       "LD_LIBRARY_PATH because they are how a library is "
+                       "forced into a process, PATH because a writable "
+                       "directory early in it is how a command is hijacked - "
+                       "and environment still holds all of them, in order, so "
+                       "nothing is only in a column. PROC_ENVIRON_VARIABLES "
+                       "carries the same data one row per variable, which is "
+                       "the shape to filter and sort on.")
+        v = self.table("PROC_ENVIRON_VARIABLES",
+                       "Process environment variables, one row each",
                        ["pid", "process", "user", "container", "variable",
                         "value", "source"], "Process",
-                       "/proc/<pid>/environ - LD_PRELOAD and friends live here.")
+                       "The same /proc/<pid>/environ files as "
+                       "PROC_ENVIRON, split so one variable is one row. "
+                       "Filter variable for LD_PRELOAD, sort by it, or "
+                       "search value for a path - none of which the "
+                       "rolled-up form can answer.")
         for rel in self.col.glob("live_response/process/proc/*/environ.txt"):
             parts = rel.split("/")
             try:
@@ -835,11 +871,29 @@ class TableBuilder:
                 continue
             i = self.proc_of(pid)
             raw = self.text(rel, "PROC_ENVIRON")
+            pairs = []
             for item in raw.replace("\x00", "\n").splitlines():
                 if "=" in item:
-                    k, v = item.split("=", 1)
-                    t.add(pid, i.get("name", ""), i.get("user", ""),
-                          i.get("container", ""), k.strip(), v.strip(), rel)
+                    k, val = item.split("=", 1)
+                    k, val = k.strip(), val.strip()
+                    pairs.append((k, val))
+                    v.add(pid, i.get("name", ""), i.get("user", ""),
+                          i.get("container", ""), k, val, rel)
+            if pairs:
+                # Read the named ones out rather than leaving an examiner to
+                # find LD_PRELOAD inside a hundred characters of one line.
+                # Last wins: a variable set twice in an environment is the
+                # later one, which is what the process actually sees.
+                seen = {}
+                for k, val in pairs:
+                    seen[k.upper()] = val
+                t.add(pid, i.get("name", ""), i.get("user", ""),
+                      i.get("container", ""), len(pairs),
+                      seen.get("LD_PRELOAD", ""),
+                      seen.get("LD_LIBRARY_PATH", ""),
+                      seen.get("PATH", ""), seen.get("PWD", ""),
+                      seen.get("HOME", ""), seen.get("SHELL", ""),
+                      " ".join("%s=%s" % kv for kv in pairs), rel)
 
     def t_proc_fds(self):
         t = self.table("PROC_FD", "Per-process file descriptors",
@@ -7165,7 +7219,7 @@ class TableBuilder:
         ("EDITOR_HISTORY", ("value",), "command"),
         ("PROCESS_MASTER", ("exe", "args", "comm"), "command"),
         ("PROCESSES", ("exe", "args"), "command"),
-        ("PROC_ENVIRON", ("value",), "command"),
+        ("PROC_ENVIRON_VARIABLES", ("value",), "command"),
         ("CRON", ("command",), "command"),
         ("SYSTEMD_UNITS", ("exec_start", "exec_start_pre"), "command"),
         ("INIT_AND_PROFILE", ("text",), "command"),
