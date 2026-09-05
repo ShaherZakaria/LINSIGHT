@@ -4571,6 +4571,49 @@ class TableBuilder:
                   self.gid_name(f[5]), f[6],
                   ts(f[7]), ts(f[8]), ts(f[9]), ts(f[10]))
 
+    def t_timestomp(self):
+        """Every entry that failed a timestamp rule, with all four clocks.
+
+        A derived table, like FINDINGS and TIMELINE: the rules ran on the
+        bodyfile pass the analyzer already makes, and re-reading a few hundred
+        thousand inode records to render them again would be a second pass for
+        nothing.
+
+        The finding says how many and names thirty. This is the rest of them,
+        sortable by rule and filterable by path, which is the difference
+        between "eleven files are backdated" and knowing which eleven.
+        """
+        rows = self.tri.timestomp["rows"]
+        if not any(rows.get(r) for r in self.tri.TIMESTOMP_ORDER):
+            return
+        t = self.table("TIMESTOMP", "Timestamp anomalies",
+                       ["rule", "severity", "path", "directory", "basename",
+                        "mode", "uid", "owner", "size", "inode",
+                        "timestamp_utc", "atime_utc", "mtime_utc", "ctime_utc",
+                        "crtime_utc", "finding"],
+                       "Filesystem",
+                       "One row per file whose own four timestamps disagree "
+                       "with each other, and the rule that says how. "
+                       "timestamp_utc repeats ctime deliberately - it is the "
+                       "only one of the four the kernel will not let userspace "
+                       "write, so it is the clock this row is placed on: the "
+                       "console's time window and the activity chart then "
+                       "answer for the moment the metadata actually changed "
+                       "rather than the moment the file claims. Rows are "
+                       "capped at %d per rule; the count on the finding is "
+                       "exact either way."
+                       % Triage.TIMESTOMP_ROW_CAP)
+        for rule in self.tri.TIMESTOMP_ORDER:
+            sev, title = self.tri.TIMESTOMP_RULES[rule][0:2]
+            for (path, mode, uid, size, inode,
+                 atime, mtime, ctime, crtime, note) in rows.get(rule) or []:
+                t.add(rule, sev, path, os.path.dirname(path),
+                      os.path.basename(path), mode, uid,
+                      self.uid_name(uid) or "", size, inode,
+                      _ts_text(ctime), _ts_text(atime), _ts_text(mtime),
+                      _ts_text(ctime), _ts_text(crtime),
+                      "%s - %s" % (title, note))
+
     def t_file_hashes(self):
         t = self.table("FILE_HASHES", "Executable hashes",
                        ["path", "directory", "basename", "md5", "sha1", "sha256",
@@ -8394,7 +8437,7 @@ class TableBuilder:
         "t_suid", "t_getcap", "t_mac_policy",
         "t_writable", "t_hidden_files", "t_unknown_owner",
         "t_socket_files",
-        "t_dev_files", "t_bodyfile", "t_deleted_files",
+        "t_dev_files", "t_bodyfile", "t_timestomp", "t_deleted_files",
         "t_file_hashes",
         "t_user_artifacts",
         "t_packages", "t_package_logs", "t_chkrootkit",
@@ -8477,7 +8520,7 @@ class TableBuilder:
         "t_editor_history", "t_ld_preload",
         "t_suid", "t_getcap", "t_mac_policy", "t_writable", "t_hidden_files",
         "t_unknown_owner", "t_socket_files", "t_dev_files", "t_bodyfile",
-        "t_deleted_files", "t_disk_layout", "t_sensitive_files",
+        "t_timestomp", "t_deleted_files", "t_disk_layout", "t_sensitive_files",
         "t_file_hashes", "t_user_artifacts", "t_package_logs",
         "t_journal", "t_audit_log", "t_login_records", "t_wtmpdb", "t_lastlog",
         "t_web_logs", "t_web_config", "t_samba_logs", "t_firewall_log",
