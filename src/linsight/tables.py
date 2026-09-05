@@ -376,7 +376,17 @@ class TableBuilder:
     # another table. These resolve the number once so every table can carry the
     # name beside it.
     def _procs(self):
-        if not self.tri.processes:
+        """The live process map, parsed once.
+
+        The guard is "has this been attempted", not "is the result empty".
+        A disk image has no live processes, so the parse yields {} - which is
+        falsy, so an emptiness check re-ran the whole parse on every call. It
+        is called once per row by t_cron, t_users, t_systemd_units and
+        t_file_hashes, and on a disk image that turned the cron table alone
+        into 104 seconds of re-parsing nothing for 604 rows: 40% of the run.
+        """
+        if not self.tri.processes and not getattr(self.tri, "_procs_parsed", False):
+            self.tri._procs_parsed = True
             self.tri._parse_process_tables()
         return self.tri.processes
 

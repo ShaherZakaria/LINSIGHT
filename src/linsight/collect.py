@@ -629,14 +629,60 @@ class Collection:
                 and all(fnmatch.fnmatchcase(n, p)
                         for n, p in zip(nseg[len(nseg) - len(tail):], tail)))
 
+    #: Characters that make a path fragment a pattern rather than a literal.
+    GLOB_META = "*?["
+
+    def _dir_index(self):
+        """{parent directory -> [(lowercased name, real name)]}, built once.
+
+        glob() used to walk all of _names for every pattern. That is fine for
+        a handful of patterns and ruinous for the extractors that build one
+        per home directory: t_history asks for eleven filenames under every
+        home /etc/passwd declares, which on a host with twenty accounts is
+        220 full passes over 85,000 names - and measured 19.8s of a 143s run
+        for 366 rows of output.
+
+        Bucketing by parent directory turns the common case - a pattern whose
+        directory part is literal - into one dict lookup and a handful of
+        fnmatch calls. A pattern with a wildcard in the directory part still
+        has to try each directory, but there are far fewer directories than
+        files, so even that is an order of magnitude less work.
+        """
+        idx = getattr(self, "_dirs_cache", None)
+        if idx is None:
+            idx = {}
+            for low, real in self._names.items():
+                cut = low.rfind("/")
+                idx.setdefault(low[:cut] if cut >= 0 else "", []).append((low, real))
+            self._dirs_cache = idx
+        return idx
+
     def glob(self, pattern):
         """Shell-style match over collection-relative names (case-insensitive)."""
         pat = (self.escape_glob(self.prefix) + pattern.lstrip("/")).lower()
         plen = len(self.prefix)
         out = []
-        for low, real in self._names.items():
-            if self._match_path(low, pat):
-                out.append(real[plen:])
+
+        # '**' spans directories, so the bucket a name sits in says nothing
+        # about whether it matches - that case keeps the full scan.
+        if "**" in pat.split("/"):
+            for low, real in self._names.items():
+                if self._match_path(low, pat):
+                    out.append(real[plen:])
+            return sorted(out)
+
+        cut = pat.rfind("/")
+        dirpat, basepat = (pat[:cut], pat[cut + 1:]) if cut >= 0 else ("", pat)
+        index = self._dir_index()
+        if any(ch in dirpat for ch in self.GLOB_META):
+            buckets = [v for d, v in index.items()
+                       if self._match_path(d, dirpat)]
+        else:
+            buckets = [index.get(dirpat, ())]
+        for bucket in buckets:
+            for low, real in bucket:
+                if fnmatch.fnmatchcase(low[low.rfind("/") + 1:], basepat):
+                    out.append(real[plen:])
         return sorted(out)
 
     def rootfs_glob(self, pattern):
