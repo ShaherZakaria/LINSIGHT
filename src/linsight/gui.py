@@ -3621,6 +3621,16 @@ var colFilters=[],lay=null;   /* per-column filter text; measured column tLayout
    Recomputed per tRender so it follows the filter - narrowing to one noisy
    process should retighten the columns around what is left. */
 function tLayout(t,rows,cap){
+ /* Never sample past the end of what was handed in. A grid the current
+    filter leaves empty - a time window over a table whose rows are all
+    undated is the usual way to get one - arrived here with rows=[] and a cap
+    of 1, read rows[0][j] on an empty array and threw. That took the whole
+    render with it: the previous grid stayed on the screen, still showing its
+    old row count, so setting the window looked like the window doing nothing
+    and opening such a table looked like the tab refusing to open. The
+    columns of an empty grid are sized by their headings, which is what the
+    loop below produces once it runs zero times. */
+ cap=Math.min(cap,rows.length);
  var n=t.columns.length,out=[],step=Math.max(1,Math.floor(cap/200));
  for(var j=0;j<n;j++){
   var lens=[],num=(rows.length>0),seen=0;
@@ -3870,7 +3880,7 @@ function tRender(){
  h+='<div id="vhead">'+viewHead()+'</div>';
  /* the layout is measured once per table, not per keystroke - columns that
     resize while you are typing into them are worse than columns that do not */
- lay=tLayout(t,page.length?page:rows,Math.max(cap,1));
+ lay=tLayout(t,page.length?page:rows,cap);
  /* table-layout:fixed only honours the <colgroup> if the table itself has a
     width. Left to 'auto' the browser falls back to shrink-to-fit and sizes
     column 1 from its content - which is how a table of one long field and
