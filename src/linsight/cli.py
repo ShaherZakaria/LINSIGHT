@@ -867,6 +867,49 @@ def _input_paths(opts):
     return [p for p in out if p]
 
 
+#: Names above which a run spills its tables to disk on its own.
+#:
+#: Table memory tracks the number of files, not the size of the image: the
+#: measured cost is ~157 bytes per name for the index alone, and the tables
+#: built from those names are several times that again. On the collection this
+#: was measured against, spilling held the run to 802 MB instead of 1,805 MB
+#: for 45s of a 220s run.
+#:
+#: Half a million names is where that trade turns over. Below it the run fits
+#: comfortably in memory on any machine that can hold the image's index at
+#: all, and the time matters more; above it the run is long enough that a
+#: fifth more of it is a better outcome than being killed at 90%.
+AUTOSPILL_NAMES = 500000
+
+
+def _autospill(col, opts):
+    """Turn spilling on for a large input, and say so.
+
+    --low-memory exists and is the right switch when the examiner knows the
+    box is tight. This is for when they do not: the flag has to be given
+    before the walk, and how big the walk turns out to be is not knowable
+    until it is done. A 500 GB disk of a build server is millions of files and
+    an unattended run that dies at 90% for want of a flag nobody could have
+    known to pass.
+
+    Never overrides a decision already made - an explicit --low-memory, or
+    LINSIGHT_SPILL_AFTER from the environment, both stand.
+    """
+    if getattr(opts, "low_memory", False):
+        return
+    if "LINSIGHT_SPILL_AFTER" in os.environ:
+        return
+    if Table.SPILL_AFTER != Table.SPILL_NEVER:
+        return
+    n = len(getattr(col, "_names", ()) or ())
+    if n < AUTOSPILL_NAMES:
+        return
+    Table.SPILL_AFTER = 20000
+    status("[*] %s names: spilling tables to disk as they are built "
+           "(about a fifth more time, roughly half the peak memory). "
+           "--low-memory does this on request; nothing was lost." % "{:,}".format(n))
+
+
 def _run_one(ap, opts, forced, target, collect=False):
     """Read one collection and write whatever this run asked for.
 
@@ -924,6 +967,7 @@ def _run_one(ap, opts, forced, target, collect=False):
               % (col.kind, len(col._names), col.prefix or "(none)",
                  ", ".join(col.rootfs_dirs)))
 
+    _autospill(col, opts)
     _check_output_paths(col, opts)      # before any work, for every output flag
 
     tri = Triage(col, opts)

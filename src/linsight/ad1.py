@@ -643,7 +643,7 @@ class Ad1Collection(Collection):
             if key in self._names:
                 skipped += 1
                 continue
-            self._names[key] = member
+            self._names[key] = key if key == member else member
             self._sizes[key] = e.size
             self._entries[member] = e
             if e.md5 or e.sha1:
@@ -683,7 +683,8 @@ class Ad1Collection(Collection):
     # -- the synthetic bodyfile ---------------------------------------------
     def _add_bodyfile(self):
         member = "bodyfile/bodyfile.txt"
-        self._names[member.lower()] = member
+        low = member.lower()
+        self._names[low] = low if low == member else member
         self._sizes[member.lower()] = len(self._entries) * 120
         self._virtual[member] = None
 

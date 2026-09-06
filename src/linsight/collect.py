@@ -246,7 +246,12 @@ class Collection:
         than looked up later for the few that get parsed.
         """
         key = rel.lower()
-        self._names[key] = rel
+        # One object where the two are equal. `.lower()` always builds a new
+        # string, so a path that is already lowercase - most of a Linux
+        # filesystem - was stored twice: measured 228 bytes per name against
+        # 157 when the pair is shared, which is 685 MB against 472 MB at the
+        # three million names --disk-max-files allows.
+        self._names[key] = key if key == rel else rel
         self._sizes[key] = size
         if mtime:
             self._mtimes[key] = mtime
@@ -633,7 +638,7 @@ class Collection:
     GLOB_META = "*?["
 
     def _dir_index(self):
-        """{parent directory -> [(lowercased name, real name)]}, built once.
+        """{parent directory -> [lowercased name]}, built once.
 
         glob() used to walk all of _names for every pattern. That is fine for
         a handful of patterns and ruinous for the extractors that build one
@@ -647,13 +652,20 @@ class Collection:
         fnmatch calls. A pattern with a wildcard in the directory part still
         has to try each directory, but there are far fewer directories than
         files, so even that is an order of magnitude less work.
+
+        The buckets hold the key alone and the real name is looked up from
+        _names, because a list of (key, name) pairs costs a tuple per file on
+        top of the index it is indexing: measured at 73 bytes per name against
+        9 for the key alone, which is 218 MB against 26 MB at the three
+        million names --disk-max-files allows. The lookup it saves is one dict
+        hit on a dict that has to be in memory anyway.
         """
         idx = getattr(self, "_dirs_cache", None)
         if idx is None:
             idx = {}
-            for low, real in self._names.items():
+            for low in self._names:
                 cut = low.rfind("/")
-                idx.setdefault(low[:cut] if cut >= 0 else "", []).append((low, real))
+                idx.setdefault(low[:cut] if cut >= 0 else "", []).append(low)
             self._dirs_cache = idx
         return idx
 
@@ -679,10 +691,11 @@ class Collection:
                        if self._match_path(d, dirpat)]
         else:
             buckets = [index.get(dirpat, ())]
+        names = self._names
         for bucket in buckets:
-            for low, real in bucket:
+            for low in bucket:
                 if fnmatch.fnmatchcase(low[low.rfind("/") + 1:], basepat):
-                    out.append(real[plen:])
+                    out.append(names[low][plen:])
         return sorted(out)
 
     def rootfs_glob(self, pattern):
@@ -853,7 +866,8 @@ class FilesCollection(Collection):
                 self.skipped.append((real, "not identified as a known artifact"))
                 continue
             member = self._member(dest)
-            self._names[member.lower()] = member
+            low = member.lower()
+            self._names[low] = low if low == member else member
             self._sizes[member.lower()] = size
             # the loose file's own mtime, which is the host's when the file
             # was copied off with its metadata and the copy's when it was not
