@@ -447,6 +447,14 @@ nav a.tbl span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:no
 .badge{background:var(--sunk);border:1px solid var(--line);border-radius:11px;padding:2px 9px;
 color:var(--dim);font-size:11px;white-space:nowrap}
 .warn{color:var(--HIGH)}
+/* An address one of these machines answers on, tagged with which. The
+   address keeps its own type and colour - the tag is an annotation on
+   it, not a replacement for it, because the address is still the thing
+   the artifact recorded. */
+.own{white-space:nowrap}
+.own>i{font-style:normal;font-size:10.5px;margin-left:4px;padding:0 5px;
+border:1px solid var(--accent);border-radius:9px;color:var(--accent);
+vertical-align:baseline}
 /* fixed layout so the <colgroup> widths computed from the data are what the
    browser actually uses - with auto layout one long cell drags its column
    wide and squeezes every other column into a ragged strip */
@@ -825,7 +833,7 @@ function viewIocs(){
    '<td class="num"><span class="score">'+r.score+'</span>'+
    '<span class="sbar" style="width:'+Math.max(2,Math.round(46*r.score/max))+
    'px"></span></td>'+
-   '<td><code>'+esc(r.ind.slice(0,90))+'</code></td>'+
+   '<td><code>'+ownHtml(r.ind.slice(0,90))+'</code></td>'+
    '<td>'+esc(r.type)+'</td>'+
    '<td class="num" title="frequency '+r.freq+' + severity '+r.sev+
    ' + kind '+r.kind+' + marks '+r.mk+' + findings '+r.hits+'">'+
@@ -850,6 +858,21 @@ function viewIocs(){
    screenshot in a report matches what the examiner saw. */
 var NODE_KIND={ip:'#58a6ff',user:'#f5d067',file:'#ff9f43',rule:'#ff5f56',cmd:'#a371f7',url:'#3fb950',tool:'#ff7b72',host:'#79c0ff',collection:'#79c0ff'};
 var EV_SHOWN=6;    /* sample rows the hover panel has room for */
+/* An address circle is labelled with the machine that answers on it,
+   where one of these collections does. The picture is where the reader
+   is looking for movement, and 'ip 192.168.2.101 -> user hadoop' is a
+   connection; '192.168.2.101 slave1 -> user hadoop' is slave1 signing
+   in. SVG text, so the tag is written into the label rather than
+   marked up - the id stays the node's key either way. */
+function egName(nd,cap){
+ var id=String(nd&&nd.id||''),
+     who=!nd?'':(nd.kind==='ip'?ownOf(id):ownIn(id));
+ if(cap&&id.length>cap)id=id.slice(0,cap);
+ /* the label is a name beside a circle, and a collection labelled after the
+    archive it came out of is longer than the picture has room for */
+ if(cap&&who.length>20)who=who.slice(0,19)+'…';
+ return who?id+'  '+who:id;
+}
 var EGN=44;        /* how many circles to draw - the examiner's choice */
 var EGISO=null;    /* the node the picture is narrowed to, by key */
 /* Which kinds of thing are drawn. All of them to start, because the first
@@ -1349,7 +1372,7 @@ function viewEntities(){
    '<button class="mkbtn" id="eg_reset">reset</button>'+
    (EGISO&&EGHUB
     ?'<button class="mkbtn on" id="eg_all">show everything</button>'+
-     '<span class="dim">showing <b>'+esc(EGHUB.id)+'</b> and what it touches'+
+     '<span class="dim">showing <b>'+esc(egName(EGHUB))+'</b> and what it touches'+
      '</span>'
     :'')+
    '<span class="dim">drag a node \u00b7 hover to isolate \u00b7 click one to see only it '+
@@ -1399,7 +1422,7 @@ function viewEntities(){
      (e.kind==='in'?'" stroke-dasharray="4 4':'')+
      '" marker-end="'+egMark(e,c)+'"'+
      ' opacity="'+(e.kind==='in'?'.35':'.9')+'"><title>'+
-     esc(e.a.id+' \u2192 '+e.b.id+'  ('+e.n+' row(s), '+
+     esc(egName(e.a)+' \u2192 '+egName(e.b)+'  ('+e.n+' row(s), '+
          (e.kind==='move'?'reached after ':'')+e.why+')')+
      '</title></line>';});
  h+='</g><g id="eg_lbl">';
@@ -1416,11 +1439,11 @@ function viewEntities(){
   h+='<g class="egn" data-n="'+i+'" style="cursor:grab">';
   h+='<circle cx="'+nd.x.toFixed(1)+'" cy="'+nd.y.toFixed(1)+'" r="'+
      nd.r.toFixed(1)+'" fill="'+NODE_KIND[nd.kind]+'" stroke="var(--bg)" '+
-     'stroke-width="2"><title>'+esc(nd.kind+' '+nd.id+' \u2014 '+nd.n+
+     'stroke-width="2"><title>'+esc(nd.kind+' '+egName(nd)+' \u2014 '+nd.n+
      ' row(s)')+'</title></circle>';
   h+='<text x="'+(nd.x+nd.r+4).toFixed(1)+'" y="'+(nd.y+4).toFixed(1)+
      '" class="lane" style="font-size:11px;paint-order:stroke;stroke:var(--bg);'+
-     'stroke-width:3px">'+esc(String(nd.id).slice(0,30))+'</text>';
+     'stroke-width:3px">'+esc(egName(nd,30))+'</text>';
   h+='</g>';});
  h+='</g></svg></div>';
  h+=egPanels(EG);
@@ -1452,7 +1475,7 @@ function egPanels(g){
  h+='<div class="panel"><h4>Most connected</h4>';
  top.forEach(function(n){
   h+='<div class="rowline"><span><span style="color:'+NODE_KIND[n.kind]+
-     '">\u25cf</span> '+esc(String(n.id).slice(0,30))+'</span>'+
+     '">\u25cf</span> '+esc(egName(n,30))+'</span>'+
      '<span class="v">'+(deg[n.k]||0)+'</span></div>';});
  h+='</div>';
  h+='<div class="panel"><h4>Relations by kind</h4>';
@@ -1530,7 +1553,7 @@ function egWire(){
    for(var i=0;i<x.c.length;i++){
     var v=x.r[i];
     if(v===undefined||v===null||v==='')continue;
-    h+='<tr><th>'+esc(x.c[i])+'</th><td>'+esc(String(v).slice(0,300))+
+    h+='<tr><th>'+esc(x.c[i])+'</th><td>'+ownHtml(String(v).slice(0,300))+
        '</td></tr>';}
    h+='</table>';});
   return h;
@@ -1542,13 +1565,13 @@ function egWire(){
  lines.forEach(function(L,i){
   L.onmouseenter=function(){
    var e=EG.edges[i];
-   detail(evHtml(e.a.id+'  \u2192  '+e.b.id,
+   detail(evHtml(egName(e.a)+'  \u2192  '+egName(e.b),
      e.n+' row(s) recorded this - '+egWhys(e),egEv(e)));};});
  nodes.forEach(function(g,i){
   g.onmouseenter=function(){
    if(!drag&&!EG.focus)highlight(EG.nodes[i]);
    var nd=EG.nodes[i];
-   detail(evHtml(nd.kind+'  '+nd.id,nd.n+' row(s) name it',egEv(nd)));};
+   detail(evHtml(nd.kind+'  '+egName(nd),nd.n+' row(s) name it',egEv(nd)));};
   g.onmouseleave=function(){if(!drag&&!EG.focus)highlight(null);};
   g.onmousedown=function(ev){
    ev.preventDefault();drag={i:i,moved:false};g.style.cursor='grabbing';};
@@ -1958,7 +1981,7 @@ function viewContext(){
   t.rows.forEach(function(r){
    h+='<tr>';
    for(var i=0;i<t.columns.length;i++){
-    h+='<td><div class="c">'+esc(r[i]==null?'':r[i])+'</div></td>';}
+    h+='<td><div class="c">'+ownHtml(r[i]==null?'':r[i])+'</div></td>';}
    h+='</tr>';});
   h+='</tbody></table></div>';});
  return h+'</div>';
@@ -2025,6 +2048,72 @@ function themeSet(v){
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+/* ---------- whose address is that? ----------
+   D.owners maps an address to the collection that answers on it, built from
+   HOSTS where the run was correlated and from INTERFACES otherwise. It is
+   only present when the export holds more than one machine.
+
+   A login from 10.0.0.14 is a number until something says 10.0.0.14 is
+   web01. The correlation makes that call once, for CROSS_SESSIONS, and it
+   used to stop there - the same address in AUTH_LOG, in a scp command line,
+   in the relationship graph was left for the reader to recognise. Now every
+   place the console prints a value marks it, so lateral movement reads as
+   lateral movement in whichever table you happened to open.
+
+   Marked in the text rather than only in whole-cell values on purpose:
+   `scp payload hadoop@192.168.2.101:/tmp/` is the row that says what the
+   sign-in was for, and the address is in the middle of it. */
+var OWN=D.owners||{},OWNRE;
+function ownRe(){
+ if(OWNRE!==undefined)return OWNRE;
+ var ks=[],k;
+ for(k in OWN)ks.push(k);
+ /* Longest first, or 10.0.0.1 matches inside 10.0.0.10 and claims its
+    host. The tail guard has to let ':' and '/' through - 10.0.0.5:22 and
+    `scp x hadoop@10.0.0.5:/tmp/` are the two forms lateral movement is
+    actually written in - while still refusing a digit, so the 10.0.0.10
+    case stays refused. */
+ ks.sort(function(a,b){return b.length-a.length;});
+ OWNRE=ks.length?new RegExp('(^|[^0-9A-Za-z.:_-])('+ks.map(function(x){
+  return x.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&');}).join('|')+
+  ')(?![0-9A-Za-z_-]|\\\\.[0-9])','g'):null;
+ return OWNRE;
+}
+/* Escaped HTML in, escaped HTML out - the tag is added to text that is
+   already safe, and an address carries nothing that escaping would have
+   changed, so the two operations cannot tread on each other. */
+function ownMark(html){
+ var re=ownRe();
+ if(!re||html.indexOf('.')<0&&html.indexOf(':')<0)return html;
+ re.lastIndex=0;
+ return html.replace(re,function(m,pre,ip){
+  var who=OWN[String(ip).toLowerCase()];
+  return who?pre+'<span class="own" title="'+esc(who)+
+   ' answers on this address">'+ip+'<i>'+esc(who)+'</i></span>':m;});
+}
+/* Every cell the console prints goes through this rather than esc. */
+function ownHtml(v){return ownMark(esc(v));}
+/* The same answer as plain text, for an SVG label or a title attribute. */
+function ownOf(v){
+ var s=String(v==null?'':v).trim().toLowerCase();
+ if(!s)return '';
+ if(s.charAt(0)==='['){var e=s.indexOf(']');if(e>0)s=s.slice(1,e);}
+ else if(s.indexOf(':')>0&&s.indexOf(':')===s.lastIndexOf(':'))
+  s=s.slice(0,s.indexOf(':'));
+ var sl=s.indexOf('/');
+ if(sl>0)s=s.slice(0,sl);
+ return OWN[s]||'';
+}
+/* And the same answer for a value that only contains an address - a command
+   line, a log line. `ssh root@10.0.0.12` is the row that says where somebody
+   went next, and it is a cmd node in the picture rather than an ip one. */
+function ownIn(v){
+ var re=ownRe(),m;
+ if(!re)return '';
+ re.lastIndex=0;
+ m=re.exec(String(v==null?'':v));
+ return m?(OWN[String(m[2]).toLowerCase()]||''):'';
+}
 function el(id){return document.getElementById(id);}
 function sevRank(s){var i=SEV.indexOf(s);return i<0?99:i;}
 
@@ -3259,7 +3348,7 @@ function viewSearch(){
   h+='</tr>';
   x.sample.forEach(function(r){
    h+='<tr>';
-   for(var i=0;i<x.cols.length;i++){h+='<td>'+esc(r[i]==null?'':r[i])+'</td>';}
+   for(var i=0;i<x.cols.length;i++){h+='<td>'+ownHtml(r[i]==null?'':r[i])+'</td>';}
    h+='</tr>';});
   h+='</table></div>';});
  return h;
@@ -3657,7 +3746,7 @@ function tBodyHtml(t,rows,cap){
    var v=r[j]===undefined?'':r[j];
    var cls=(sevIdx===j)?'sev-'+esc(v):(lay[j].num?'num':'');
    if(lay[j].nw){cls+=(cls?' ':'')+'nw';}
-   h+='<td'+(cls?' class="'+cls+'"':'')+'><div class="c">'+esc(v)+'</div></td>';}
+   h+='<td'+(cls?' class="'+cls+'"':'')+'><div class="c">'+ownHtml(v)+'</div></td>';}
   h+='</tr>';}
  return h;
 }
@@ -4031,7 +4120,7 @@ function pvRows(name,t,rows){
   for(var j=0;j<t.columns.length;j++){
    var v=r[j];
    if(v===undefined||v===null||v==='')continue;
-   h+='<tr><th>'+esc(t.columns[j])+'</th><td>'+esc(v)+'</td></tr>';}
+   h+='<tr><th>'+esc(t.columns[j])+'</th><td>'+ownHtml(v)+'</td></tr>';}
   h+='</tbody></table>';});
  return h;
 }
@@ -4187,7 +4276,7 @@ function fvHtml(got,row,f){
        ?' &middot; '+lines.length+' of '+esc(all):'')+'</div>';
    h+='<table class="evkv"><tbody>';
    lines.forEach(function(ln,i){
-    h+='<tr><th>'+(i+1)+'</th><td>'+esc(ln)+'</td></tr>';});
+    h+='<tr><th>'+(i+1)+'</th><td>'+ownMark(esc(ln))+'</td></tr>';});
    h+='</tbody></table>';}
   else if(!got.token)
    h+='<div class="dim">This finding kept no sample rows.</div>';
