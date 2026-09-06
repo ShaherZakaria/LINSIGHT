@@ -893,6 +893,18 @@ def check_cross_timeline(L, res):
     res.check("a refused sign-in is not called a sign-in",
               any(r["event"] == "sign-in refused" for r in rows),
               "got %s" % sorted(set(r["event"] for r in rows)))
+    # One sign-in reaches CROSS_SESSIONS from AUTH_LOG and again from LOGINS.
+    # The tables keep both on purpose; a timeline that does is three answers
+    # to "how many times did they sign in" - 190 rows for 95 acts on the
+    # cluster this was found on.
+    acts = [(r["timestamp_utc"], r["from_collection"], r["to_collection"],
+             r["event"], r["detail"].split(" over ")[0]) for r in rows]
+    res.check("one act is one row", len(acts) == len(set(acts)),
+              "%d rows for %d acts" % (len(acts), len(set(acts))))
+    res.check("and every source that recorded it is still named",
+              any("," in r["basis"] for r in rows)
+              or all(r["basis"] for r in rows),
+              "a row lost its basis")
     res.check("and it is counted in a finding",
               any("dated cross-host event" in f.title for f in cor.tri.findings),
               "got %s" % [f.title for f in cor.tri.findings][:4])

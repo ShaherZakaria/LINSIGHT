@@ -34498,6 +34498,7 @@ class Correlator(object):
         if not rows:
             return
         rows.sort(key=lambda r: (r[0], r[5]))
+        rows = _one_per_act(rows)
         t = self.table("CROSS_TIMELINE",
                        "Everything between these collections, in order",
                        ["timestamp_utc", "from_collection", "to_collection",
@@ -34509,7 +34510,9 @@ class Correlator(object):
                        "second host, an indicator reaching one before the "
                        "other. `basis` names the table it came from, because "
                        "a sign-in the destination logged and a command the "
-                       "source ran are different kinds of evidence. Every "
+                       "source ran are different kinds of evidence - and "
+                       "where both recorded one act, `basis` names them all "
+                       "on the single row rather than repeating it. Every "
                        "time here is UTC normalised by each host's own "
                        "resolved offset: HOSTS says what those were, and a "
                        "host that never resolved one is its own finding.")
@@ -34697,6 +34700,37 @@ def _somebody_decided(kind, grant, cases):
         if uid == 0 or uid > SYSTEM_UID_MAX:
             return True
     return False
+
+
+def _one_per_act(rows):
+    """Collapse rows that are one act several artifacts recorded.
+
+    A single sign-in reaches CROSS_SESSIONS from AUTH_LOG and again from
+    LOGINS, because those are two records of it and the table keeps both on
+    purpose - two records disagreeing is itself a finding. A timeline is the
+    other question: it is a list of what happened, and one login written three
+    times is three answers to "how many times did they sign in". On the Hadoop
+    cluster that was 190 rows for 95 acts.
+
+    The act is the time, the two ends, the kind and the subject - the service
+    it came over is part of the record, not of the act, so `hadoop over sshd`
+    and `hadoop over login` are one sign-in. What every record of it agreed
+    on stays; the tables they came from are joined into `basis`, so nothing
+    about provenance is lost by not repeating the row.
+    """
+    seen = {}
+    order = []
+    for when, a, b, event, detail, basis in rows:
+        subject = str(detail).split(" over ")[0]
+        key = (when, a, b, event, subject)
+        got = seen.get(key)
+        if got is None:
+            seen[key] = [when, a, b, event, detail, [basis]]
+            order.append(key)
+        elif basis not in got[5]:
+            got[5].append(basis)
+    return [(r[0], r[1], r[2], r[3], r[4], ", ".join(r[5]))
+            for r in (seen[k] for k in order)]
 
 
 def _interesting_account(name, by_host):
