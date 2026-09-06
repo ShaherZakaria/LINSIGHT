@@ -44,6 +44,7 @@ from .common import (
     PRIVILEGED_GROUPS, TMPFS_DIRS, _ts_text, ioc_type, span_of)
 from .triage import Triage
 from .tables import Table
+from .graph import write_correlation_svg
 from .writers import write_tables_csv, write_tables_html, write_tables_json
 
 
@@ -95,6 +96,27 @@ _COUNT_RE = re.compile(r"\d[\d,]*")
 #: 'T1110 Brute Force / T1078 Valid Accounts' -> T1110, T1078. The same shape
 #: the console's matrix reads, so a technique means one thing in both.
 _TECH_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
+
+
+#: 'address 192.168.2.100', 'addresses: [10.0.0.5/24]', 'address' with the
+#: value in the next column - the three shapes a network configuration writes
+#: the host's own address in. Anchored, so 'dns-nameservers' and 'gateway'
+#: cannot reach it.
+_SELF_ADDRESS_RE = re.compile(r"^address(?:es)?\b[\s:=]*(.*)$", re.I)
+
+_ADDRESS_SPLIT_RE = re.compile(r"[,\s\[\]'\"]+")
+
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_IPV6_RE = re.compile(r"^[0-9a-f:]{3,45}$", re.I)
+
+
+def _is_address(text):
+    """An address this host answers on, or something that only looks like one."""
+    if not text or text.startswith(("127.", "::1", "fe80:", "0.0.0.0")):
+        return False
+    if _IPV4_RE.match(text):
+        return all(0 <= int(p) <= 255 for p in text.split("."))
+    return ":" in text and bool(_IPV6_RE.match(text))
 
 
 def _norm_title(title):
@@ -214,6 +236,53 @@ def merge_tables(per_host):
                 merged.add(*new)    # the one cell the source table cannot own
         out.append(merged)
     return out, column
+
+
+#: What the collection column says on a row that is about all of them.
+#:
+#: Not a host label, and deliberately not one of the real ones: a cross-host
+#: finding is a statement about the case rather than about any collection in
+#: it, and lending it a host's name would put it under a filter it does not
+#: belong to. The console's collection picker is built from the input labels,
+#: so this never becomes an option in it - narrowing to a host hides these
+#: rows, which is the same answer the Correlation tab gives for the same
+#: reason.
+CORRELATION_LABEL = "(correlation)"
+
+
+def fold_correlation(tables, cross, column):
+    """Put the correlation's own findings and timeline into the merged ones.
+
+    The cross-host tables join the merged export, and the correlator's
+    FINDINGS and TIMELINE are held back because the export already has one of
+    each. Held back was all that happened to them: the console reads its
+    findings list, its severity chips and its ATT&CK matrix out of the
+    FINDINGS *table*, so every correlation finding - including "a machine in
+    this case signed in to another", which is the strongest thing this tool
+    can say - was computed, counted, and then shown nowhere. Not in the
+    console, not in FINDINGS.csv, not in case.db. Only --html and --json saw
+    them, because those render a Triage rather than a table.
+
+    So the rows are folded in instead of dropped, under a label of their own.
+    """
+    merged = dict((t.name, t) for t in tables)
+    for src in cross:
+        if src.name not in ("FINDINGS", "TIMELINE"):
+            continue
+        dst = merged.get(src.name)
+        if dst is None:
+            continue
+        at = [dst.columns.index(c) if c in dst.columns else -1
+              for c in src.columns]
+        for row in src.iter_rows():
+            new = [""] * len(dst.columns)
+            for i, value in zip(at, row):
+                if i >= 0:
+                    new[i] = value
+            if dst.columns[0] == column:
+                new[0] = CORRELATION_LABEL
+            dst.add(*new)
+    return tables
 
 
 def merge_triage(cases, opts, tris):
@@ -505,11 +574,55 @@ class HostCase(object):
                 addr = addr.split("/")[0].strip()
                 if addr and not addr.startswith(("127.", "::1", "fe80:")):
                     self.addresses.add(addr)
+        # And off the configuration, which is where a disk image keeps it.
+        #
+        # INTERFACES is a live_response artifact - the output of `ip addr` at
+        # collection time - so a disk image produces none of it, and every
+        # host read from an image resolved to no addresses at all. That is not
+        # a small gap: it is the one input CROSS_SESSIONS runs on, so the
+        # table this whole module exists for silently reported nothing for
+        # disk images however much the logs held. On a three-host Hadoop
+        # cluster, slave1's auth.log carried 116 successful logins from the
+        # master and the correlation reported no sign-ins at all.
+        #
+        # /etc/network/interfaces and netplan are on the disk and say what the
+        # host gives itself. Only the address keys are read: `network`,
+        # `broadcast`, `gateway` and `dns-nameservers` are addresses too, and
+        # none of them is this host.
+        for r in self._cells(tables, "NETWORK_CONFIG", ("key", "value")):
+            m = _SELF_ADDRESS_RE.match(r["key"].strip())
+            if not m:
+                continue
+            for tok in _ADDRESS_SPLIT_RE.split("%s %s" % (m.group(1),
+                                                          r["value"])):
+                addr = tok.split("/")[0].strip()
+                if _is_address(addr):
+                    self.addresses.add(addr)
         for r in self._cells(tables, "DEVICE_PROFILE", ("category", "value")):
             if r["category"] == "hostname" and r["value"]:
                 self.names.add(r["value"].strip().lower())
         self.names.discard("")
         self.names.discard("localhost")
+
+    #: AUTH_LOG events that are an authentication result rather than a
+    #: connection.
+    #:
+    #: Every row here becomes a claim that one machine in this case signed in
+    #: to another, so it has to be an attempt to authenticate and its outcome
+    #: - not a TCP connection ending. sshd writes 'Connection closed by
+    #: 10.0.0.11' after a successful login, after a refused one, and after a
+    #: scanner opens a socket and goes away; taking it as a sign-in put 399 of
+    #: them into a three-host cluster's correlation and made 'connection
+    #: closed' read as 'signed in successfully'.
+    #:
+    #: The failures belong here as much as the successes: a host in the case
+    #: trying its neighbour and being refused is the finding CROSS_SESSIONS
+    #: reports at HIGH.
+    SESSION_EVENTS = frozenset((
+        "accepted login", "public key accepted", "session opened",
+        "failed password", "invalid user", "authentication failure",
+        "max auth attempts", "root login refused",
+    ))
 
     def _take_sessions(self, tables):
         """Every login this host accepted, and the address it came from.
@@ -523,7 +636,7 @@ class HostCase(object):
         for r in self._cells(tables, "AUTH_LOG",
                              ("timestamp_utc", "event", "user", "source_ip",
                               "result", "process")):
-            if r["source_ip"]:
+            if r["source_ip"] and r["event"] in self.SESSION_EVENTS:
                 self.sessions.append({
                     "when": r["timestamp_utc"], "user": r["user"],
                     "from": r["source_ip"].strip(),
@@ -588,9 +701,27 @@ class HostCase(object):
             if body:
                 self.keys.setdefault(body, []).append(r["path"])
 
+    #: CRON row kinds that are an autostart entry rather than a line of one.
+    #:
+    #: The table also keeps 'script_line' - a line *inside* a cron script - so
+    #: an examiner can read what the script does, and 'env' and 'unparsed'.
+    #: None of those is a thing that runs. Joining on them made
+    #: CROSS_PERSISTENCE 183 rows of the fragments two stock Debian hosts have
+    #: in common: '$iosched_idle \\', ') | do_sendmail', '-- --quiet'.
+    CRON_ENTRY_KINDS = ("crontab", "script")
+
     def _take_persistence(self, tables):
         """What runs without anybody asking, across the three usual places."""
-        for r in self._cells(tables, "CRON", ("command", "run_as", "file")):
+        cron = self._cells(tables, "CRON",
+                           ("command", "run_as", "file", "kind"))
+        if not cron:
+            # A CRON table from before the kind column existed. Everything is
+            # taken, as it was, rather than nothing.
+            cron = [dict(r, kind="crontab") for r in
+                    self._cells(tables, "CRON", ("command", "run_as", "file"))]
+        for r in cron:
+            if r["kind"] and r["kind"] not in self.CRON_ENTRY_KINDS:
+                continue
             if r["command"]:
                 self.persist[("cron", r["command"].strip())] = \
                     "%s (as %s)" % (r["file"], r["run_as"] or "?")
@@ -1663,14 +1794,20 @@ class Correlator(object):
     def t_cross_persistence(self):
         t = self.table("CROSS_PERSISTENCE",
                        "Autostart entries on more than one host",
-                       ["kind", "value", "host_count", "hosts", "where"],
+                       ["kind", "value", "host_count", "hosts", "notable",
+                        "where"],
                        "Correlation",
                        "A cron command, a systemd ExecStart or an "
                        "ld.so.preload entry that appears on several hosts. "
                        "Configuration management puts the same entries "
                        "everywhere and so does an intruder who scripted the "
                        "install; what tells them apart is what the command "
-                       "does, which is why the command itself is the column.")
+                       "does, which is why the command itself is the column. "
+                       "`notable` is the reading of that: any ld.so.preload "
+                       "entry, and any command that runs something from a "
+                       "directory a package does not install into or fetches "
+                       "one and pipes it to a shell. The rest is two hosts "
+                       "running the same distribution's stock cron.")
         shared = defaultdict(dict)
         for c in self.cases:
             for (kind, value), where in c.persist.items():
@@ -1678,28 +1815,46 @@ class Correlator(object):
         rows = [(-len(by), kind, value, by)
                 for (kind, value), by in shared.items() if len(by) > 1]
         rows.sort()
+        notable = []
         for _n, kind, value, by in rows:
+            mine = _persistence_notable(kind, value)
             t.add(kind, value, len(by), ", ".join(sorted(by)),
+                  "yes" if mine else "",
                   " | ".join("%s: %s" % (h, w) for h, w in sorted(by.items())))
-        if rows:
-            preload = [r for r in rows if r[1] == "ld.so.preload"]
-            self.add("HIGH" if preload else "INFO", "Correlation",
-                     "%d autostart entry(ies) appear on more than one host"
-                     % len(rows),
-                     "The same thing set to run on several machines. An "
+            if mine:
+                notable.append((-len(by), kind, value, by))
+        if notable:
+            preload = [r for r in notable if r[1] == "ld.so.preload"]
+            self.add("HIGH" if preload else "MEDIUM", "Correlation",
+                     "%d autostart entry(ies) somebody added appear on more "
+                     "than one host" % len(notable),
+                     "The same thing set to run on several machines, from "
+                     "somewhere a package does not install into. An "
                      "ld.so.preload entry shared across hosts is a userland "
                      "rootkit deployed to all of them and is why this is HIGH "
-                     "when one is present; a shared cron line is as likely to "
-                     "be the configuration management that built the estate."
+                     "when one is present."
                      if preload else
-                     "The same thing set to run on several machines - which "
-                     "on a managed estate is what management looks like. Read "
-                     "the commands rather than the count.",
+                     "The same thing set to run on several machines, from "
+                     "somewhere a package does not install into - which on a "
+                     "managed estate is what management looks like, and on a "
+                     "compromised one is what an install script looks like. "
+                     "Read the commands rather than the count.",
                      evidence=["%-14s %-3d host(s)  %s"
                                % (r[1], -r[0], trunc(r[2], 84))
-                               for r in rows[: self.EVIDENCE]],
-                     source="CROSS_PERSISTENCE", count=len(rows),
+                               for r in notable[: self.EVIDENCE]],
+                     source="CROSS_PERSISTENCE", count=len(notable),
                      mitre="T1053 Scheduled Task/Job / T1574.006 LD_PRELOAD")
+        rest = len(rows) - len(notable)
+        if rest:
+            self.add("INFO", "Correlation",
+                     "%d further autostart entry(ies) appear on more than one "
+                     "host" % rest,
+                     "Every one of them runs something from where a package "
+                     "puts files, which on machines built from one "
+                     "distribution is what being built from one distribution "
+                     "looks like. Listed in CROSS_PERSISTENCE rather than "
+                     "here.",
+                     source="CROSS_PERSISTENCE", count=rest)
 
     # -- 5e. the shape of the intrusion, per host --------------------------
     def t_cross_techniques(self):
@@ -1750,8 +1905,13 @@ class Correlator(object):
         computed from a table of that name, so a correlation written this way
         opens in the same page as a single host and needs no second console.
         """
+        # `artifact`, not `source`, though what it holds is the cross table
+        # the finding was read out of. The console looks these columns up by
+        # name - severity, category, title, mitre, artifact - so a table that
+        # calls the same thing something else opens with an empty column and
+        # no error, and a merge by name drops it. One name, both tables.
         t = self.table("FINDINGS", "Correlation findings",
-                       ["severity", "category", "title", "mitre", "source",
+                       ["severity", "category", "title", "mitre", "artifact",
                         "count", "first_utc", "last_utc", "detail",
                         "evidence_count", "evidence"],
                        "Analysis",
@@ -1814,6 +1974,32 @@ STOCK_SUDO_RULES = frozenset((
     "%wheel ALL=(ALL) ALL", "%wheel ALL=(ALL:ALL) ALL",
     "%wheel ALL=(ALL) NOPASSWD: ALL",
 ))
+
+
+#: A command that fetches something and runs it. The shape is the finding,
+#: whichever downloader is used to write it.
+_FETCH_RUN_RE = re.compile(
+    r"\b(?:curl|wget|fetch)\b[^|;&]*[|]\s*(?:sudo\s+)?"
+    r"(?:ba|da|k|z)?sh\b|\bpython\d?\s+-c\b|\bbase64\s+-d\b", re.I)
+
+
+def _persistence_notable(kind, value):
+    """Is this autostart entry somebody's, or the distribution's?
+
+    The same question CROSS_HASHES asks of a shared file and CROSS_PRIVILEGE
+    of a shared sudo rule. Two hosts of one distribution share every stock
+    cron entry it ships, and reporting those as shared persistence buries the
+    one line that runs something out of /tmp.
+
+    An ld.so.preload entry is always notable: nothing a package installs
+    writes to it, and a shared one is a userland rootkit on both machines.
+    """
+    if kind == "ld.so.preload":
+        return True
+    text = value or ""
+    if _FETCH_RUN_RE.search(text):
+        return True
+    return any(d in text for d in NOTABLE_DIRS)
 
 
 def _somebody_decided(kind, grant, cases):
@@ -1951,6 +2137,7 @@ def write_correlation(cases, outdir, opts):
     json_path = os.path.join(outdir, "tables.json")
     html_path = os.path.join(outdir, "console.html")
     n = write_tables_csv(tables, csv_dir)
+    write_correlation_svg(tables, os.path.join(outdir, "correlation.svg"), meta)
     write_tables_json(tables, json_path, meta)
     write_tables_html(tables, html_path, getattr(opts, "html_rows", 0), meta,
                       cor.tri, opts)

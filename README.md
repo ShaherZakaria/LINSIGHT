@@ -229,7 +229,7 @@ python linsight.py web01.tar db02.dd app03.dd --export ./case --correlate
 | `CROSS_KEYS` | one public key trusted by several hosts, joined on the key material rather than the comment after it — whoever holds the private half reaches every host listed |
 | `CROSS_PRIVILEGE` | a sudoers rule, or a name in a privileged group, present on more than one host — shared privilege is shared reach, and `nopasswd` marks the grants that need no credential at all |
 | `CROSS_ACCOUNTS` | one username on several hosts, with `consistent` saying whether uid, shell and home agree everywhere. Distribution accounts are excluded; a second uid‑0 account is not |
-| `CROSS_PERSISTENCE` | a cron command, a systemd `ExecStart` or an `ld.so.preload` entry present on several hosts |
+| `CROSS_PERSISTENCE` | a cron entry, a systemd `ExecStart` or an `ld.so.preload` entry present on several hosts, with `notable` marking the ones that run something from where a package does not install — every `ld.so.preload` entry, anything out of `/tmp`, `/home`, `/opt`, `/usr/local` and friends, and anything that fetches a file and pipes it to a shell |
 | `CROSS_FINDINGS` | the same check firing on several hosts, grouped by title with its counts masked so `3 executable file(s)` and `7 executable file(s)` are one row |
 | `CROSS_TECHNIQUES` | which hosts raised which ATT&CK technique, and — the column worth reading — `missing_from` |
 | `HOSTS` | one row per input: label, hostname, distribution, offset, collection time, findings by severity |
@@ -256,6 +256,12 @@ rests on each run's resolved UTC offset, so a host that never recorded one
 becomes a `MEDIUM` finding of its own: if that host was not on UTC, every
 "four minutes after" in the correlation is wrong by that offset, and wrong in
 one direction.
+
+### The correlation, drawn
+
+Every `--correlate` run also writes **`correlation.svg`** into the export — the hosts, who reached whom, what moved between them, and any address that touched several of the collections without being one of them. It is a standalone SVG: no JavaScript, no fonts to ship, its own light and dark palette, and it drops straight into a report.
+
+Nothing about a particular case is written into it. The nodes come from `HOSTS`, the arrows from `CROSS_SESSIONS`, `CROSS_COMMANDS`, `CROSS_TRANSFERS` and `CROSS_IOCS`, and the caption says which tables it was drawn from — so a run with nothing shared draws a picture that says so, and a single collection draws nothing at all, because one host is not a correlation.
 
 ### Seeing it rather than reading it
 

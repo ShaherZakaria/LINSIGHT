@@ -106,6 +106,7 @@ import ipaddress
 import itertools
 import json
 import lzma
+import math
 import os
 import re
 import shutil
@@ -25074,6 +25075,7 @@ function viewIocs(){
    rather than animated: it has to settle the same way twice so that a
    screenshot in a report matches what the examiner saw. */
 var NODE_KIND={ip:'#58a6ff',user:'#f5d067',file:'#ff9f43',rule:'#ff5f56',cmd:'#a371f7',url:'#3fb950',tool:'#ff7b72',host:'#79c0ff',collection:'#79c0ff'};
+var EV_SHOWN=6;    /* sample rows the hover panel has room for */
 var EGN=44;        /* how many circles to draw - the examiner's choice */
 var EGISO=null;    /* the node the picture is narrowed to, by key */
 /* Which kinds of thing are drawn. All of them to start, because the first
@@ -25126,6 +25128,19 @@ function _egRank(why){
 /* An activity that succeeded is drawn differently from one that did not.
    Colour rather than a footnote, because on a busy picture the question is
    always which of these lines mattered. */
+/* One round of each source table, then the next, until the panel is full.
+   A node touched by four tables shows one row from each before it shows a
+   second from any. */
+function egEv(o){
+ var by=o&&o.evs,out=[],names,i,j;
+ if(!by)return out;
+ names=Object.keys(by);
+ for(i=0;i<EV_SHOWN&&out.length<EV_SHOWN;i++){
+  for(j=0;j<names.length&&out.length<EV_SHOWN;j++){
+   var lst=by[names[j]];
+   if(i<lst.length)out.push(lst[i]);}}
+ return out;
+}
 function egEdgeColour(e){
  if(e.kind==='move')return 'var(--gold)';
  if(e.kind==='in')return NODE_KIND.collection;
@@ -25137,18 +25152,33 @@ function egEdgeColour(e){
 function egBuild(){
  var nodes={},edges={},order=[];
  EGSRC={rows:0,tables:0};
- /* Six rows kept per node and per edge, so hovering can show the evidence
+ /* Six rows shown per node and per edge, so hovering can show the evidence
     rather than a count of it. Six because that is what fits in the panel -
-    the full set is one click away in the table it names. */
- var KEEP=6;
+    the full set is one click away in the table it names.
+
+    Kept per source table rather than first-come, because first-come is
+    whichever table egBuild happens to walk first. AUTH_LOG is walked before
+    PRIVILEGE_ACTIVITY, so on a host where root is the target of 168 sudo
+    calls and of a handful of refused logins, the root circle filled all six
+    of its slots with the refused logins and showed not one sudo call - and
+    the sudo calls are the reason anybody hovers root. Three per table, then
+    interleaved, so a node with two relations shows both and a node with one
+    still shows six of it: the interleave takes one row from each table in
+    turn, so six tables give one row each and one table gives all six. Up to
+    six are kept per table rather than three, or the single-relation node -
+    the common one - would show half a panel. */
  function node(kind,id,extra){
   if(!EGKIND[kind])return null;
   var k=kind+':'+id;
-  if(!nodes[k]){nodes[k]={k:k,kind:kind,id:id,n:0,extra:extra||'',ev:[]};
+  if(!nodes[k]){nodes[k]={k:k,kind:kind,id:id,n:0,extra:extra||'',evs:{}};
    order.push(nodes[k]);}
   nodes[k].n++;return nodes[k];}
  function evid(o,ctx){
-  if(ctx&&o.ev.length<KEEP)o.ev.push(ctx);}
+  if(!ctx)return;
+  var t=ctx.t||'';
+  if(!o.evs)o.evs={};
+  if(!o.evs[t])o.evs[t]=[];
+  if(o.evs[t].length<EV_SHOWN)o.evs[t].push(ctx);}
  /* `why` is the activity, and it is now the edge's own property rather than
     a string hidden in a tooltip: it is drawn on the line, it colours the
     line, and it is what the legend of relations counts. `kind` separates the
@@ -25158,7 +25188,7 @@ function egBuild(){
  function edge(a,b,why,ctx,kind){
   if(!a||!b||a===b)return null;
   var k=a.k+'>'+b.k;
-  if(!edges[k])edges[k]={a:a,b:b,n:0,why:why||'',ev:[],
+  if(!edges[k])edges[k]={a:a,b:b,n:0,why:why||'',evs:{},
                          kind:kind||'act',whys:{}};
   var e=edges[k];
   e.n++;
@@ -25636,12 +25666,12 @@ function egWire(){
   L.onmouseenter=function(){
    var e=EG.edges[i];
    detail(evHtml(e.a.id+'  \u2192  '+e.b.id,
-     e.n+' row(s) recorded this - '+e.why,e.ev));};});
+     e.n+' row(s) recorded this - '+e.why,egEv(e)));};});
  nodes.forEach(function(g,i){
   g.onmouseenter=function(){
    if(!drag&&!EG.focus)highlight(EG.nodes[i]);
    var nd=EG.nodes[i];
-   detail(evHtml(nd.kind+'  '+nd.id,nd.n+' row(s) name it',nd.ev));};
+   detail(evHtml(nd.kind+'  '+nd.id,nd.n+' row(s) name it',egEv(nd)));};
   g.onmouseleave=function(){if(!drag&&!EG.focus)highlight(null);};
   g.onmousedown=function(ev){
    ev.preventDefault();drag={i:i,moved:false};g.style.cursor='grabbing';};
@@ -27050,7 +27080,8 @@ function viewCorrelation(){
    ['kind','grant','host_count','hosts','notable','nopasswd']);
  h+=crossPanel('CROSS_ACCOUNTS',
    ['username','uid','host_count','hosts','consistent','shells']);
- h+=crossPanel('CROSS_PERSISTENCE',['kind','value','host_count','hosts']);
+ h+=crossPanel('CROSS_PERSISTENCE',
+   ['kind','value','host_count','hosts','notable']);
  h+=crossPanel('CROSS_FINDINGS',
    ['severity','category','finding','host_count','hosts'],
    function(c,v){
@@ -32108,6 +32139,15 @@ def _emit_outputs(tri, tables, meta, opts, tb=None):
     if outdir:
         os.makedirs(outdir, exist_ok=True)
     writer_times = []
+    # The correlation, drawn. Written whenever the table set holds the
+    # cross-host tables and there is somewhere to put it - it costs
+    # milliseconds, it is the first thing anybody opens on a multi-host case,
+    # and asking for it with a flag would mean most runs never see it.
+    if outdir:
+        t0 = time.perf_counter()
+        if write_correlation_svg(tables, os.path.join(outdir,
+                                                      "correlation.svg"), meta):
+            writer_times.append(("draw correlation", time.perf_counter() - t0))
     if csv_dir:
         t0 = time.perf_counter()
         n = write_tables_csv(tables, csv_dir)
@@ -32531,6 +32571,396 @@ def write_html(tri, path, opts, tb=None):
     print("[+] HTML report written to %s" % path, file=sys.stderr)
 
 # -------------------------------------------------------------------------
+# the correlation, drawn as one standalone SVG
+# -------------------------------------------------------------------------
+
+"""The correlation, drawn: one SVG built from the cross-host tables.
+
+The Correlation tab answers "what is true of more than one of these machines"
+in twelve grids. This draws the same thing as one picture, because the first
+question anybody asks of a multi-host case is which way it went, and a reader
+gets that from an arrow faster than from a table of pairs.
+
+Everything on the page is derived from the tables the correlator produced -
+the hosts from HOSTS, the arrows from CROSS_SESSIONS, CROSS_COMMANDS,
+CROSS_TRANSFERS and CROSS_IOCS, the notes under each host from its own
+findings and from what the cross tables marked notable. Nothing about any
+particular case is written into this file: hand it a different correlation and
+it draws that one, with that one's counts.
+
+Standalone SVG on purpose. It opens in any browser, embeds in a report, needs
+no fonts and no JavaScript, and carries its own light and dark palette so it
+reads on either surface - which a PNG cannot do and an HTML page cannot be
+pasted into a document.
+"""
+
+
+
+
+#: Colour by the job it does, not by the entity. Validated as a categorical
+#: set against both surfaces (worst all-pairs CVD dE 9.2 light / 9.4 dark);
+#: `bad` is the fixed status-critical step and never doubles as a series.
+#: Every edge also carries a written label, because three of these sit under
+#: 3:1 on the light surface and colour must not be the only thing saying what
+#: a line means.
+LIGHT = {"surface": "#fcfcfb", "panel": "#ffffff", "line": "#d9d8d3",
+         "ink": "#0b0b0b", "ink2": "#52514e", "ink3": "#75746f",
+         "host": "#2a78d6", "move": "#eb6834", "admin": "#1baf7a",
+         "bad": "#d03b3b", "dim": "#a3a29c"}
+DARK = {"surface": "#1a1a19", "panel": "#232322", "line": "#3a3a37",
+        "ink": "#ffffff", "ink2": "#c3c2b7", "ink3": "#9a998f",
+        "host": "#3987e5", "move": "#d95926", "admin": "#199e70",
+        "bad": "#d03b3b", "dim": "#6b6a64"}
+
+CARD_W, CARD_H = 268, 150
+EXT_W, EXT_H = 214, 128
+MARGIN = 40
+
+
+def _esc(text):
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _graph_rows(tables, name, wanted=None):
+    """Rows of one table as dicts, or [] where the table was not built."""
+    t = next((x for x in (tables or []) if getattr(x, "name", "") == name), None)
+    if t is None:
+        return []
+    at = dict((c, i) for i, c in enumerate(t.columns))
+    if wanted and not all(c in at for c in wanted):
+        return []
+    out = []
+    for row in t.iter_rows():
+        out.append(dict((c, (row[i] if i < len(row) else "") or "")
+                        for c, i in at.items()))
+    return out
+
+
+def _int(value):
+    try:
+        return int(str(value).replace(",", "").strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _short(text, n):
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+class _Edge(object):
+    """One arrow: a pair of nodes, what passed between them, how much."""
+
+    __slots__ = ("a", "b", "kind", "n", "label")
+
+    def __init__(self, a, b, kind, n, label):
+        self.a, self.b, self.kind, self.n, self.label = a, b, kind, n, label
+
+
+def _host_nodes(tables):
+    """One node per collection, with what its own run concluded about it."""
+    nodes = []
+    for r in _graph_rows(tables, "HOSTS"):
+        label = r.get("collection") or r.get("host") or ""
+        if not label:
+            continue
+        sev = []
+        for key, name in (("critical", "critical"), ("high", "high")):
+            n = _int(r.get(key))
+            if n:
+                sev.append("%d %s" % (n, name))
+        notes = []
+        if r.get("hostname") and r["hostname"] != label:
+            notes.append(r["hostname"])
+        if r.get("distribution"):
+            notes.append(_short(r["distribution"], 30))
+        nodes.append({"key": label, "kind": "host", "title": label,
+                      "sub": r.get("input_address") or r.get("hostname") or "",
+                      "lines": ([", ".join(sev)] if sev else []) + notes,
+                      "findings": _int(r.get("findings"))})
+    return nodes
+
+
+def _external_nodes(tables, host_labels, cap=2):
+    """Addresses that reached more than one collection but are not one of them.
+
+    A shared indicator that is an address and belongs to none of the machines
+    in the case is, by construction, somewhere else that touched several of
+    them. That is the node a reader looks for first, and it is derivable -
+    CROSS_IOCS already ranks them by how many hosts saw them.
+    """
+    out = []
+    for r in _graph_rows(tables, "CROSS_IOCS"):
+        if r.get("type") not in ("ipv4", "ipv6"):
+            continue
+        value = (r.get("indicator") or "").strip()
+        if not value or value in host_labels:
+            continue
+        hosts = [h.strip() for h in (r.get("hosts") or "").split(",") if h.strip()]
+        if len(hosts) < 2 or set(hosts) - set(host_labels):
+            continue
+        lines = [_short(r.get("why") or "seen on several hosts", 34)]
+        if r.get("total_mentions"):
+            lines.append("%s mention(s)" % r["total_mentions"])
+        if r.get("spread"):
+            lines.append("spread %s" % r["spread"])
+        out.append({"key": value, "kind": "ext", "title": value,
+                    "sub": "not one of these collections", "lines": lines,
+                    "rank": (len(hosts), _int(r.get("total_mentions")))})
+    out.sort(key=lambda n: n["rank"], reverse=True)
+    return out[:cap]
+
+
+def _edges(tables, known):
+    """Every arrow the cross tables support, aggregated per pair and kind."""
+    agg = {}
+
+    def bump(a, b, kind, n, label):
+        if a not in known or b not in known or a == b:
+            return
+        got = agg.get((a, b, kind))
+        if got is None:
+            agg[(a, b, kind)] = _Edge(a, b, kind, n, label)
+        else:
+            got.n += n
+
+    for r in _graph_rows(tables, "CROSS_SESSIONS"):
+        ok = "fail" not in (r.get("result") or "").lower()
+        bump(r.get("from_collection"), r.get("to_collection"),
+             "session" if ok else "refused", 1, "")
+    for r in _graph_rows(tables, "CROSS_COMMANDS"):
+        bump(r.get("from_collection"), r.get("to_collection"), "command", 1, "")
+    for r in _graph_rows(tables, "CROSS_TRANSFERS"):
+        bump(r.get("from_collection"), r.get("to_collection"), "move", 1, "")
+    for r in _graph_rows(tables, "CROSS_IOCS"):
+        a, b = (r.get("first_host") or ""), (r.get("last_host") or "")
+        if a and b and a != b:
+            bump(a, b, "move", 1, "")
+
+    out = []
+    for (a, b, kind), e in agg.items():
+        e.label = {"session": "%d sign-in%s", "refused": "%d refused",
+                   "command": "%d remote command%s",
+                   "move": "%d shared file/indicator%s"}[kind]
+        e.label = (e.label % (e.n, "" if e.n == 1 else "s")
+                   if "%s" in e.label else e.label % e.n)
+        out.append(e)
+    out.sort(key=lambda e: -e.n)
+    return out
+
+
+def _layout(hosts, exts, width):
+    """Externals down the left, collections on an arc to the right of them.
+
+    A ring rather than a row: with three or more collections a row puts every
+    arrow on top of the same horizontal line, and the pair counts stop being
+    readable. Two collections degenerate to a row, which is correct for two.
+    """
+    top = 150
+    for i, n in enumerate(exts):
+        n["x"] = MARGIN + EXT_W // 2
+        n["y"] = top + i * (EXT_H + 30) + EXT_H // 2
+    left = MARGIN + (EXT_W + 90 if exts else 0)
+    span = width - left - MARGIN - CARD_W // 2
+    cx = left + CARD_W // 2 + span * 0.45
+    if len(hosts) == 1:
+        hosts[0]["x"], hosts[0]["y"] = cx, top + CARD_H
+        return
+    if len(hosts) == 2:
+        for i, n in enumerate(hosts):
+            n["x"] = cx
+            n["y"] = top + CARD_H // 2 + i * (CARD_H + 60)
+        return
+    r = max(150, min(span * 0.5, 40 + len(hosts) * 32))
+    cy = top + CARD_H + r - 40
+    for i, n in enumerate(hosts):
+        ang = -math.pi / 2 + 2 * math.pi * i / len(hosts)
+        n["x"] = cx + math.cos(ang) * r * 1.35
+        n["y"] = cy + math.sin(ang) * r
+
+
+def _trim(x1, y1, x2, y2, w1, h1, w2, h2):
+    """Shorten a segment so it starts and ends outside both cards."""
+    dx, dy = x2 - x1, y2 - y1
+    d = math.hypot(dx, dy) or 1.0
+
+    def edge(w, h):
+        # distance from a card's centre to its border along this direction
+        sx = (w / 2 + 8) / abs(dx / d) if dx else float("inf")
+        sy = (h / 2 + 8) / abs(dy / d) if dy else float("inf")
+        return min(sx, sy)
+
+    a, b = edge(w1, h1), edge(w2, h2)
+    if a + b >= d - 12:
+        a = b = max(0.0, (d - 12) / 2)
+    return (x1 + dx / d * a, y1 + dy / d * a,
+            x2 - dx / d * b, y2 - dy / d * b)
+
+
+def _style():
+    def block(scope, pal):
+        return "%s{%s}" % (scope, "".join(
+            "--%s:%s;" % (k, v) for k, v in sorted(pal.items())))
+    return """<style>
+%s
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){%s}}
+%s
+.bg{fill:var(--surface)}
+.card{fill:var(--panel);stroke:var(--line);stroke-width:1}
+.t1{fill:var(--ink);font-size:14px;font-weight:650}
+.t2{fill:var(--ink2);font-size:11.5px}
+.t3{fill:var(--ink3);font-size:10.5px}
+.lbl{fill:var(--ink2);font-size:10.5px;font-weight:600}
+.hd{fill:var(--ink);font-size:19px;font-weight:700}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.e{fill:none;stroke-width:2}
+.e-session{stroke:var(--admin)}
+.e-refused{stroke:var(--dim);stroke-dasharray:5 4}
+.e-command{stroke:var(--host)}
+.e-move{stroke:var(--move);stroke-dasharray:9 4}
+.e-ext{stroke:var(--bad)}
+</style>""" % (block(":root", LIGHT),
+               "".join("--%s:%s;" % (k, v) for k, v in sorted(DARK.items())),
+               block(':root[data-theme="dark"]', DARK))
+
+
+def build_svg(tables, meta=None):
+    """The correlation as one SVG document. -> str, or '' if there is nothing."""
+    hosts = _host_nodes(tables)
+    if len(hosts) < 2:
+        return ""
+    labels = [n["key"] for n in hosts]
+    exts = _external_nodes(tables, labels)
+    known = set(labels) | set(n["key"] for n in exts)
+    edges = _edges(tables, known)
+
+    width = 1180
+    _layout(hosts, exts, width)
+    height = int(max([n["y"] + CARD_H for n in hosts]
+                     + [n["y"] + EXT_H for n in exts] + [520])) + 190
+
+    s = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" '
+         'width="%d" height="%d" role="img" aria-label="Correlation between '
+         '%d collections" font-family="ui-sans-serif,-apple-system,Segoe UI,'
+         'Roboto,Helvetica,Arial,sans-serif">' % (width, height, width, height,
+                                                  len(hosts))]
+    s.append("<title>Correlation across %d collections</title>" % len(hosts))
+    s.append(_style())
+    s.append('<rect class="bg" width="%d" height="%d"/>' % (width, height))
+    s.append("<defs>")
+    for kind, var in (("session", "--admin"), ("refused", "--dim"),
+                      ("command", "--host"), ("move", "--move"),
+                      ("ext", "--bad")):
+        s.append('<marker id="a-%s" viewBox="0 0 10 10" refX="9" refY="5" '
+                 'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
+                 '<path d="M0,0 L10,5 L0,10 z" fill="var(%s)"/></marker>'
+                 % (kind, var))
+    s.append("</defs>")
+
+    title = (meta or {}).get("hostname") or "%d collections" % len(hosts)
+    s.append('<text class="hd" x="%d" y="46">Correlation — %s</text>'
+             % (MARGIN, _esc(_short(title, 78))))
+    s.append('<text class="t2" x="%d" y="70">Every node and count is read from '
+             'the cross-host tables of this run. An arrow is drawn only where '
+             'a table recorded the relation.</text>' % MARGIN)
+
+    by_key = dict((n["key"], n) for n in hosts + exts)
+    for e in edges:
+        a, b = by_key[e.a], by_key[e.b]
+        aw, ah = ((EXT_W, EXT_H) if a["kind"] == "ext" else (CARD_W, CARD_H))
+        bw, bh = ((EXT_W, EXT_H) if b["kind"] == "ext" else (CARD_W, CARD_H))
+        x1, y1, x2, y2 = _trim(a["x"], a["y"], b["x"], b["y"], aw, ah, bw, bh)
+        cls = "e-ext" if a["kind"] == "ext" else "e-" + e.kind
+        mk = "ext" if a["kind"] == "ext" else e.kind
+        s.append('<path class="e %s" d="M%.0f,%.0f L%.0f,%.0f" '
+                 'marker-end="url(#a-%s)"><title>%s → %s: %s</title></path>'
+                 % (cls, x1, y1, x2, y2, mk, _esc(e.a), _esc(e.b),
+                    _esc(e.label)))
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        s.append('<text class="lbl" x="%.0f" y="%.0f" text-anchor="middle">%s'
+                 '</text>' % (mx, my - 6, _esc(e.label)))
+
+    for n in hosts + exts:
+        w, h = ((EXT_W, EXT_H) if n["kind"] == "ext" else (CARD_W, CARD_H))
+        x, y = n["x"] - w / 2, n["y"] - h / 2
+        accent = "--bad" if n["kind"] == "ext" else "--host"
+        s.append('<g><rect class="card" x="%.0f" y="%.0f" width="%d" '
+                 'height="%d" rx="10"/>' % (x, y, w, h))
+        s.append('<rect x="%.0f" y="%.0f" width="4" height="%d" rx="2" '
+                 'fill="var(%s)"/>' % (x, y, h, accent))
+        s.append('<text class="t1" x="%.0f" y="%.0f">%s</text>'
+                 % (x + 14, y + 25, _esc(_short(n["title"], 26))))
+        if n.get("sub"):
+            s.append('<text class="t3 mono" x="%.0f" y="%.0f">%s</text>'
+                     % (x + 14, y + 42, _esc(_short(n["sub"], 30))))
+        yy = y + 64
+        for line in n["lines"][:4]:
+            s.append('<text class="t2" x="%.0f" y="%.0f">%s</text>'
+                     % (x + 14, yy, _esc(_short(line, 32))))
+            yy += 17
+        s.append("</g>")
+
+    s.append(_legend(width, height, edges, tables))
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def _legend(width, height, edges, tables):
+    """What the lines mean, and what the picture was drawn from."""
+    kinds = [("e-session", "session", "a sign-in from one collection to another"),
+             ("e-refused", "refused", "a sign-in that was refused"),
+             ("e-command", "command", "a command naming another collection"),
+             ("e-move", "move", "a file or indicator seen on both"),
+             ("e-ext", "ext", "something outside the case reaching into it")]
+    used = set(e.kind for e in edges)
+    y = height - 150
+    out = ['<g><rect class="card" x="%d" y="%d" width="%d" height="118" '
+           'rx="10"/>' % (MARGIN, y, width - 2 * MARGIN)]
+    out.append('<text class="t1" x="%d" y="%d">How to read the lines</text>'
+               % (MARGIN + 18, y + 26))
+    col, row = 0, 0
+    for cls, kind, text in kinds:
+        if kind not in used and kind != "ext":
+            continue
+        lx = MARGIN + 18 + col * 540
+        ly = y + 52 + row * 24
+        out.append('<path class="e %s" d="M%d,%d L%d,%d" '
+                   'marker-end="url(#a-%s)"/>' % (cls, lx, ly - 4, lx + 44,
+                                                  ly - 4, kind))
+        out.append('<text class="t2" x="%d" y="%d">%s</text>'
+                   % (lx + 56, ly, _esc(text)))
+        row += 1
+        if row > 2:
+            row, col = 0, col + 1
+    counts = []
+    for name in ("CROSS_SESSIONS", "CROSS_COMMANDS", "CROSS_TRANSFERS",
+                 "CROSS_IOCS", "CROSS_KEYS", "CROSS_ACCOUNTS",
+                 "CROSS_PERSISTENCE", "CROSS_PRIVILEGE"):
+        n = len(_graph_rows(tables, name))
+        if n:
+            counts.append("%s %d" % (name.replace("CROSS_", "").lower(), n))
+    out.append('<text class="t3" x="%d" y="%d">drawn from: %s</text>'
+               % (MARGIN + 18, y + 104, _esc(", ".join(counts) or "no cross "
+                                             "table held a row")))
+    out.append("</g>")
+    return "\n".join(out)
+
+
+def write_correlation_svg(tables, path, meta=None):
+    """Write the diagram beside the rest of the export. -> path, or ''."""
+    svg = build_svg(tables, meta)
+    if not svg:
+        return ""
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(svg)
+    status("[+] correlation diagram written to %s" % path)
+    return path
+
+# -------------------------------------------------------------------------
 # cross-host correlation: several collections at once
 # -------------------------------------------------------------------------
 
@@ -32616,6 +33046,27 @@ _COUNT_RE = re.compile(r"\d[\d,]*")
 #: 'T1110 Brute Force / T1078 Valid Accounts' -> T1110, T1078. The same shape
 #: the console's matrix reads, so a technique means one thing in both.
 _TECH_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
+
+
+#: 'address 192.168.2.100', 'addresses: [10.0.0.5/24]', 'address' with the
+#: value in the next column - the three shapes a network configuration writes
+#: the host's own address in. Anchored, so 'dns-nameservers' and 'gateway'
+#: cannot reach it.
+_SELF_ADDRESS_RE = re.compile(r"^address(?:es)?\b[\s:=]*(.*)$", re.I)
+
+_ADDRESS_SPLIT_RE = re.compile(r"[,\s\[\]'\"]+")
+
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_IPV6_RE = re.compile(r"^[0-9a-f:]{3,45}$", re.I)
+
+
+def _is_address(text):
+    """An address this host answers on, or something that only looks like one."""
+    if not text or text.startswith(("127.", "::1", "fe80:", "0.0.0.0")):
+        return False
+    if _IPV4_RE.match(text):
+        return all(0 <= int(p) <= 255 for p in text.split("."))
+    return ":" in text and bool(_IPV6_RE.match(text))
 
 
 def _norm_title(title):
@@ -32735,6 +33186,53 @@ def merge_tables(per_host):
                 merged.add(*new)    # the one cell the source table cannot own
         out.append(merged)
     return out, column
+
+
+#: What the collection column says on a row that is about all of them.
+#:
+#: Not a host label, and deliberately not one of the real ones: a cross-host
+#: finding is a statement about the case rather than about any collection in
+#: it, and lending it a host's name would put it under a filter it does not
+#: belong to. The console's collection picker is built from the input labels,
+#: so this never becomes an option in it - narrowing to a host hides these
+#: rows, which is the same answer the Correlation tab gives for the same
+#: reason.
+CORRELATION_LABEL = "(correlation)"
+
+
+def fold_correlation(tables, cross, column):
+    """Put the correlation's own findings and timeline into the merged ones.
+
+    The cross-host tables join the merged export, and the correlator's
+    FINDINGS and TIMELINE are held back because the export already has one of
+    each. Held back was all that happened to them: the console reads its
+    findings list, its severity chips and its ATT&CK matrix out of the
+    FINDINGS *table*, so every correlation finding - including "a machine in
+    this case signed in to another", which is the strongest thing this tool
+    can say - was computed, counted, and then shown nowhere. Not in the
+    console, not in FINDINGS.csv, not in case.db. Only --html and --json saw
+    them, because those render a Triage rather than a table.
+
+    So the rows are folded in instead of dropped, under a label of their own.
+    """
+    merged = dict((t.name, t) for t in tables)
+    for src in cross:
+        if src.name not in ("FINDINGS", "TIMELINE"):
+            continue
+        dst = merged.get(src.name)
+        if dst is None:
+            continue
+        at = [dst.columns.index(c) if c in dst.columns else -1
+              for c in src.columns]
+        for row in src.iter_rows():
+            new = [""] * len(dst.columns)
+            for i, value in zip(at, row):
+                if i >= 0:
+                    new[i] = value
+            if dst.columns[0] == column:
+                new[0] = CORRELATION_LABEL
+            dst.add(*new)
+    return tables
 
 
 def merge_triage(cases, opts, tris):
@@ -33026,11 +33524,55 @@ class HostCase(object):
                 addr = addr.split("/")[0].strip()
                 if addr and not addr.startswith(("127.", "::1", "fe80:")):
                     self.addresses.add(addr)
+        # And off the configuration, which is where a disk image keeps it.
+        #
+        # INTERFACES is a live_response artifact - the output of `ip addr` at
+        # collection time - so a disk image produces none of it, and every
+        # host read from an image resolved to no addresses at all. That is not
+        # a small gap: it is the one input CROSS_SESSIONS runs on, so the
+        # table this whole module exists for silently reported nothing for
+        # disk images however much the logs held. On a three-host Hadoop
+        # cluster, slave1's auth.log carried 116 successful logins from the
+        # master and the correlation reported no sign-ins at all.
+        #
+        # /etc/network/interfaces and netplan are on the disk and say what the
+        # host gives itself. Only the address keys are read: `network`,
+        # `broadcast`, `gateway` and `dns-nameservers` are addresses too, and
+        # none of them is this host.
+        for r in self._cells(tables, "NETWORK_CONFIG", ("key", "value")):
+            m = _SELF_ADDRESS_RE.match(r["key"].strip())
+            if not m:
+                continue
+            for tok in _ADDRESS_SPLIT_RE.split("%s %s" % (m.group(1),
+                                                          r["value"])):
+                addr = tok.split("/")[0].strip()
+                if _is_address(addr):
+                    self.addresses.add(addr)
         for r in self._cells(tables, "DEVICE_PROFILE", ("category", "value")):
             if r["category"] == "hostname" and r["value"]:
                 self.names.add(r["value"].strip().lower())
         self.names.discard("")
         self.names.discard("localhost")
+
+    #: AUTH_LOG events that are an authentication result rather than a
+    #: connection.
+    #:
+    #: Every row here becomes a claim that one machine in this case signed in
+    #: to another, so it has to be an attempt to authenticate and its outcome
+    #: - not a TCP connection ending. sshd writes 'Connection closed by
+    #: 10.0.0.11' after a successful login, after a refused one, and after a
+    #: scanner opens a socket and goes away; taking it as a sign-in put 399 of
+    #: them into a three-host cluster's correlation and made 'connection
+    #: closed' read as 'signed in successfully'.
+    #:
+    #: The failures belong here as much as the successes: a host in the case
+    #: trying its neighbour and being refused is the finding CROSS_SESSIONS
+    #: reports at HIGH.
+    SESSION_EVENTS = frozenset((
+        "accepted login", "public key accepted", "session opened",
+        "failed password", "invalid user", "authentication failure",
+        "max auth attempts", "root login refused",
+    ))
 
     def _take_sessions(self, tables):
         """Every login this host accepted, and the address it came from.
@@ -33044,7 +33586,7 @@ class HostCase(object):
         for r in self._cells(tables, "AUTH_LOG",
                              ("timestamp_utc", "event", "user", "source_ip",
                               "result", "process")):
-            if r["source_ip"]:
+            if r["source_ip"] and r["event"] in self.SESSION_EVENTS:
                 self.sessions.append({
                     "when": r["timestamp_utc"], "user": r["user"],
                     "from": r["source_ip"].strip(),
@@ -33109,9 +33651,27 @@ class HostCase(object):
             if body:
                 self.keys.setdefault(body, []).append(r["path"])
 
+    #: CRON row kinds that are an autostart entry rather than a line of one.
+    #:
+    #: The table also keeps 'script_line' - a line *inside* a cron script - so
+    #: an examiner can read what the script does, and 'env' and 'unparsed'.
+    #: None of those is a thing that runs. Joining on them made
+    #: CROSS_PERSISTENCE 183 rows of the fragments two stock Debian hosts have
+    #: in common: '$iosched_idle \\', ') | do_sendmail', '-- --quiet'.
+    CRON_ENTRY_KINDS = ("crontab", "script")
+
     def _take_persistence(self, tables):
         """What runs without anybody asking, across the three usual places."""
-        for r in self._cells(tables, "CRON", ("command", "run_as", "file")):
+        cron = self._cells(tables, "CRON",
+                           ("command", "run_as", "file", "kind"))
+        if not cron:
+            # A CRON table from before the kind column existed. Everything is
+            # taken, as it was, rather than nothing.
+            cron = [dict(r, kind="crontab") for r in
+                    self._cells(tables, "CRON", ("command", "run_as", "file"))]
+        for r in cron:
+            if r["kind"] and r["kind"] not in self.CRON_ENTRY_KINDS:
+                continue
             if r["command"]:
                 self.persist[("cron", r["command"].strip())] = \
                     "%s (as %s)" % (r["file"], r["run_as"] or "?")
@@ -34184,14 +34744,20 @@ class Correlator(object):
     def t_cross_persistence(self):
         t = self.table("CROSS_PERSISTENCE",
                        "Autostart entries on more than one host",
-                       ["kind", "value", "host_count", "hosts", "where"],
+                       ["kind", "value", "host_count", "hosts", "notable",
+                        "where"],
                        "Correlation",
                        "A cron command, a systemd ExecStart or an "
                        "ld.so.preload entry that appears on several hosts. "
                        "Configuration management puts the same entries "
                        "everywhere and so does an intruder who scripted the "
                        "install; what tells them apart is what the command "
-                       "does, which is why the command itself is the column.")
+                       "does, which is why the command itself is the column. "
+                       "`notable` is the reading of that: any ld.so.preload "
+                       "entry, and any command that runs something from a "
+                       "directory a package does not install into or fetches "
+                       "one and pipes it to a shell. The rest is two hosts "
+                       "running the same distribution's stock cron.")
         shared = defaultdict(dict)
         for c in self.cases:
             for (kind, value), where in c.persist.items():
@@ -34199,28 +34765,46 @@ class Correlator(object):
         rows = [(-len(by), kind, value, by)
                 for (kind, value), by in shared.items() if len(by) > 1]
         rows.sort()
+        notable = []
         for _n, kind, value, by in rows:
+            mine = _persistence_notable(kind, value)
             t.add(kind, value, len(by), ", ".join(sorted(by)),
+                  "yes" if mine else "",
                   " | ".join("%s: %s" % (h, w) for h, w in sorted(by.items())))
-        if rows:
-            preload = [r for r in rows if r[1] == "ld.so.preload"]
-            self.add("HIGH" if preload else "INFO", "Correlation",
-                     "%d autostart entry(ies) appear on more than one host"
-                     % len(rows),
-                     "The same thing set to run on several machines. An "
+            if mine:
+                notable.append((-len(by), kind, value, by))
+        if notable:
+            preload = [r for r in notable if r[1] == "ld.so.preload"]
+            self.add("HIGH" if preload else "MEDIUM", "Correlation",
+                     "%d autostart entry(ies) somebody added appear on more "
+                     "than one host" % len(notable),
+                     "The same thing set to run on several machines, from "
+                     "somewhere a package does not install into. An "
                      "ld.so.preload entry shared across hosts is a userland "
                      "rootkit deployed to all of them and is why this is HIGH "
-                     "when one is present; a shared cron line is as likely to "
-                     "be the configuration management that built the estate."
+                     "when one is present."
                      if preload else
-                     "The same thing set to run on several machines - which "
-                     "on a managed estate is what management looks like. Read "
-                     "the commands rather than the count.",
+                     "The same thing set to run on several machines, from "
+                     "somewhere a package does not install into - which on a "
+                     "managed estate is what management looks like, and on a "
+                     "compromised one is what an install script looks like. "
+                     "Read the commands rather than the count.",
                      evidence=["%-14s %-3d host(s)  %s"
                                % (r[1], -r[0], trunc(r[2], 84))
-                               for r in rows[: self.EVIDENCE]],
-                     source="CROSS_PERSISTENCE", count=len(rows),
+                               for r in notable[: self.EVIDENCE]],
+                     source="CROSS_PERSISTENCE", count=len(notable),
                      mitre="T1053 Scheduled Task/Job / T1574.006 LD_PRELOAD")
+        rest = len(rows) - len(notable)
+        if rest:
+            self.add("INFO", "Correlation",
+                     "%d further autostart entry(ies) appear on more than one "
+                     "host" % rest,
+                     "Every one of them runs something from where a package "
+                     "puts files, which on machines built from one "
+                     "distribution is what being built from one distribution "
+                     "looks like. Listed in CROSS_PERSISTENCE rather than "
+                     "here.",
+                     source="CROSS_PERSISTENCE", count=rest)
 
     # -- 5e. the shape of the intrusion, per host --------------------------
     def t_cross_techniques(self):
@@ -34271,8 +34855,13 @@ class Correlator(object):
         computed from a table of that name, so a correlation written this way
         opens in the same page as a single host and needs no second console.
         """
+        # `artifact`, not `source`, though what it holds is the cross table
+        # the finding was read out of. The console looks these columns up by
+        # name - severity, category, title, mitre, artifact - so a table that
+        # calls the same thing something else opens with an empty column and
+        # no error, and a merge by name drops it. One name, both tables.
         t = self.table("FINDINGS", "Correlation findings",
-                       ["severity", "category", "title", "mitre", "source",
+                       ["severity", "category", "title", "mitre", "artifact",
                         "count", "first_utc", "last_utc", "detail",
                         "evidence_count", "evidence"],
                        "Analysis",
@@ -34335,6 +34924,32 @@ STOCK_SUDO_RULES = frozenset((
     "%wheel ALL=(ALL) ALL", "%wheel ALL=(ALL:ALL) ALL",
     "%wheel ALL=(ALL) NOPASSWD: ALL",
 ))
+
+
+#: A command that fetches something and runs it. The shape is the finding,
+#: whichever downloader is used to write it.
+_FETCH_RUN_RE = re.compile(
+    r"\b(?:curl|wget|fetch)\b[^|;&]*[|]\s*(?:sudo\s+)?"
+    r"(?:ba|da|k|z)?sh\b|\bpython\d?\s+-c\b|\bbase64\s+-d\b", re.I)
+
+
+def _persistence_notable(kind, value):
+    """Is this autostart entry somebody's, or the distribution's?
+
+    The same question CROSS_HASHES asks of a shared file and CROSS_PRIVILEGE
+    of a shared sudo rule. Two hosts of one distribution share every stock
+    cron entry it ships, and reporting those as shared persistence buries the
+    one line that runs something out of /tmp.
+
+    An ld.so.preload entry is always notable: nothing a package installs
+    writes to it, and a shared one is a userland rootkit on both machines.
+    """
+    if kind == "ld.so.preload":
+        return True
+    text = value or ""
+    if _FETCH_RUN_RE.search(text):
+        return True
+    return any(d in text for d in NOTABLE_DIRS)
 
 
 def _somebody_decided(kind, grant, cases):
@@ -34472,6 +35087,7 @@ def write_correlation(cases, outdir, opts):
     json_path = os.path.join(outdir, "tables.json")
     html_path = os.path.join(outdir, "console.html")
     n = write_tables_csv(tables, csv_dir)
+    write_correlation_svg(tables, os.path.join(outdir, "correlation.svg"), meta)
     write_tables_json(tables, json_path, meta)
     write_tables_html(tables, html_path, getattr(opts, "html_rows", 0), meta,
                       cor.tri, opts)
@@ -35048,8 +35664,17 @@ def main(argv=None):
         # The same rule the output paths follow: a ruleset written under the
         # collection contaminates it, and the next run would read it back as a
         # collected artifact.
-        if opts.collection and os.path.isdir(opts.collection):
-            base = os.path.abspath(opts.collection)
+        #
+        # Against every input, because there can be several and
+        # because this runs before any of them is resolved. It used to
+        # read opts.collection - which the run sets on itself later,
+        # and which stopped existing at all when the positional became
+        # plural, so --sigma-cached and --update-sigma raised
+        # AttributeError before reading a single byte of evidence.
+        for cand in _input_paths(opts):
+            if not os.path.isdir(cand):
+                continue        # only a directory can hold the cache
+            base = os.path.abspath(cand)
             if cache == base or cache.startswith(base + os.sep):
                 ap.error("refusing to keep the rule cache inside the "
                          "collection:\n      %s\n    choose a --sigma-dir "
@@ -35144,8 +35769,13 @@ def main(argv=None):
         # the cross-host tables join the export rather than becoming a second
         # one: the console carrying every host's rows is also where "which of
         # these hosts share this" is the natural next question
-        tables += [t for t in cor.run()
+        cross = cor.run()
+        tables += [t for t in cross
                    if t.name not in ("FINDINGS", "TIMELINE")]
+        # and its findings join the merged FINDINGS rather than being dropped
+        # with the table that held them - the console reads its findings out
+        # of that table, so anything not in it is computed and never shown
+        fold_correlation(tables, cross, hostcol)
     status("[*] merged %d table(s) from %d collections, %s row(s) total"
            % (len(tables), len(per_host),
               "{:,}".format(sum(len(t) for t in tables))))
@@ -35288,6 +35918,22 @@ def _host_opts(opts, label):
         # analyst wants from it is the export they would have asked for
         o.export = hdir
     return o
+
+
+def _input_paths(opts):
+    """Every path this run was pointed at, however it was named.
+
+    The positionals and the flags that declare a kind, flattened.
+    Called before anything is resolved, so it asks for nothing but
+    the strings the command line carried.
+    """
+    out = []
+    for attr in ("collections", "disk", "archive", "ad1"):
+        got = getattr(opts, attr, None) or []
+        out.extend(got if isinstance(got, list) else [got])
+    for raw in getattr(opts, "files", None) or []:
+        out.append(parse_file_spec(raw)[0])
+    return [p for p in out if p]
 
 
 def _run_one(ap, opts, forced, target, collect=False):
