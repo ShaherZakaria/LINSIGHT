@@ -314,7 +314,7 @@ class DiskCollection(Collection):
             node.path = path
             member = "[root]" + path
             key = member.lower()
-            self._names[key] = member
+            self._names[key] = key if key == member else member
             self._sizes[key] = node.size
             self._nodes[member] = node
             count += 1
@@ -393,7 +393,7 @@ class DiskCollection(Collection):
         carries crtime and the deleted inodes.
         """
         member = "bodyfile/bodyfile.txt"
-        self._names[member.lower()] = member
+        self._names[member.lower()] = member.lower()
         # an estimate: the table layer only uses it for progress and reporting
         self._sizes[member.lower()] = (len(self._nodes) +
                                        len(self.deleted_nodes)) * 120

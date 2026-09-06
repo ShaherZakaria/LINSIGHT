@@ -257,6 +257,12 @@ becomes a `MEDIUM` finding of its own: if that host was not on UTC, every
 "four minutes after" in the correlation is wrong by that offset, and wrong in
 one direction.
 
+### What a large image costs
+
+Memory tracks the **number of files**, not the size of the image. The name index is ~157 bytes per file, so the 3,000,000-name ceiling (`--disk-max-files`) is about 500 MB of index; the tables built from those names are several times that again.
+
+Above **500,000 names a run spills its tables to disk on its own** and says so — roughly half the peak memory for about a fifth more time. `--low-memory` asks for the same thing up front, and either of those decisions is left alone if you have made it. `--no-deleted` skips the deleted-inode scan, which is the slowest part of a large disk.
+
 ### The correlation, drawn
 
 Every `--correlate` run also writes **`correlation.svg`** into the export — the hosts, who reached whom, what moved between them, and any address that touched several of the collections without being one of them. It is a standalone SVG: no JavaScript, no fonts to ship, its own light and dark palette, and it drops straight into a report.
