@@ -189,6 +189,11 @@ padding:10px 12px;margin:0 0 12px}
 .mkstate{font-weight:600;color:var(--mkc,var(--fg))}
 .grow{flex:1}
 #hdr th.mkc,#hdr th.ntc{cursor:default;color:var(--dim)}
+/* A cross-host row is worth opening: the cell shows what fits across, the
+   opened row shows the command or the path in full. */
+tr.cxr{cursor:pointer}
+tr.cxr:hover td{background:var(--hover)}
+tr.cxd td{background:var(--sunk);padding:6px 8px}
 table.rkv{width:100%;border-collapse:collapse;margin:4px 0 8px}
 table.rkv th{text-align:left;color:var(--dim);font-weight:500;width:150px;
 vertical-align:top;padding:2px 8px 2px 0;white-space:nowrap;font-size:12px}
@@ -2854,6 +2859,20 @@ function viewHead(){
    statement about several collections at once, so narrowing to one would be
    filtering out the answer - and the tab says so rather than silently
    showing less. */
+/* One cross-host row, every column of it, nothing shortened.
+   The panel above shows the columns that fit across; this shows the row as it
+   is - which for CROSS_COMMANDS is the command in full, and for
+   CROSS_TRANSFERS the two paths. */
+function crossRowHtml(name,i){
+ var t=TB[name],rows=t&&t.rows;
+ if(!t||!rows||!rows[i])return '<div class="dim">row not decoded</div>';
+ var r=rows[i],h='<table class="rkv">';
+ t.columns.forEach(function(c,j){
+  var v=r[j];
+  if(v===undefined||v===null||v==='')return;
+  h+='<tr><th>'+esc(c)+'</th><td>'+esc(String(v))+'</td></tr>';});
+ return h+'</table>';
+}
 function crossPanel(name,cols,fmt){
  var t=TB[name];
  if(!t||!t.row_count)return '';
@@ -2871,12 +2890,17 @@ function crossPanel(name,cols,fmt){
  h+='<table class="tbl"><thead><tr>';
  cols.forEach(function(c){h+='<th>'+esc(c)+'</th>';});
  h+='</tr></thead><tbody>';
- rows.slice(0,8).forEach(function(r){
-  h+='<tr>';
+ /* Every row opens. A cross-host row is a claim with a command or a path
+    behind it, and those do not fit a cell - the panel shows what fits and the
+    row shows all of it, which is the same bargain the artifact grids make. */
+ rows.slice(0,8).forEach(function(r,i){
+  h+='<tr class="cxr" data-cx="'+esc(name)+'" data-cxi="'+i+'" '+
+     'title="click to see the whole row">';
   cols.forEach(function(c){
    var v=at[c]===undefined?'':r[at[c]];
    h+='<td>'+(fmt?fmt(c,v,r,at):esc(String(v==null?'':v)))+'</td>';});
-  h+='</tr>';});
+  h+='</tr><tr class="cxd" data-cxd="'+esc(name)+'-'+i+'" hidden>'+
+     '<td colspan="'+cols.length+'"></td></tr>';});
  h+='</tbody></table>';
  if(t.row_count>8)h+='<div class="dim pad">'+(t.row_count-8).toLocaleString()+
    ' more in the full table</div>';
@@ -3371,6 +3395,15 @@ function wire(){
  wireWin();
  [].forEach.call(document.querySelectorAll('[data-open]'),function(b){
   b.onclick=function(){setView('table',b.getAttribute('data-open'));};});
+ [].forEach.call(document.querySelectorAll('tr.cxr'),function(tr){
+  tr.onclick=function(){
+   var key=tr.getAttribute('data-cx')+'-'+tr.getAttribute('data-cxi'),
+       d=document.querySelector('tr.cxd[data-cxd="'+key+'"]');
+   if(!d)return;
+   if(!d.hidden){d.hidden=true;return;}   /* a second click closes it */
+   d.firstChild.innerHTML=crossRowHtml(tr.getAttribute('data-cx'),
+                                       Number(tr.getAttribute('data-cxi')));
+   d.hidden=false;};});
  [].forEach.call(document.querySelectorAll('[data-hostpick]'),function(b){
   b.onclick=function(){setHost(b.getAttribute('data-hostpick'));
                        setView('overview');};});
