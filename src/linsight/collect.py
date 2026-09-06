@@ -7,6 +7,7 @@ import fnmatch
 import io
 import json
 import os
+import hashlib
 import re
 import sys
 import tarfile
@@ -200,6 +201,7 @@ class Collection:
         self._names = {}          # lowercase relative name -> the same name, cased
         self._raw = {}            # lowercase relative name -> archive member name
         self._owners = {}         # lowercase relative name -> tar uname/uid
+        self._digests = None      # lowercase relative name -> {algo: hex}
         self.prefix = ""          # archive dir that holds the layout's marker
         self.mounted_root = False # the collection root IS the host filesystem
         self.layout = "uac"       # 'uac' or 'velociraptor'; see _find_prefix
@@ -284,6 +286,70 @@ class Collection:
         ran tar -x, so both answer nothing rather than answering wrongly.
         """
         return self._owners.get((self.prefix + rel.lstrip("/")).lower(), "")
+
+    #: Read in these, so a multi-gigabyte member is hashed without being held.
+    HASH_CHUNK = 1 << 20
+
+    def member_hash(self, rel, algos=("sha256",)):
+        """{algo: hex} for one member, computed by reading it. -> {} if unread.
+
+        Hashing is the one thing in this tool that reads a file it has no
+        interest in the contents of, so it is the one thing whose cost is the
+        size of the evidence rather than the shape of it. Nothing calls this
+        unless --hash asked for it.
+        """
+        if self.kind == "tar":
+            # A .tar.gz is one gzip stream, so seeking backwards in it means
+            # decompressing from the start again: measured at 0.2ms a member
+            # read in offset order against 55ms read out of it, on an archive
+            # of 58 MB, and that gap grows with the archive. Every member is
+            # therefore hashed in one forward pass the first time any of them
+            # is asked for, rather than seeking to each in turn.
+            if self._digests is None:
+                self._hash_tar(algos)
+            return self._digests.get((self.prefix + rel.lstrip("/")).lower(), {})
+        return self._hash_member(rel, algos)
+
+    def _hash_member(self, rel, algos):
+        """One member, read straight through. -> {algo: hex} or {}."""
+        real = self.resolve(rel)
+        if real is None:
+            return {}
+        try:
+            with self._open(real) as fh:
+                hs = [(a, hashlib.new(a)) for a in algos]
+                for chunk in iter(lambda: fh.read(self.HASH_CHUNK), b""):
+                    for _a, h in hs:
+                        h.update(chunk)
+                return dict((a, h.hexdigest()) for a, h in hs)
+        except Exception:
+            # the same answer an unreadable member gets everywhere else: no
+            # hash rather than no export
+            return {}
+
+    def _hash_tar(self, algos):
+        """Every member, in the order the archive stores them."""
+        self._digests = {}
+        try:
+            members = [m for m in self._tar.getmembers() if m.isfile()]
+        except Exception:
+            return
+        for m in sorted(members, key=lambda m: m.offset_data):
+            key = self._norm_member(m.name).lower()
+            if not key:
+                continue
+            try:
+                fh = self._tar.extractfile(m)
+                if fh is None:
+                    continue
+                hs = [(a, hashlib.new(a)) for a in algos]
+                with fh:
+                    for chunk in iter(lambda: fh.read(self.HASH_CHUNK), b""):
+                        for _a, h in hs:
+                            h.update(chunk)
+                self._digests[key] = dict((a, h.hexdigest()) for a, h in hs)
+            except Exception:
+                continue
 
     def member_time(self, rel):
         """(mtime, atime, ctime, crtime) for a member, as UTC strings.

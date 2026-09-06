@@ -1854,6 +1854,7 @@ class Collection:
         self._names = {}          # lowercase relative name -> the same name, cased
         self._raw = {}            # lowercase relative name -> archive member name
         self._owners = {}         # lowercase relative name -> tar uname/uid
+        self._digests = None      # lowercase relative name -> {algo: hex}
         self.prefix = ""          # archive dir that holds the layout's marker
         self.mounted_root = False # the collection root IS the host filesystem
         self.layout = "uac"       # 'uac' or 'velociraptor'; see _find_prefix
@@ -1938,6 +1939,70 @@ class Collection:
         ran tar -x, so both answer nothing rather than answering wrongly.
         """
         return self._owners.get((self.prefix + rel.lstrip("/")).lower(), "")
+
+    #: Read in these, so a multi-gigabyte member is hashed without being held.
+    HASH_CHUNK = 1 << 20
+
+    def member_hash(self, rel, algos=("sha256",)):
+        """{algo: hex} for one member, computed by reading it. -> {} if unread.
+
+        Hashing is the one thing in this tool that reads a file it has no
+        interest in the contents of, so it is the one thing whose cost is the
+        size of the evidence rather than the shape of it. Nothing calls this
+        unless --hash asked for it.
+        """
+        if self.kind == "tar":
+            # A .tar.gz is one gzip stream, so seeking backwards in it means
+            # decompressing from the start again: measured at 0.2ms a member
+            # read in offset order against 55ms read out of it, on an archive
+            # of 58 MB, and that gap grows with the archive. Every member is
+            # therefore hashed in one forward pass the first time any of them
+            # is asked for, rather than seeking to each in turn.
+            if self._digests is None:
+                self._hash_tar(algos)
+            return self._digests.get((self.prefix + rel.lstrip("/")).lower(), {})
+        return self._hash_member(rel, algos)
+
+    def _hash_member(self, rel, algos):
+        """One member, read straight through. -> {algo: hex} or {}."""
+        real = self.resolve(rel)
+        if real is None:
+            return {}
+        try:
+            with self._open(real) as fh:
+                hs = [(a, hashlib.new(a)) for a in algos]
+                for chunk in iter(lambda: fh.read(self.HASH_CHUNK), b""):
+                    for _a, h in hs:
+                        h.update(chunk)
+                return dict((a, h.hexdigest()) for a, h in hs)
+        except Exception:
+            # the same answer an unreadable member gets everywhere else: no
+            # hash rather than no export
+            return {}
+
+    def _hash_tar(self, algos):
+        """Every member, in the order the archive stores them."""
+        self._digests = {}
+        try:
+            members = [m for m in self._tar.getmembers() if m.isfile()]
+        except Exception:
+            return
+        for m in sorted(members, key=lambda m: m.offset_data):
+            key = self._norm_member(m.name).lower()
+            if not key:
+                continue
+            try:
+                fh = self._tar.extractfile(m)
+                if fh is None:
+                    continue
+                hs = [(a, hashlib.new(a)) for a in algos]
+                with fh:
+                    for chunk in iter(lambda: fh.read(self.HASH_CHUNK), b""):
+                        for _a, h in hs:
+                            h.update(chunk)
+                self._digests[key] = dict((a, h.hexdigest()) for a, h in hs)
+            except Exception:
+                continue
 
     def member_time(self, rel):
         """(mtime, atime, ctime, crtime) for a member, as UTC strings.
@@ -15992,13 +16057,38 @@ class TableBuilder:
         for e in sorted(self.tri.events, key=lambda ev: ev.ts):
             t.add(e.ts, e.severity, e.category, e.description, e.source)
 
+    #: Hash columns, in the order they appear. Kept here rather than inlined
+    #: because --hash names them and the inventory has to answer in the same
+    #: words.
+    HASH_ALGOS = ("md5", "sha1", "sha256")
+
+    def _inventory_hashes(self):
+        """(the algo columns this run can fill, the recorded digests).
+
+        The columns exist only when there is something to put in them. A run
+        with no --hash over a collection that hashed nothing would otherwise
+        carry four headings with nothing under them for every file on the
+        host, and an empty column reads as 'hashed, came back blank' - which
+        is a different and much more interesting statement than 'nobody
+        hashed this'. Merging is by column name, so a set of hosts where only
+        one was hashed still merges: the others simply have no such column.
+        """
+        recorded = self._exe_hashes()
+        want = set(getattr(self.tri.opts, "hash_algos", None) or ())
+        for entry in recorded.values():
+            want.update(a for a, v in entry.items() if v)
+        return tuple(a for a in self.HASH_ALGOS if a in want), recorded
+
     def t_file_inventory(self):
         """Every file in the collection - the 'did anything get missed' table."""
+        algos, recorded = self._inventory_hashes()
+        compute = tuple(a for a in getattr(self.tri.opts, "hash_algos", None) or ())
         t = self.table("FILE_INVENTORY", "Every file in the collection",
                        ["path", "host_path", "top_level", "category", "size_bytes",
                         "size_human", "owner", "owner_source", "mtime_utc",
                         "atime_utc", "ctime_utc", "crtime_utc", "time_source",
-                        "parsed_into"],
+                        "parsed_into"]
+                       + list(algos) + (["hash_source"] if algos else []),
                        "Collection",
                        "One row per collected file, with its times, who owned "
                        "it and the table that parsed it. Under a narrowed "
@@ -16020,9 +16110,16 @@ class TableBuilder:
                        "looking at rather than a formatting failure. Empty "
                        "means nothing recorded it: a zip carries no owner, "
                        "and the owner of an extracted directory is whoever "
-                       "unpacked it, so neither is guessed at.")
+                       "unpacked it, so neither is guessed at. The hash "
+                       "columns are present only when this run has hashes for "
+                       "them, and hash_source says where each came from: "
+                       "'collected' is the hash the collector or the "
+                       "acquisition recorded, which is a better record of "
+                       "what the file was than one computed afterwards, and "
+                       "'computed' is --hash reading the file here.")
         plen = len(self.col.prefix)
         rootfs = tuple(rd + "/" for rd in self.col.rootfs_dirs)
+        read_n = read_bytes = 0         # what --hash actually had to read
         # The bodyfile is the authoritative record of the host's own times
         # where the collection has one - it was read off the inodes. Anything
         # else is what the container happened to preserve, so it is the
@@ -16080,9 +16177,38 @@ class TableBuilder:
             else:
                 mtime, atime, ctime, crtime = times
                 origin = fallback if mtime else ""
-            t.add(rel, host, top, cat, size, human_size(size),
-                  owner, owner_src,
-                  mtime, atime, ctime, crtime, origin, into)
+            row = [rel, host, top, cat, size, human_size(size),
+                   owner, owner_src,
+                   mtime, atime, ctime, crtime, origin, into]
+            if algos:
+                # What something already recorded is never recomputed: it is
+                # the better record - taken on the host, or at acquisition,
+                # rather than off a copy afterwards - and it is free.
+                have = recorded.get(host) or {} if host else {}
+                missing = [a for a in compute if not have.get(a)]
+                # Only what has contents. A directory and a symlink read as
+                # zero bytes, and the sha256 of nothing is a real-looking
+                # digest that would sit in this column claiming to be the
+                # hash of /boot - the same digest, on every host, for every
+                # directory in the world.
+                got = ({} if not missing or self.col.member_kind(rel) != "f"
+                       else self.col.member_hash(rel, tuple(missing)))
+                if got:
+                    read_n += 1
+                    read_bytes += size
+                src = ("collected" if any(have.get(a) for a in algos) else "")
+                if got:
+                    src = "computed" if not src else "collected + computed"
+                row += [have.get(a) or got.get(a, "") for a in algos]
+                row.append(src)
+            t.add(*row)
+        if read_n:
+            # Said out loud because it is the one part of a run whose cost is
+            # the size of the evidence: an analyst who sees four minutes go
+            # missing should be able to find out where they went.
+            status("[+] --hash: %s of %s read to hash %s file(s) (%s)"
+                   % (human_size(read_bytes), self.col.kind,
+                      "{:,}".format(read_n), ", ".join(algos)))
 
     # -- 2. processes -------------------------------------------------------
     def t_processes(self):
@@ -35875,6 +36001,12 @@ def _case_db_beside(opts):
     return os.path.join(opts.export or os.getcwd(), "case.db")
 
 
+#: What --hash will compute, in the order the columns appear. md5 and sha1 are
+#: here because an indicator feed is as likely to be written in one of them as
+#: in sha256, not because they are worth trusting for anything else.
+HASH_ALGOS = ("md5", "sha1", "sha256")
+
+
 #: A file --serve will open as a case. The extension is checked rather than
 #: the contents because the message for "that is not a case" should name what
 #: was given, not what SQLite made of it.
@@ -35949,6 +36081,10 @@ def _reopen_case(ap, opts):
                  "or point --serve at the export directory of a run that "
                  "already happened." % path)
 
+    if getattr(opts, "hash_algos", None):
+        ap.error("--hash reads every file in the collection to hash it, and "
+                 "reopening a case parses nothing at all. Re-run over the "
+                 "collection with --hash, then serve the export it writes.")
     db = CaseDB(path)
     try:
         tables, meta, console = db.reopen()
@@ -36203,12 +36339,33 @@ def main(argv=None):
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colour")
     ap.add_argument("--quiet", action="store_true", help="suppress the console report")
     ap.add_argument("--debug", action="store_true", help="re-raise analyzer exceptions")
+    ap.add_argument("--hash", nargs="?", const="sha256", metavar="ALGO[,ALGO]",
+                    help="hash every file in the inventory, which means "
+                         "reading every one of them - the only thing in here "
+                         "whose cost is the size of the evidence rather than "
+                         "its shape. sha256 unless md5 or sha1 is named; "
+                         "several run in one pass over each file. Hashes the "
+                         "collection already recorded are shown either way "
+                         "and are never recomputed, so leave this off unless "
+                         "you need the files nothing hashed.")
     ap.add_argument("--low-memory", action="store_true",
                     help="spill large tables to a temp file - roughly half the peak "
                          "memory, about a fifth more time")
     ap.add_argument("--timing", action="store_true",
                     help="report wall time per table extractor and per output writer")
     opts = ap.parse_args(argv)
+
+    # Validated here rather than where the files are read: a run that spends
+    # four minutes parsing and then refuses '--hash sha257' has wasted the
+    # four minutes, and the misspelling is visible before any of them.
+    opts.hash_algos = ()
+    if opts.hash is not None:
+        want = [a.strip().lower() for a in opts.hash.split(",") if a.strip()]
+        bad = [a for a in want if a not in HASH_ALGOS]
+        if bad:
+            ap.error("--hash takes %s; got %s"
+                     % (", ".join(HASH_ALGOS), ", ".join(bad)))
+        opts.hash_algos = tuple(a for a in HASH_ALGOS if a in want)
 
     # set before any table is built, because a table that has already buffered
     # its rows cannot be made to have spilled them

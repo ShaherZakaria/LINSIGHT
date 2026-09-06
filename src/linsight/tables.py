@@ -692,13 +692,38 @@ class TableBuilder:
         for e in sorted(self.tri.events, key=lambda ev: ev.ts):
             t.add(e.ts, e.severity, e.category, e.description, e.source)
 
+    #: Hash columns, in the order they appear. Kept here rather than inlined
+    #: because --hash names them and the inventory has to answer in the same
+    #: words.
+    HASH_ALGOS = ("md5", "sha1", "sha256")
+
+    def _inventory_hashes(self):
+        """(the algo columns this run can fill, the recorded digests).
+
+        The columns exist only when there is something to put in them. A run
+        with no --hash over a collection that hashed nothing would otherwise
+        carry four headings with nothing under them for every file on the
+        host, and an empty column reads as 'hashed, came back blank' - which
+        is a different and much more interesting statement than 'nobody
+        hashed this'. Merging is by column name, so a set of hosts where only
+        one was hashed still merges: the others simply have no such column.
+        """
+        recorded = self._exe_hashes()
+        want = set(getattr(self.tri.opts, "hash_algos", None) or ())
+        for entry in recorded.values():
+            want.update(a for a, v in entry.items() if v)
+        return tuple(a for a in self.HASH_ALGOS if a in want), recorded
+
     def t_file_inventory(self):
         """Every file in the collection - the 'did anything get missed' table."""
+        algos, recorded = self._inventory_hashes()
+        compute = tuple(a for a in getattr(self.tri.opts, "hash_algos", None) or ())
         t = self.table("FILE_INVENTORY", "Every file in the collection",
                        ["path", "host_path", "top_level", "category", "size_bytes",
                         "size_human", "owner", "owner_source", "mtime_utc",
                         "atime_utc", "ctime_utc", "crtime_utc", "time_source",
-                        "parsed_into"],
+                        "parsed_into"]
+                       + list(algos) + (["hash_source"] if algos else []),
                        "Collection",
                        "One row per collected file, with its times, who owned "
                        "it and the table that parsed it. Under a narrowed "
@@ -720,9 +745,16 @@ class TableBuilder:
                        "looking at rather than a formatting failure. Empty "
                        "means nothing recorded it: a zip carries no owner, "
                        "and the owner of an extracted directory is whoever "
-                       "unpacked it, so neither is guessed at.")
+                       "unpacked it, so neither is guessed at. The hash "
+                       "columns are present only when this run has hashes for "
+                       "them, and hash_source says where each came from: "
+                       "'collected' is the hash the collector or the "
+                       "acquisition recorded, which is a better record of "
+                       "what the file was than one computed afterwards, and "
+                       "'computed' is --hash reading the file here.")
         plen = len(self.col.prefix)
         rootfs = tuple(rd + "/" for rd in self.col.rootfs_dirs)
+        read_n = read_bytes = 0         # what --hash actually had to read
         # The bodyfile is the authoritative record of the host's own times
         # where the collection has one - it was read off the inodes. Anything
         # else is what the container happened to preserve, so it is the
@@ -780,9 +812,38 @@ class TableBuilder:
             else:
                 mtime, atime, ctime, crtime = times
                 origin = fallback if mtime else ""
-            t.add(rel, host, top, cat, size, human_size(size),
-                  owner, owner_src,
-                  mtime, atime, ctime, crtime, origin, into)
+            row = [rel, host, top, cat, size, human_size(size),
+                   owner, owner_src,
+                   mtime, atime, ctime, crtime, origin, into]
+            if algos:
+                # What something already recorded is never recomputed: it is
+                # the better record - taken on the host, or at acquisition,
+                # rather than off a copy afterwards - and it is free.
+                have = recorded.get(host) or {} if host else {}
+                missing = [a for a in compute if not have.get(a)]
+                # Only what has contents. A directory and a symlink read as
+                # zero bytes, and the sha256 of nothing is a real-looking
+                # digest that would sit in this column claiming to be the
+                # hash of /boot - the same digest, on every host, for every
+                # directory in the world.
+                got = ({} if not missing or self.col.member_kind(rel) != "f"
+                       else self.col.member_hash(rel, tuple(missing)))
+                if got:
+                    read_n += 1
+                    read_bytes += size
+                src = ("collected" if any(have.get(a) for a in algos) else "")
+                if got:
+                    src = "computed" if not src else "collected + computed"
+                row += [have.get(a) or got.get(a, "") for a in algos]
+                row.append(src)
+            t.add(*row)
+        if read_n:
+            # Said out loud because it is the one part of a run whose cost is
+            # the size of the evidence: an analyst who sees four minutes go
+            # missing should be able to find out where they went.
+            status("[+] --hash: %s of %s read to hash %s file(s) (%s)"
+                   % (human_size(read_bytes), self.col.kind,
+                      "{:,}".format(read_n), ", ".join(algos)))
 
     # -- 2. processes -------------------------------------------------------
     def t_processes(self):
