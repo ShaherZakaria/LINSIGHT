@@ -894,15 +894,23 @@ def check_diagram(L, res):
         res.check("  %s is on it" % host, host in svg)
     res.check("the address that reached two hosts is on it too",
               OUTSIDE in svg, "expected %s" % OUTSIDE)
-    res.check("an address belonging to one of the hosts is not a node",
-              svg.count(ADDR["web01"]) == 0,
-              "%s should not be drawn as an outsider" % ADDR["web01"])
+    # A host's own address belongs on its own card - that is what the arrows
+    # are about. What it must never be is a node of its own, so the check is
+    # against the titles, not against the whole document.
+    titles = _re().findall(r'class="t1"[^>]*>([^<]+)<', svg)
+    res.check("a host's address is shown on its card",
+              any(ADDR["web01"] in t for t in
+                  _re().findall(r'class="t3[^"]*"[^>]*>([^<]+)<', svg)),
+              "expected %s under a host name" % ADDR["web01"])
+    res.check("but it is not a node of its own",
+              ADDR["web01"] not in titles,
+              "%s drawn as an outsider" % ADDR["web01"])
     # The cluster's own peers are the most-shared indicators in any real case,
     # so a filter that only knows the collection *names* draws the machines
     # themselves as strangers and pushes the real outsider off the picture.
     res.check("nor is the peer address every host sees most often",
-              ADDR["db02"] not in svg,
-              "%s is one of these collections" % ADDR["db02"])
+              ADDR["db02"] not in titles,
+              "%s drawn as an outsider" % ADDR["db02"])
     res.check("and the outsider survives being outranked by them",
               OUTSIDE in svg, "expected %s to be drawn" % OUTSIDE)
     res.check("HOSTS says what each collection answers on",
@@ -910,9 +918,14 @@ def check_diagram(L, res):
               "no addresses column filled")
     res.check("the sign-in edges are labelled with their count",
               "sign-in" in svg and "refused" in svg)
-    res.check("a shared file is drawn as movement", "shared file" in svg)
-    res.check("and a command that names another host is its own kind",
-              "remote command" in svg)
+    res.check("a shared file is named on the line that carries it",
+              "file" in svg, "no file relation in any label")
+    res.check("and a command that names another host is named too",
+              "cmd" in svg, "no command relation in any label")
+    res.check("a pair related several ways gets one line saying all of it",
+              any(" · " in t for t in
+                  __import__("re").findall(r'class="lbl"[^>]*>([^<]+)', svg)),
+              "no combined label - every relation drew its own line again")
     res.check("the caption says what it was drawn from", "drawn from:" in svg)
     res.check("both themes are defined, not one flipped",
               "prefers-color-scheme: dark" in svg
@@ -933,6 +946,11 @@ def check_diagram_one_host(L, res):
     svg = _build_svg(L)(cor.tables, {})
     res.check("a single collection draws nothing at all", svg == "",
               "got %d bytes" % len(svg))
+
+
+def _re():
+    import re
+    return re
 
 
 def _build_svg(L):
@@ -957,6 +975,29 @@ def _parses(svg):
         return True
     except Exception:
         return False
+
+
+def check_cross_timeline(L, res):
+    """One clock for the whole case, and it has to carry every dated kind."""
+    print(chr(10) + "everything between the hosts, in order")
+    cor = build(L)
+    rows = rows_of(cor, "CROSS_TIMELINE")
+    res.check("there is a timeline at all", bool(rows), "no rows")
+    stamps = [r["timestamp_utc"] for r in rows]
+    res.check("it is sorted", stamps == sorted(stamps), "out of order")
+    res.check("every row carries a time", all(stamps))
+    kinds = set(r["basis"] for r in rows)
+    for want in ("CROSS_SESSIONS", "CROSS_COMMANDS", "CROSS_TRANSFERS"):
+        res.check("  %s reaches it" % want, want in kinds, "got %s" % kinds)
+    res.check("both ends are named",
+              all(r["from_collection"] and r["to_collection"] for r in rows
+                  if r["basis"] != "CROSS_IOCS"))
+    res.check("a refused sign-in is not called a sign-in",
+              any(r["event"] == "sign-in refused" for r in rows),
+              "got %s" % sorted(set(r["event"] for r in rows)))
+    res.check("and it is counted in a finding",
+              any("dated cross-host event" in f.title for f in cor.tri.findings),
+              "got %s" % [f.title for f in cor.tri.findings][:4])
 
 
 def check_tab_contract(L, res):
@@ -1050,6 +1091,7 @@ def main():
     check_findings_reach_the_merge(L, res)
     check_diagram(L, res)
     check_diagram_one_host(L, res)
+    check_cross_timeline(L, res)
     check_tab_contract(L, res)
 
     print("\n%d passed, %d failed" % (res.passed, len(res.failed)))

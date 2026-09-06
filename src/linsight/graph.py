@@ -41,8 +41,8 @@ DARK = {"surface": "#1a1a19", "panel": "#232322", "line": "#3a3a37",
         "host": "#3987e5", "move": "#d95926", "admin": "#199e70",
         "bad": "#d03b3b", "dim": "#6b6a64"}
 
-CARD_W, CARD_H = 268, 150
-EXT_W, EXT_H = 214, 128
+CARD_W, CARD_H = 210, 74
+EXT_W, EXT_H = 190, 74
 MARGIN = 40
 
 
@@ -73,18 +73,67 @@ def _int(value):
         return 0
 
 
+#: Width of an average character as a fraction of the font size. SVG has no
+#: text metrics without a renderer, so the fit is estimated - generously, so
+#: the estimate errs toward wrapping early rather than toward overflowing a
+#: card, which is the failure a reader actually sees.
+CHAR_W = 0.56
+
+
+def _fits(text, px, size):
+    return len(str(text)) * size * CHAR_W <= px
+
+
+def _wrap(text, px, size, lines=1):
+    """Break text to fit a width, on word boundaries. -> [line, ...]
+
+    Truncating by character count cut words in half - 'authentication source,
+    failed a…' - and still overflowed, because a character count is not a
+    width. This measures, breaks where there is a space, and only ellipsises
+    when the last line it is allowed still does not fit.
+    """
+    text = " ".join(str(text or "").split())
+    if not text:
+        return []
+    budget = max(4, int(px / (size * CHAR_W)))
+    out, rest = [], text
+    while rest and len(out) < lines:
+        if len(rest) <= budget:
+            out.append(rest)
+            return out
+        cut = rest.rfind(" ", 0, budget + 1)
+        if cut <= 0 or len(out) + 1 == lines:
+            break
+        out.append(rest[:cut])
+        rest = rest[cut + 1:].strip()
+    if rest:
+        if len(rest) <= budget:
+            out.append(rest)
+        else:
+            # no space to break at, or out of lines: cut, and say it was cut
+            out.append(rest[: max(1, budget - 1)].rstrip() + "…")
+    return out
+
+
 def _short(text, n):
-    text = str(text)
-    return text if len(text) <= n else text[: n - 1] + "…"
+    """A single line, cut on a word boundary where there is one."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= n:
+        return text
+    cut = text.rfind(" ", 0, n)
+    return (text[:cut] if cut > n // 2 else text[: n - 1]).rstrip() + "…"
 
 
 class _Edge(object):
     """One arrow: a pair of nodes, what passed between them, how much."""
 
-    __slots__ = ("a", "b", "kind", "n", "label")
+    __slots__ = ("a", "b", "kind", "n", "label", "lane", "along", "flip",
+                 "first")
 
     def __init__(self, a, b, kind, n, label):
         self.a, self.b, self.kind, self.n, self.label = a, b, kind, n, label
+        self.lane, self.along, self.flip = 0.0, 0.5, False
+        self.first = ""
 
 
 def _host_nodes(tables):
@@ -99,14 +148,22 @@ def _host_nodes(tables):
             n = _int(r.get(key))
             if n:
                 sev.append("%d %s" % (n, name))
+        # The address under the name, because the address is what every arrow
+        # in this picture is about - a login is from 192.168.2.100 until a row
+        # says whose that is. The hostname goes in the body: it is what the
+        # machine calls itself, which is worth reading and is not what the
+        # edges join on. Printing it in both places, which this did, wasted
+        # the widest line on the card saying one thing twice.
+        # Name, address, and what its own run concluded - nothing else. A
+        # relationship diagram is read for its arrows; a paragraph inside
+        # every node competes with them and wins, which is what made the
+        # first two versions of this unreadable.
         notes = []
-        if r.get("hostname") and r["hostname"] != label:
-            notes.append(r["hostname"])
-        if r.get("distribution"):
-            notes.append(_short(r["distribution"], 30))
+        if sev:
+            notes.append(", ".join(sev))
         nodes.append({"key": label, "kind": "host", "title": label,
-                      "sub": r.get("input_address") or r.get("hostname") or "",
-                      "lines": ([", ".join(sev)] if sev else []) + notes,
+                      "sub": r.get("addresses") or r.get("hostname") or "",
+                      "lines": notes,
                       "findings": _int(r.get("findings"))})
     return nodes
 
@@ -148,53 +205,163 @@ def _external_nodes(tables, host_labels, cap=2):
         hosts = [h.strip() for h in (r.get("hosts") or "").split(",") if h.strip()]
         if len(hosts) < 2 or set(hosts) - set(host_labels):
             continue
-        lines = [_short(r.get("why") or "seen on several hosts", 34)]
+        # `why` is every provenance label that indicator collected, joined.
+        # On a busy address that is three sentences of comma-separated text;
+        # as one wrapped block it filled the card and still got cut. One
+        # reason per line, the three most specific, and the count says how
+        # many there were.
+        why = [w.strip() for w in (r.get("why") or "").split(",") if w.strip()]
+        lines = [_short(why[0], 26)] if why else ["seen on several hosts"]
+        tail = []
         if r.get("total_mentions"):
-            lines.append("%s mention(s)" % r["total_mentions"])
+            tail.append("%s mention(s)" % r["total_mentions"])
         if r.get("spread"):
-            lines.append("spread %s" % r["spread"])
+            tail.append("over %s" % r["spread"])
+        if tail:
+            lines.append(" · ".join(tail))
         out.append({"key": value, "kind": "ext", "title": value,
-                    "sub": "not one of these collections", "lines": lines,
+                    "sub": "outside the case", "lines": lines,
                     "rank": (len(hosts), _int(r.get("total_mentions")))})
     out.sort(key=lambda n: n["rank"], reverse=True)
     return out[:cap]
 
 
+#: Which relation a pair's line is coloured and named by when it carries
+#: several. A sign-in is the strongest claim - one machine authenticated to
+#: another - then movement of a file, then a command that names a host, then
+#: an attempt that was refused.
+KIND_ORDER = ("session", "move", "command", "refused")
+
+#: The short form each relation takes when a pair carries more than one, so a
+#: line reads "84 sign-ins · 13 cmd" rather than three sentences stacked.
+SHORT = {"session": "%d sign-in%s", "refused": "%d refused",
+         "command": "%d cmd", "move": "%d file%s"}
+
+
 def _edges(tables, known):
-    """Every arrow the cross tables support, aggregated per pair and kind."""
-    agg = {}
+    """One arrow per direction, naming everything that direction carries.
 
-    def bump(a, b, kind, n, label):
-        if a not in known or b not in known or a == b:
-            return
-        got = agg.get((a, b, kind))
-        if got is None:
-            agg[(a, b, kind)] = _Edge(a, b, kind, n, label)
-        else:
-            got.n += n
+    Not one arrow per relation. Two machines in one case are related several
+    ways at once, and drawn separately those lines start and end at the same
+    two cards - on a three-host cluster that was nineteen lines over six
+    routes, with five labels printed at a single point. The pair is the fact a
+    reader wants ("these two talk, this way round, this much"); which tables
+    say so is the label, and the full detail is a click away in the grids.
+    """
+    agg, firsts = {}, {}
 
-    for r in _graph_rows(tables, "CROSS_SESSIONS"):
-        ok = "fail" not in (r.get("result") or "").lower()
-        bump(r.get("from_collection"), r.get("to_collection"),
-             "session" if ok else "refused", 1, "")
-    for r in _graph_rows(tables, "CROSS_COMMANDS"):
-        bump(r.get("from_collection"), r.get("to_collection"), "command", 1, "")
-    for r in _graph_rows(tables, "CROSS_TRANSFERS"):
-        bump(r.get("from_collection"), r.get("to_collection"), "move", 1, "")
+    def stamp(a, b, when):
+        """The earliest time anything passed this way, for the arrow label."""
+        when = (when or "").strip()
+        if when and (not firsts.get((a, b)) or when < firsts[(a, b)]):
+            firsts[(a, b)] = when
+
+    for name, kind, ok_col in (("CROSS_SESSIONS", None, "result"),
+                               ("CROSS_COMMANDS", "command", None),
+                               ("CROSS_TRANSFERS", "move", None)):
+        for r in _graph_rows(tables, name):
+            a, b = r.get("from_collection"), r.get("to_collection")
+            if a not in known or b not in known or a == b:
+                continue
+            k = kind
+            if k is None:
+                k = ("refused" if "fail" in (r.get(ok_col) or "").lower()
+                     else "session")
+            agg.setdefault((a, b), {}).setdefault(k, 0)
+            agg[(a, b)][k] += 1
+            stamp(a, b, r.get("timestamp_utc") or r.get("first_utc"))
     for r in _graph_rows(tables, "CROSS_IOCS"):
         a, b = (r.get("first_host") or ""), (r.get("last_host") or "")
-        if a and b and a != b:
-            bump(a, b, "move", 1, "")
+        if a in known and b in known and a != b:
+            agg.setdefault((a, b), {}).setdefault("move", 0)
+            agg[(a, b)]["move"] += 1
+            stamp(a, b, r.get("first_utc"))
 
     out = []
-    for (a, b, kind), e in agg.items():
-        e.label = {"session": "%d sign-in%s", "refused": "%d refused",
-                   "command": "%d remote command%s",
-                   "move": "%d shared file/indicator%s"}[kind]
-        e.label = (e.label % (e.n, "" if e.n == 1 else "s")
-                   if "%s" in e.label else e.label % e.n)
+    for (a, b), kinds in agg.items():
+        parts = []
+        for k in KIND_ORDER:
+            n = kinds.get(k)
+            if not n:
+                continue
+            fmt = SHORT[k]
+            parts.append(fmt % ((n, "" if n == 1 else "s")
+                                if "%s" in fmt else n))
+        lead = next(k for k in KIND_ORDER if kinds.get(k))
+        e = _Edge(a, b, lead, sum(kinds.values()), " · ".join(parts))
+        e.first = firsts.get((a, b), "")
         out.append(e)
     out.sort(key=lambda e: -e.n)
+    return _fan(out)
+
+
+def _findings(tables):
+    """The correlation's own findings, dated, earliest first.
+
+    In a merged export FINDINGS holds every host's findings too, so the
+    correlation's are the ones whose category says so - the same column the
+    console filters on. In a --split correlation the whole table is theirs.
+    """
+    out = []
+    for r in _graph_rows(tables, "FINDINGS"):
+        if (r.get("category") or "") != "Correlation":
+            continue
+        when = (r.get("first_utc") or "").strip()
+        if not when:
+            continue
+        out.append((when, r.get("severity") or "INFO",
+                    r.get("title") or "", r.get("artifact") or ""))
+    out.sort()
+    return out
+
+
+def _moment(tables):
+    """The first time one of these machines signed in to another.
+
+    The turn in a multi-host case, and the one line a reader wants before any
+    table: not that the machines are related, but when the relation started
+    and which way it ran. Derived rather than narrated - the earliest row of
+    CROSS_SESSIONS that succeeded.
+    """
+    best = None
+    for r in _graph_rows(tables, "CROSS_SESSIONS"):
+        when = (r.get("timestamp_utc") or "").strip()
+        if not when or "fail" in (r.get("result") or "").lower():
+            continue
+        if best is None or when < best[0]:
+            best = (when, r.get("from_collection") or "",
+                    r.get("to_collection") or "", r.get("user") or "",
+                    r.get("service") or "")
+    return best
+
+
+def _per_host(tables, labels):
+    """What the correlation says about each collection, one line each."""
+    out = {}
+    for label in labels:
+        outbound = inbound = 0
+        for r in _graph_rows(tables, "CROSS_SESSIONS"):
+            if "fail" in (r.get("result") or "").lower():
+                continue
+            if r.get("from_collection") == label:
+                outbound += 1
+            elif r.get("to_collection") == label:
+                inbound += 1
+        notable = 0
+        for name in ("CROSS_PERSISTENCE", "CROSS_PRIVILEGE"):
+            for r in _graph_rows(tables, name):
+                if r.get("notable") != "yes":
+                    continue
+                if label in [h.strip() for h in
+                             (r.get("hosts") or "").split(",")]:
+                    notable += 1
+        bits = []
+        if outbound or inbound:
+            bits.append("%d sign-in%s out, %d in"
+                        % (outbound, "" if outbound == 1 else "s", inbound))
+        bits.append("%d marked notable" % notable if notable
+                    else "nothing marked notable")
+        out[label] = " · ".join(bits)
     return out
 
 
@@ -226,6 +393,57 @@ def _layout(hosts, exts, width):
         ang = -math.pi / 2 + 2 * math.pi * i / len(hosts)
         n["x"] = cx + math.cos(ang) * r * 1.35
         n["y"] = cy + math.sin(ang) * r
+
+
+def _fan(edges):
+    """Give every edge its own line.
+
+    Two machines in one case are related several ways at once - they signed in
+    to each other, one ran a command naming the other, a file is on both - and
+    each direction has its own count. Drawn from centre to centre they are all
+    the same segment: on a three-host cluster that put nineteen edges on six
+    lines, arrowheads pointing both ways through each other and five labels
+    printed at one point.
+
+    So each ordered pair is offset perpendicular to its own line, and the two
+    directions take opposite sides. The perpendicular is computed from the
+    pair sorted by name, not from the direction being drawn, or a->b and b->a
+    would compute mirrored perpendiculars and land back on top of each other.
+    """
+    for e in edges:
+        # One line per direction, the two sides of the same route. Computed
+        # from the pair sorted by name rather than from the direction being
+        # drawn: a->b and b->a have mirrored perpendiculars, so taking each
+        # edge's own would put both back on the same line.
+        # Both halves are needed. The perpendicular is measured from the
+        # pair sorted by name (`flip`), so the two directions share one
+        # reference; the lane sign then puts them on opposite sides of it.
+        # Flipping only one of the two cancels: mirror the reference and
+        # mirror the side, and the return arrow lands back on the outbound
+        # line, which is the thing this exists to prevent.
+        e.flip = e.a > e.b
+        e.lane = -16.0 if e.flip else 16.0
+        e.along = 0.5
+    return edges
+
+
+def _offset(x1, y1, x2, y2, lane, flip):
+    """Push a segment sideways by `lane`, on a side that does not depend on
+    which way the arrow points.
+
+    The perpendicular of b->a is the perpendicular of a->b mirrored, so
+    offsetting each edge by its own perpendicular and flipping the sign for
+    the return direction cancels out exactly - both directions land back on
+    one line, which is the thing the lanes exist to prevent. `flip` is decided
+    once from the pair sorted by name, and the perpendicular is taken from the
+    segment as drawn, so the two directions end up on opposite sides.
+    """
+    dx, dy = x2 - x1, y2 - y1
+    d = math.hypot(dx, dy) or 1.0
+    if flip:                       # measure from the canonical direction
+        dx, dy = -dx, -dy
+    px, py = -dy / d * lane, dx / d * lane
+    return x1 + px, y1 + py, x2 + px, y2 + py
 
 
 def _trim(x1, y1, x2, y2, w1, h1, w2, h2):
@@ -285,8 +503,9 @@ def build_svg(tables, meta=None):
 
     width = 1180
     _layout(hosts, exts, width)
-    height = int(max([n["y"] + CARD_H for n in hosts]
-                     + [n["y"] + EXT_H for n in exts] + [520])) + 190
+    graph_bottom = int(max([n["y"] + CARD_H / 2 for n in hosts]
+                           + [n["y"] + EXT_H / 2 for n in exts])) + 36
+    height = graph_bottom + 118 + 30
 
     s = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" '
          'width="%d" height="%d" role="img" aria-label="Correlation between '
@@ -318,16 +537,29 @@ def build_svg(tables, meta=None):
         a, b = by_key[e.a], by_key[e.b]
         aw, ah = ((EXT_W, EXT_H) if a["kind"] == "ext" else (CARD_W, CARD_H))
         bw, bh = ((EXT_W, EXT_H) if b["kind"] == "ext" else (CARD_W, CARD_H))
-        x1, y1, x2, y2 = _trim(a["x"], a["y"], b["x"], b["y"], aw, ah, bw, bh)
+        ox1, oy1, ox2, oy2 = _offset(a["x"], a["y"], b["x"], b["y"], e.lane,
+                                     e.flip)
+        x1, y1, x2, y2 = _trim(ox1, oy1, ox2, oy2, aw, ah, bw, bh)
         cls = "e-ext" if a["kind"] == "ext" else "e-" + e.kind
         mk = "ext" if a["kind"] == "ext" else e.kind
         s.append('<path class="e %s" d="M%.0f,%.0f L%.0f,%.0f" '
                  'marker-end="url(#a-%s)"><title>%s → %s: %s</title></path>'
                  % (cls, x1, y1, x2, y2, mk, _esc(e.a), _esc(e.b),
                     _esc(e.label)))
-        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        # along the line rather than at its midpoint: several lanes share a
+        # direction, and three labels stacked at one midpoint is the blob
+        # this replaced
+        mx = x1 + (x2 - x1) * e.along
+        my = y1 + (y2 - y1) * e.along
         s.append('<text class="lbl" x="%.0f" y="%.0f" text-anchor="middle">%s'
                  '</text>' % (mx, my - 6, _esc(e.label)))
+        if e.first:
+            # when this route opened. The counts say how much passed; the
+            # first stamp says when it started, which is the question asked
+            # of a correlation before any other.
+            s.append('<text class="t3" x="%.0f" y="%.0f" '
+                     'text-anchor="middle">from %s</text>'
+                     % (mx, my + 8, _esc(e.first[:16])))
 
     for n in hosts + exts:
         w, h = ((EXT_W, EXT_H) if n["kind"] == "ext" else (CARD_W, CARD_H))
@@ -337,24 +569,119 @@ def build_svg(tables, meta=None):
                  'height="%d" rx="10"/>' % (x, y, w, h))
         s.append('<rect x="%.0f" y="%.0f" width="4" height="%d" rx="2" '
                  'fill="var(%s)"/>' % (x, y, h, accent))
+        inner = w - 28
         s.append('<text class="t1" x="%.0f" y="%.0f">%s</text>'
-                 % (x + 14, y + 25, _esc(_short(n["title"], 26))))
+                 % (x + 14, y + 25,
+                    _esc(_wrap(n["title"], inner, 14)[0])))
         if n.get("sub"):
             s.append('<text class="t3 mono" x="%.0f" y="%.0f">%s</text>'
-                     % (x + 14, y + 42, _esc(_short(n["sub"], 30))))
+                     % (x + 14, y + 42,
+                        _esc(_wrap(n["sub"], inner, 10.5)[0])))
         yy = y + 64
-        for line in n["lines"][:4]:
-            s.append('<text class="t2" x="%.0f" y="%.0f">%s</text>'
-                     % (x + 14, yy, _esc(_short(line, 32))))
-            yy += 17
+        room = int((y + h - 12 - yy) / 17)
+        for line in n["lines"]:
+            if room <= 0:
+                break
+            for part in _wrap(line, inner, 11.5, lines=min(2, room)):
+                s.append('<text class="t2" x="%.0f" y="%.0f">%s</text>'
+                         % (x + 14, yy, _esc(part)))
+                yy += 17
+                room -= 1
         s.append("</g>")
 
-    s.append(_legend(width, height, edges, tables))
+    s.append(_legend(MARGIN, graph_bottom, width - 2 * MARGIN, edges, tables))
     s.append("</svg>")
     return "\n".join(s)
 
 
-def _legend(width, height, edges, tables):
+def _moment_and_legend(width, y, edges, tables):
+    """The turn on the left, what the lines mean on the right."""
+    out = []
+    m = _moment(tables)
+    half = (width - 2 * MARGIN - 20) // 2
+    lx = MARGIN + (half + 20 if m else 0)
+    if m:
+        when, a, b, user, service = m
+        out.append('<g><rect class="card" x="%d" y="%d" width="%d" height="104"'
+                   ' rx="10"/>' % (MARGIN, y, half))
+        out.append('<rect x="%d" y="%d" width="4" height="104" rx="2" '
+                   'fill="var(--bad)"/>' % (MARGIN, y))
+        out.append('<text class="t1" x="%d" y="%d">The first sign-in between '
+                   'these machines</text>' % (MARGIN + 18, y + 26))
+        out.append('<text class="t2 mono" x="%d" y="%d" fill="var(--bad)">%s'
+                   '</text>' % (MARGIN + 18, y + 52, _esc(when)))
+        out.append('<text class="t2" x="%d" y="%d">%s</text>'
+                   % (MARGIN + 18, y + 72,
+                      _esc(_wrap("%s \u2192 %s%s%s" % (
+                          a, b, " as %s" % user if user else "",
+                          " over %s" % service if service else ""),
+                          half - 36, 11.5)[0])))
+        out.append('<text class="t3" x="%d" y="%d">%s</text>'
+                   % (MARGIN + 18, y + 90,
+                      _esc(_wrap("Both clocks and both address lists have to "
+                                 "be right for this.", half - 36, 10.5)[0])))
+        out.append("</g>")
+    out.append(_legend(lx, y, half if m else width - 2 * MARGIN, edges,
+                       tables))
+    return "\n".join(out)
+
+
+def _timeline(width, y, rows):
+    """The dated correlation findings, in the order they happened."""
+    out = ['<g><text class="t1" x="%d" y="%d">What the correlation found, '
+           'in order</text>' % (MARGIN, y + 22)]
+    x0, x1 = MARGIN + 20, width - MARGIN - 20
+    ty = y + 46
+    out.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="var(--line)" '
+               'stroke-width="2"/>' % (x0, ty, x1, ty))
+    step = (x1 - x0) / max(1, len(rows) - 1) if len(rows) > 1 else 0
+    seat = int((x1 - x0) / max(1, len(rows)))
+    for i, (when, sev, title, _src) in enumerate(rows):
+        x = x0 + step * i if len(rows) > 1 else (x0 + x1) / 2
+        colour = "--bad" if sev in ("CRITICAL", "HIGH") else "--host"
+        out.append('<circle cx="%.0f" cy="%d" r="6" fill="var(%s)" '
+                   'stroke="var(--surface)" stroke-width="2"><title>%s</title>'
+                   '</circle>' % (x, ty, colour, _esc("%s  %s" % (when, title))))
+        out.append('<text class="t3 mono" x="%.0f" y="%d" text-anchor="middle">'
+                   '%s</text>' % (x, ty + 22, _esc(when[5:16])))
+        # The point is labelled with the table it came from, not with the
+        # finding's sentence: "5 route(s) of two hops between these
+        # collections were travelled end to end" has no short form that fits
+        # a timeline seat, and cutting it produces "these collections were
+        # travelled...". The sentence is on the point, as its tooltip.
+        seat_label = (_src or "").replace("CROSS_", "").replace("_", " ").lower()
+        for j, part in enumerate(_wrap(seat_label or title, seat + 20, 10.5,
+                                       lines=2)):
+            out.append('<text class="t2" x="%.0f" y="%d" text-anchor="middle">'
+                       '%s</text>' % (x, ty + 38 + j * 14, _esc(part)))
+    out.append("</g>")
+    return "\n".join(out)
+
+
+def _strip(width, y, hosts, per_host):
+    """One cell per collection: what the correlation says about each."""
+    out = ['<g><text class="t1" x="%d" y="%d">Each collection, as the '
+           'correlation sees it</text>' % (MARGIN, y + 20)]
+    n = max(1, len(hosts))
+    gap = 12
+    w = (width - 2 * MARGIN - gap * (n - 1)) // n
+    for i, node in enumerate(hosts):
+        x = MARGIN + i * (w + gap)
+        out.append('<rect class="card" x="%d" y="%d" width="%d" height="52" '
+                   'rx="8"/>' % (x, y + 32, w))
+        out.append('<rect x="%d" y="%d" width="4" height="52" rx="2" '
+                   'fill="var(--host)"/>' % (x, y + 32))
+        out.append('<text class="t1" x="%d" y="%d" font-size="13px">%s</text>'
+                   % (x + 14, y + 54, _esc(_wrap(node["title"], w - 28, 13)[0])))
+        out.append('<text class="t3" x="%d" y="%d">%s</text>'
+                   % (x + 14, y + 72,
+                      _esc(_wrap(per_host.get(node["key"], ""), w - 28,
+                                 10.5)[0])))
+    out.append("</g>")
+    return "\n".join(out)
+
+
+def _legend(x0, y, box_w, edges, tables):
     """What the lines mean, and what the picture was drawn from."""
     kinds = [("e-session", "session", "a sign-in from one collection to another"),
              ("e-refused", "refused", "a sign-in that was refused"),
@@ -362,25 +689,21 @@ def _legend(width, height, edges, tables):
              ("e-move", "move", "a file or indicator seen on both"),
              ("e-ext", "ext", "something outside the case reaching into it")]
     used = set(e.kind for e in edges)
-    y = height - 150
-    out = ['<g><rect class="card" x="%d" y="%d" width="%d" height="118" '
-           'rx="10"/>' % (MARGIN, y, width - 2 * MARGIN)]
+    out = ['<g><rect class="card" x="%d" y="%d" width="%d" height="104" '
+           'rx="10"/>' % (x0, y, box_w)]
     out.append('<text class="t1" x="%d" y="%d">How to read the lines</text>'
-               % (MARGIN + 18, y + 26))
-    col, row = 0, 0
-    for cls, kind, text in kinds:
-        if kind not in used and kind != "ext":
-            continue
-        lx = MARGIN + 18 + col * 540
-        ly = y + 52 + row * 24
+               % (x0 + 18, y + 26))
+    shown = [k for k in kinds if k[1] in used or k[1] == "ext"]
+    per_col = 3
+    colw = (box_w - 36) // max(1, (len(shown) + per_col - 1) // per_col)
+    for i, (cls, kind, text) in enumerate(shown):
+        lx = x0 + 18 + (i // per_col) * colw
+        ly = y + 50 + (i % per_col) * 18
         out.append('<path class="e %s" d="M%d,%d L%d,%d" '
-                   'marker-end="url(#a-%s)"/>' % (cls, lx, ly - 4, lx + 44,
+                   'marker-end="url(#a-%s)"/>' % (cls, lx, ly - 4, lx + 34,
                                                   ly - 4, kind))
         out.append('<text class="t2" x="%d" y="%d">%s</text>'
-                   % (lx + 56, ly, _esc(text)))
-        row += 1
-        if row > 2:
-            row, col = 0, col + 1
+                   % (lx + 44, ly, _esc(_wrap(text, colw - 60, 11.5)[0])))
     counts = []
     for name in ("CROSS_SESSIONS", "CROSS_COMMANDS", "CROSS_TRANSFERS",
                  "CROSS_IOCS", "CROSS_KEYS", "CROSS_ACCOUNTS",
@@ -388,9 +711,11 @@ def _legend(width, height, edges, tables):
         n = len(_graph_rows(tables, name))
         if n:
             counts.append("%s %d" % (name.replace("CROSS_", "").lower(), n))
-    out.append('<text class="t3" x="%d" y="%d">drawn from: %s</text>'
-               % (MARGIN + 18, y + 104, _esc(", ".join(counts) or "no cross "
-                                             "table held a row")))
+    for i, part in enumerate(_wrap("drawn from: " + (", ".join(counts)
+                                   or "no cross table held a row"),
+                                   box_w - 36, 10.5, lines=2)):
+        out.append('<text class="t3" x="%d" y="%d">%s</text>'
+                   % (x0 + 18, y + 82 + i * 13, _esc(part)))
     out.append("</g>")
     return "\n".join(out)
 
