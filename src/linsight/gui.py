@@ -889,8 +889,16 @@ function egRows(t){
    "was this address trying" but "did it get in". */
 function _egRank(why){
  var w=String(why||'').toLowerCase();
+ /* Between two collections one route usually carries several of these. The
+    line is labelled with the most specific: a file that arrived says more
+    than the command that fetched it, which says more than the sign-in it ran
+    over, which says more than an indicator turning up on both. */
+ if(w.indexOf('file ')===0)return 7;
+ if(w.indexOf('ran ')===0)return 6;
+ if(w.indexOf('sign-in')>=0)return 5;
  if(w.indexOf('accepted')>=0||w.indexOf('success')>=0)return 4;
  if(w.indexOf('privilege')>=0||w.indexOf('sudo')>=0)return 3;
+ if(w.indexOf('indicator ')===0)return 2;
  if(w.indexOf('failed')>=0)return 1;
  return w?2:0;
 }
@@ -909,6 +917,28 @@ function egEv(o){
    var lst=by[names[j]];
    if(i<lst.length)out.push(lst[i]);}}
  return out;
+}
+/* Is this spread short enough to read as one thing spreading?
+   CROSS_IOCS writes the gap as the correlation formatted it - '13m', '1h5m',
+   '24h59m', '697 days'. Hours and minutes are the shape of an intrusion
+   moving; days are the shape of two machines that have been on the same
+   network for years. The unit is the whole test - no parsing of the number
+   is needed to tell those apart. */
+function egQuick(gap){
+ gap=String(gap||'');
+ if(!gap)return false;
+ if(gap.indexOf('day')>=0)return false;
+ var h=gap.match(/^([0-9]+)h/);
+ return !h||Number(h[1])<=12;
+}
+/* Everything this route carries, counted by kind. The line can only be
+   labelled with one of them; the panel behind it should not have to be. */
+function egWhys(e){
+ var k=e&&e.whys,out=[],w;
+ if(!k)return e&&e.why||'';
+ for(w in k)out.push(k[w]+' x '+w);
+ out.sort(function(a,b){return b.split(' x ')[0]-a.split(' x ')[0];});
+ return out.slice(0,4).join('; ')||e.why||'';
 }
 function egEdgeColour(e){
  if(e.kind==='move')return 'var(--gold)';
@@ -1089,26 +1119,99 @@ function egBuild(){
    hs.forEach(function(hn){
     edge(node('collection',hn),nd,'seen in this collection',null,'in');});});
 
-  /* ---- lateral movement ----
-     The one relation in this picture that is about time rather than about
-     structure: an indicator observed on one collection before another, drawn
-     from the correlation's own CROSS_IOCS - first_host to last_host, with an
-     arrow, because "web01 and db02 share an address" and "it reached db02
-     forty minutes after web01" are different sentences and only the second
-     one says which way the intrusion travelled.
+  /* ---- one machine reaching another ----
+     The one relation here that is about time rather than structure, and it is
+     drawn from CROSS_SESSIONS: a login the destination's own log recorded,
+     whose source address the origin reported as its own. That is direction as
+     a fact - who authenticated to whom, which way round, how often.
 
-     Read from the table rather than recomputed here: the correlation already
-     did this arithmetic against each run's resolved UTC offset, and a second
-     implementation of it would be a second chance to get it wrong. */
+     It used to be drawn from CROSS_IOCS instead, first_host to last_host: an
+     indicator seen on one collection before another. That reads as movement
+     and mostly is not. On a three-host Hadoop cluster it drew master -> slave1
+     "after 697 days", which is not an intrusion travelling - it is the
+     master's own address having been in slave1's logs since the cluster was
+     built, and the ordering being whichever host happened to log it first.
+     Worse, it drew arrows in the opposite direction to the sessions: the
+     Correlation tab said slave2 signed in to master sixteen times and the
+     picture said the movement went the other way.
+
+     The indicator ordering is still worth drawing where it is quick enough to
+     mean something - an address on one host and then another inside the hour
+     is the shape of a spreading intrusion - so it is kept behind a window and
+     labelled as what it is. Anything slower is a fact about how long these
+     machines have been running together. */
+  var xs=T('CROSS_SESSIONS');
+  if(xs){
+   var fa=xs.columns.indexOf('from_collection'),
+       fb=xs.columns.indexOf('to_collection'),
+       fu=xs.columns.indexOf('user'),fr=xs.columns.indexOf('result'),
+       ft=xs.columns.indexOf('timestamp_utc'),pairs={};
+   if(fa>=0&&fb>=0)egRows(xs).forEach(function(r){
+    var a=String(r[fa]||''),b=String(r[fb]||'');
+    if(!a||!b||a===b)return;
+    if(fr>=0&&String(r[fr]||'').toLowerCase().indexOf('fail')>=0)return;
+    var k=a+'>'+b,p=pairs[k];
+    if(!p)p=pairs[k]={a:a,b:b,n:0,first:'',users:{},row:r};
+    p.n++;
+    if(fu>=0&&r[fu])p.users[r[fu]]=1;
+    var w=ft>=0?String(r[ft]||''):'';
+    if(w&&(!p.first||w<p.first))p.first=w;});
+   Object.keys(pairs).forEach(function(k){
+    var p=pairs[k],us=Object.keys(p.users),
+        why=p.n+' sign-in'+(p.n===1?'':'s')+
+            (us.length?' as '+us.slice(0,2).join(', '):'')+
+            (p.first?', from '+p.first.slice(0,16):'');
+    var e=edge(node('collection',p.a),node('collection',p.b),why,
+               {t:'CROSS_SESSIONS',c:xs.columns,r:p.row},'move');
+    if(e&&p.first&&!e.gap)e.gap=p.first.slice(0,16);});}
+
+  /* The same two hosts, and what one of them was told to do to the other.
+     A sign-in says the machines authenticated; `scp ../45010
+     hadoop@192.168.2.101:/home/hadoop/temp/` says what for. Both hang off the
+     one arrow, so hovering it shows the session rows and the command that
+     explains them side by side - the evidence sampler already keeps a row
+     per source table, so adding a second table here is what puts the command
+     in the panel rather than crowding the sessions out of it. */
+  var xc=T('CROSS_COMMANDS');
+  if(xc){
+   var ca=xc.columns.indexOf('from_collection'),
+       cb=xc.columns.indexOf('to_collection'),
+       cc=xc.columns.indexOf('command'),cw=xc.columns.indexOf('user');
+   if(ca>=0&&cb>=0)egRows(xc).forEach(function(r){
+    var a=String(r[ca]||''),b=String(r[cb]||'');
+    if(!a||!b||a===b)return;
+    edge(node('collection',a),node('collection',b),
+         'ran '+String(r[cc]||'a remote command').slice(0,60)
+         +(cw>=0&&r[cw]?' as '+r[cw]:''),
+         {t:'CROSS_COMMANDS',c:xc.columns,r:r},'move');});}
+
+  /* And a file that is on both, with the direction the creation times give.
+     The strongest of the three when it is present: a sign-in is two machines
+     talking, a command is one being told to reach the other, a transfer is
+     something that arrived. */
+  var xt=T('CROSS_TRANSFERS');
+  if(xt){
+   var ta=xt.columns.indexOf('from_collection'),
+       tb=xt.columns.indexOf('to_collection'),
+       tp=xt.columns.indexOf('to_path'),tg=xt.columns.indexOf('gap');
+   if(ta>=0&&tb>=0)egRows(xt).forEach(function(r){
+    var a=String(r[ta]||''),b=String(r[tb]||'');
+    if(!a||!b||a===b)return;
+    var e=edge(node('collection',a),node('collection',b),
+               'file '+String(r[tp]||'').slice(0,52)
+               +(tg>=0&&r[tg]?' after '+r[tg]:''),
+               {t:'CROSS_TRANSFERS',c:xt.columns,r:r},'move');
+    if(e&&tg>=0&&r[tg]&&!e.gap)e.gap=String(r[tg]);});}
+
   var xi=T('CROSS_IOCS');
   if(xi){
    var ai=xi.columns.indexOf('first_host'),bi=xi.columns.indexOf('last_host'),
        ii=xi.columns.indexOf('indicator'),gi=xi.columns.indexOf('spread');
-   if(ai>=0&&bi>=0)xi.rows.forEach(function(r){
+   if(ai>=0&&bi>=0)egRows(xi).forEach(function(r){
     var a=String(r[ai]||''),b=String(r[bi]||''),gap=String(r[gi]||'');
-    if(!a||!b||a===b)return;
+    if(!a||!b||a===b||!egQuick(gap))return;
     var e=edge(node('collection',a),node('collection',b),
-               String(r[ii]||'')+(gap?' after '+gap:''),
+               'indicator '+String(r[ii]||'')+(gap?' after '+gap:''),
                {t:'CROSS_IOCS',c:xi.columns,r:r},'move');
     if(e&&gap&&!e.gap)e.gap=gap;});}}
 
@@ -1435,7 +1538,7 @@ function egWire(){
   L.onmouseenter=function(){
    var e=EG.edges[i];
    detail(evHtml(e.a.id+'  \u2192  '+e.b.id,
-     e.n+' row(s) recorded this - '+e.why,egEv(e)));};});
+     e.n+' row(s) recorded this - '+egWhys(e),egEv(e)));};});
  nodes.forEach(function(g,i){
   g.onmouseenter=function(){
    if(!drag&&!EG.focus)highlight(EG.nodes[i]);
