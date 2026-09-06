@@ -243,13 +243,6 @@ font-variant-numeric:tabular-nums;user-select:none}
 .chip.on.LOW{color:var(--LOW);border-color:var(--LOW)}
 .chip.on.INFO{color:var(--INFO);border-color:var(--INFO)}
 .chip.off{opacity:.42;text-decoration:line-through}
-/* The correlation drawing, sized to the panel it sits in. The SVG carries its
-   own viewBox, so width:100% scales it and the height follows - no second
-   place that has to agree with the drawing's own dimensions. */
-.corrfig{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-padding:10px;margin:0 0 14px}
-.corrfig svg{width:100%;height:auto;display:block}
-
 /* The collection picker, for an export merged from several images. Beside
    the window and the chips because it is the same kind of control: one choice
    that narrows every grid at once, rather than a per-table box. */
@@ -2834,12 +2827,6 @@ function viewCorrelation(){
       esc(r[ha['indicators']]||'0')+' indicators</span></div>';});
   h+='</div>';
  }
- /* The picture first, then the grids that make it. A reader opening this tab
-    wants the shape - who reached whom, which way - and gets it from one
-    drawing faster than from twelve tables. It is the same SVG the export
-    writes beside the console, embedded rather than linked so the page stays
-    one file. */
- if(D.corrsvg)h+='<div class="corrfig">'+D.corrsvg+'</div>';
  h+=crossPanel('CROSS_SESSIONS',
    ['timestamp_utc','from_collection','to_collection','user','result','service']);
  h+=crossPanel('CROSS_PATHS',
