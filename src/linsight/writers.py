@@ -585,7 +585,8 @@ def _emit_outputs(tri, tables, meta, opts, tb=None):
     # not to do.
     if getattr(opts, "db", None) and not getattr(opts, "serve", None):
         t0 = time.perf_counter()
-        CaseDB(opts.db).build(tables, tri.meta if tri is not None else meta)
+        CaseDB(opts.db).build(tables, tri.meta if tri is not None else meta,
+                              console=meta)
         writer_times.append(("write SQLite", time.perf_counter() - t0))
     if getattr(opts, "serve", None):
         # The server is the output. Building a page as well would write a
@@ -613,6 +614,9 @@ def _emit_outputs(tri, tables, meta, opts, tb=None):
             print_timing(tb, writer_times)
         serve(_page, case, opts.serve, tables=tables,
               meta=(tri.meta if tri is not None else meta),
+              # what the page has to be told rather than sniff, kept so that
+              # --serve over this database later rebuilds the same console
+              console=meta,
               db_path=(dbp or None),
               llm={"url": getattr(opts, "llm_url", None) or ASK_URL,
                    "model": getattr(opts, "llm_model", None) or ""})

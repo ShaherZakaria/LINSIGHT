@@ -21,7 +21,8 @@ from .rules import (
 from .triage import Triage
 from .tables import Table, TableBuilder
 from .writers import (
-    _check_output_paths, export_tables, write_merged_tables)
+    _check_output_paths, console_html, export_tables, write_merged_tables)
+from .serve import CaseDB, ReopenedCase, live_assets, serve
 from .ask import ASK_URL, ask
 from .skills import SKILLS, render
 from .mcp import CaseError, _open, serve_mcp
@@ -323,6 +324,109 @@ def _case_db_beside(opts):
     return os.path.join(opts.export or os.getcwd(), "case.db")
 
 
+#: A file --serve will open as a case. The extension is checked rather than
+#: the contents because the message for "that is not a case" should name what
+#: was given, not what SQLite made of it.
+CASE_SUFFIX = (".db", ".sqlite", ".sqlite3")
+
+#: Extensions that settle a --serve value as a path rather than an address,
+#: for the one case where it does not exist: cases, collections and images.
+#: Only these, because a host name is full of dots too - 127.0.0.1 has the
+#: extension ".1" and web01.corp.local has ".local", and neither is a file.
+NOT_A_BIND = CASE_SUFFIX + (".tar", ".gz", ".tgz", ".bz2", ".xz", ".zip",
+                            ".e01", ".ex01", ".dd", ".raw", ".img", ".bin",
+                            ".ad1", ".qcow2", ".vmdk", ".vhd", ".vhdx", ".iso")
+
+
+def _serve_value(opts):
+    """What --serve was given: ("bind", text), ("case", path) or ("lost", text).
+
+    The flag takes an address to bind to and, since a case can be reopened,
+    also a case to reopen - so the two have to be told apart from the value
+    alone. A port is a port before the disk is consulted, which keeps a
+    directory called "8000" an address. Anything that exists on disk is the
+    case, which is also what settles a Windows path with a drive letter in
+    it being a path rather than a host called "C".
+
+    The third answer is the one worth having. `--serve` takes an optional
+    value, so `linsight --serve collection.tar.gz` hands argparse the
+    collection as this flag's value and leaves the run with nothing to parse.
+    Binding to a host named collection.tar.gz is not a useful reading of
+    that, and neither is "a collection is required".
+    """
+    text = (getattr(opts, "serve", "") or "").strip()
+    if not text or text.isdigit():
+        return "bind", text
+    if os.path.isdir(text):
+        return "case", os.path.join(text, "case.db")
+    if os.path.isfile(text):
+        if os.path.splitext(text)[1].lower() in CASE_SUFFIX:
+            return "case", text
+        return "lost", text
+    sep = [c for c in (os.sep, os.altsep) if c]
+    if (any(c in text for c in sep)
+            or os.path.splitext(text)[1].lower() in NOT_A_BIND):
+        # a path, and by here not one that holds anything
+        return "lost", text
+    return "bind", text                 # a bare host name, or host:port
+
+
+def _reopen_case(ap, opts):
+    """The investigation server over a case an earlier run wrote.
+
+    Parsing is the long half of a run - minutes on a triage collection, an
+    hour on a disk image - and what it produces is a database holding every
+    row the console shows. Stopping the server and starting it again should
+    cost the second half and not both, so --serve given a case rather than a
+    port reads the tables back out of it and serves those.
+
+    Nothing is parsed and nothing is rewritten. The marks and notes carry on
+    in the same case file beside the same database, which is the point: this
+    is the same investigation being resumed, not a new one over the same
+    evidence.
+    """
+    kind, value = _serve_value(opts)
+    path = value if kind == "case" else (opts.db or _case_db_beside(opts))
+    if kind == "lost":
+        ap.error("--serve %s is neither an address to bind to nor a case "
+                 "that exists.\n    If that is a collection, --serve read it "
+                 "as its own value: put it before the flag, or give --serve "
+                 "a port.\n    If it is a case, there is nothing at that "
+                 "path." % value)
+    if not os.path.isfile(path):
+        ap.error("no case database at %s\n    Name a collection to parse, "
+                 "or point --serve at the export directory of a run that "
+                 "already happened." % path)
+
+    db = CaseDB(path)
+    try:
+        tables, meta, console = db.reopen()
+    except CaseError as e:
+        ap.error(str(e))
+    if not tables:
+        ap.error("%s holds no artifact tables - it is not a case this tool "
+                 "wrote" % path)
+    status("[*] reopening %s: %d table(s), %s row(s), nothing re-parsed"
+           % (path, len(tables), "{:,}".format(sum(len(t) for t in tables))))
+
+    tri = ReopenedCase(meta, console.get("collection") or path)
+    case = opts.case or os.path.join(os.path.dirname(path) or ".", "case.json")
+
+    def _page():
+        # rebuilt per request, exactly as a parsing run's is: a rebuilt
+        # linsight.py reaches an already-running server on a refresh
+        css, js = live_assets()
+        return console_html(tables, opts.html_rows, console, tri, opts,
+                            served=True, css=css, js=js)
+
+    serve(_page, case, value if kind == "bind" else "127.0.0.1:8000",
+          tables=None,            # the rows are in the database already
+          meta=meta, console=console, db_path=path,
+          llm={"url": getattr(opts, "llm_url", None) or ASK_URL,
+               "model": getattr(opts, "llm_model", None) or ""})
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Parse a UAC or Velociraptor Linux collection, or a disk "
@@ -337,6 +441,9 @@ def main(argv=None):
                "  python linsight.py ./coll --sigma ./detections\n"
                "  python linsight.py ./coll --update-sigma\n"
                "  python linsight.py --file capture.txt:/var/log/auth.log\n"
+               "  python linsight.py ./coll --export ./out --serve\n"
+               "  python linsight.py --serve ./out"
+               "            # reopen it, parsing nothing\n"
                "\n"
                "more: README.md\n")
     ap.add_argument("--file", dest="files", action="append", metavar="PATH[:DEST]",
@@ -479,13 +586,19 @@ def main(argv=None):
                     help="write only the one-row-per-PID process table (.csv/.html/.json "
                          "by extension)")
     tg.add_argument("--serve", nargs="?", const="127.0.0.1:8000",
-                    metavar="[HOST:]PORT",
+                    metavar="[HOST:]PORT|CASE",
                     help="open the investigation server instead of writing a "
                          "page: the same console, plus marking, labelling, "
                          "scoring and notes saved to a case file. Builds the "
                          "SQLite database and skips the CSV/JSON exports "
                          "unless --csv-dir or --tables-json ask for them. "
-                         "Loopback only unless a host is named.")
+                         "Loopback only unless a host is named. Given an "
+                         "export directory or a case.db instead of an address "
+                         "- and no collection to parse - it reopens that case "
+                         "instead: the same console over the rows already in "
+                         "the database, in seconds rather than the length of "
+                         "the parse. Name the case with --db if you want to "
+                         "choose the port as well.")
     tg.add_argument("--ask", metavar="QUESTION",
                     help="put one question to a local model with the "
                          "case behind it, and print what it found and "
@@ -525,11 +638,13 @@ def main(argv=None):
                     help="write every artifact table into a SQLite database "
                          "as well - one SQL table each, plus the marks when "
                          "--serve is used. Implied by --serve, which defaults "
-                         "it to case.db beside the export.")
+                         "it to case.db beside the export. It also names the "
+                         "case to reopen when --serve is given a port rather "
+                         "than a path.")
     tg.add_argument("--case", metavar="PATH",
                     help="where --serve keeps its marks and notes (default: "
-                         "case.json beside the export, or in the working "
-                         "directory)")
+                         "case.json beside the export, or beside the case "
+                         "being reopened, or in the working directory)")
     tg.add_argument("--html-rows", type=int, default=0, metavar="N",
                     help="rows per table embedded in the HTML browser (0, the default, "
                          "embeds every row)")
@@ -632,8 +747,19 @@ def main(argv=None):
     if not targets:
         if opts.update_sigma:
             return 0                    # a rule refresh on its own
+        # A finished case is an input too. It holds every row a run produced,
+        # so --serve with nothing to parse is not a run missing its evidence -
+        # it is a console over evidence that has already been parsed once.
+        if opts.serve:
+            return _reopen_case(ap, opts)
         ap.error("a collection, a disk or --file is required (or "
-                 "--update-sigma on its own to refresh the rule cache)")
+                 "--update-sigma on its own to refresh the rule cache, or "
+                 "--serve over a case an earlier run wrote)")
+    if _serve_value(opts)[0] == "case":
+        ap.error("--serve %s names a case to reopen, and %s was given to "
+                 "parse as well. Reopening serves the case as it stands and "
+                 "parsing would overwrite it - drop one of the two."
+                 % (opts.serve, targets[0][1] or "--file"))
 
     if opts.list_volumes:
         disks = [t for t in targets if t[0] == "disk"]

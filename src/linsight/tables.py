@@ -179,6 +179,17 @@ class Table:
                 if ln.strip():
                     yield json.loads(ln)
 
+    def declare_rows(self, count):
+        """Say how many rows this table has without holding any of them.
+
+        A table read back out of a case database is a shell: the console asks
+        SQLite for a grid when the examiner opens it, but the navigation has
+        to say '1,204,551 rows' before that, and len() is where it reads the
+        number. So the count is set and the rows are not - iter_rows() on
+        such a table yields nothing, which is correct and is the whole point.
+        """
+        self._count = int(count or 0)
+
     def __len__(self):
         return self._count
 

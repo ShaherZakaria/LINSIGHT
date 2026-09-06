@@ -158,6 +158,32 @@ One file, no server, no network: the payload is embedded and the CSS and JS are 
 
 `--html-rows N` caps how many rows of each table the page carries (default 2000); the CSV and JSON exports always hold everything.
 
+### 4. The investigation server
+
+`--serve` is the console as a workspace rather than a document. It is the same page, plus the half of an investigation a static file has nowhere to put: **marking** a row true or false positive, **labelling** it, **scoring** it and writing **notes** against it, all saved as you go to a case file beside the export. It builds a SQLite database of every table on the way up, which is both what the grids read from — so the page carries no rows and opens instantly — and what `--ask` and `--mcp` query later.
+
+```bash
+python linsight.py ./coll --export ./out --serve        # 127.0.0.1:8000
+python linsight.py ./coll --serve 0.0.0.0:9000          # anyone who can reach it
+```
+
+Loopback only unless you name a host, and it says so loudly when you do: this hands out the parsed contents of somebody's compromised host.
+
+### Reopening a case, without parsing it again
+
+Parsing is the long half — minutes on a triage collection, an hour on a disk image — and what it produces is a database holding every row the console shows. So closing the server and opening it again costs the second half only. Point `--serve` at a finished export, or at the `case.db` in it, and give it no collection:
+
+```bash
+python linsight.py --serve ./out                  # the export directory
+python linsight.py --serve ./out/case.db          # or the database itself
+python linsight.py --serve 8001 --db ./out/case.db   # and on a chosen port
+python linsight.py --serve                        # ./case.db, from inside the export
+```
+
+Nothing is parsed and nothing is rewritten. The console that comes back is the one the parsing run served — same tables, same findings, same timeline, same row counts, same provenance on every table — because it is built from the same database those rows are already in. The marks and notes carry on in the same case file: this resumes the investigation rather than starting a second one over the same evidence.
+
+What it cannot do is notice anything new. A case reopens exactly as it was written, so a rerun is still what you want after new rules, a new keyword list, or a `--pivot` you did not have yesterday.
+
 ## Several collections at once
 
 Pass more than one and they are read one after another into **one** export,
@@ -960,7 +986,7 @@ Three ways in, one engine behind all of them:
 
 ```sh
 ollama pull qwen2.5-coder:7b          # anything with tool calling
-python linsight.py --serve export/     # the panel is a tab in the console
+python linsight.py --serve export/    # the panel is a tab in the console
 python linsight.py --db export/case.db --ask "which addresses both failed SSH and got a 2xx?"
 ```
 

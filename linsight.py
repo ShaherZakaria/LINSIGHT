@@ -15453,6 +15453,17 @@ class Table:
                 if ln.strip():
                     yield json.loads(ln)
 
+    def declare_rows(self, count):
+        """Say how many rows this table has without holding any of them.
+
+        A table read back out of a case database is a shell: the console asks
+        SQLite for a grid when the examiner opens it, but the navigation has
+        to say '1,204,551 rows' before that, and len() is where it reads the
+        number. So the count is set and the rows are not - iter_rows() on
+        such a table yields nothing, which is correct and is the whole point.
+        """
+        self._count = int(count or 0)
+
     def __len__(self):
         return self._count
 
@@ -31520,18 +31531,31 @@ class CaseDB:
             self._conn.execute("PRAGMA synchronous=NORMAL")
         return self._conn
 
-    def build(self, tables, meta=None, quiet=False):
+    def build(self, tables, meta=None, quiet=False, console=None):
         """Write every artifact table, one SQL table each. -> rows written."""
         db = self.connect()
         total = 0
         with self.lock:
             db.execute("DROP TABLE IF EXISTS _tables")
             db.execute("CREATE TABLE _tables (name TEXT PRIMARY KEY, "
-                       "title TEXT, category TEXT, description TEXT, rows INT)")
+                       "title TEXT, category TEXT, description TEXT, "
+                       "rows INT, sources TEXT)")
             db.execute("DROP TABLE IF EXISTS _meta")
             db.execute("CREATE TABLE _meta (key TEXT, value TEXT)")
             for k, v in (meta or {}).items():
                 db.execute("INSERT INTO _meta VALUES (?,?)", (str(k), str(v)))
+            # The console's own wiring, kept apart from _meta because the two
+            # are not the same dict and reopening needs both: _meta is the
+            # header an examiner reads - hostname, time zone, when the
+            # collection was taken - and this is what the page has to be told
+            # rather than sniff, such as which collections a merged export
+            # holds and the column that says which. Values are JSON because
+            # one of them is a list.
+            db.execute("DROP TABLE IF EXISTS _console")
+            db.execute("CREATE TABLE _console (key TEXT, value TEXT)")
+            for k, v in (console or {}).items():
+                db.execute("INSERT INTO _console VALUES (?,?)",
+                           (str(k), json.dumps(v)))
             db.execute("""CREATE TABLE IF NOT EXISTS marks (
                             key TEXT PRIMARY KEY, state TEXT, note TEXT,
                             labels TEXT, tbl TEXT, what TEXT, when_utc TEXT,
@@ -31556,14 +31580,105 @@ class CaseDB:
                     vals += [None] * (len(cols) - len(vals))
                     db.execute(ins, vals)
                     n += 1
-                db.execute("INSERT INTO _tables VALUES (?,?,?,?,?)",
-                           (name, t.title, t.category, t.description, n))
+                # sources as JSON: which files this table was built from is
+                # provenance, and a console reopened out of this database
+                # should be able to say it rather than shrug.
+                db.execute("INSERT INTO _tables VALUES (?,?,?,?,?,?)",
+                           (name, t.title, t.category, t.description, n,
+                            json.dumps(list(t.sources or []))))
                 total += n
             db.commit()
         if not quiet:
             status("[+] sqlite: %d row(s) in %d table(s) -> %s"
                    % (total, len(tables), self.path))
         return total
+
+    #: Tables whose rows the console needs while the page is being built
+    #: rather than when the examiner opens them: _address_owners reads these
+    #: two to say which host answers on an address. Both are tens of rows.
+    EAGER = ("HOSTS", "INTERFACES")
+
+    def reopen(self):
+        """A case already written, read back without parsing.
+
+        -> (table shells, the examiner's header, what the page is told)
+
+        The reverse of build(), and what lets --serve be pointed at a case
+        rather than at a collection. Served, the console carries no rows at
+        all - it asks this database for a table when the examiner opens that
+        table - so what it needs handed back is the shape of each one and
+        none of its contents: the name, the heading, the category, the
+        columns and the row count. build() recorded every one of those in
+        _tables, so a three-million-row case reopens in the time it takes to
+        read sixty PRAGMAs rather than the hour it took to parse.
+
+        The tables that come back are shells: len() is the real count and
+        iter_rows() yields nothing, because the rows are in SQLite and that
+        is where they stay. EAGER is the exception, and it is small.
+        """
+        with self.lock:
+            # connect() inside the try as well: opening a file that is not a
+            # database at all raises on the first PRAGMA, and "file is not a
+            # database" as a traceback is a worse answer to `--serve
+            # notes.db` than the sentence this raises.
+            try:
+                db = self.connect()
+                # Whichever of the index columns this database has, rather
+                # than all of them: a case written by an earlier build has no
+                # sources column, and refusing to open it would be this
+                # feature telling an examiner their evidence is not evidence.
+                have = [c[1] for c in db.execute("PRAGMA table_info(_tables)")]
+                want = [c for c in ("name", "title", "category",
+                                    "description", "rows", "sources")
+                        if c in have]
+                if "name" not in want:
+                    raise sqlite3.OperationalError("no _tables index")
+                index = db.execute("SELECT %s FROM _tables ORDER BY rowid"
+                                   % ", ".join(want)).fetchall()
+            except sqlite3.Error as e:
+                raise CaseError("%s is not a case this tool wrote: %s"
+                                % (self.path, e))
+            meta, console = {}, {}
+            # Both are optional rather than assumed: a database written by an
+            # older build has no _console, and one written by a run that
+            # recorded no metadata has an empty _meta. Neither is a reason to
+            # refuse to open a case whose evidence is all there.
+            for table, into, decode in (("_meta", meta, False),
+                                        ("_console", console, True)):
+                try:
+                    got = db.execute("SELECT key, value FROM %s" % table)
+                except sqlite3.Error:
+                    continue
+                for k, v in got.fetchall():
+                    if not decode:
+                        into[k] = v
+                        continue
+                    try:
+                        into[k] = json.loads(v)
+                    except (TypeError, ValueError):
+                        into[k] = v
+            tables = []
+            for values in index:
+                entry = dict(zip(want, values))
+                name = entry["name"]
+                cols = [c[1] for c in
+                        db.execute('PRAGMA table_info("%s")' % name)]
+                if not cols:
+                    continue        # _tables names one the database lost
+                try:
+                    sources = json.loads(entry.get("sources") or "[]")
+                except (TypeError, ValueError):
+                    sources = []
+                t = Table(name, entry.get("title") or name, cols,
+                          entry.get("category") or "",
+                          entry.get("description") or "", sources)
+                if name in self.EAGER:
+                    for row in db.execute('SELECT * FROM "%s"' % name):
+                        t.add(*[("" if v is None else v) for v in row])
+                else:
+                    t.declare_rows(entry.get("rows"))
+                tables.append(t)
+        return tables, meta, console
 
     def rows(self, name, offset=0, limit=0):
         """One table out of the database. -> {columns, rows, total} or None.
@@ -32053,15 +32168,40 @@ def parse_bind(text):
     return host, port
 
 
+class ReopenedCase:
+    """What the console asks a Triage for, answered out of a case database.
+
+    The page wants exactly two things from the run that produced it: the
+    header an examiner reads, and where the evidence came from. Both were
+    written into the database when it was built, so reopening a case needs
+    neither the triage engine nor the collection nor any of the parsing
+    behind them - it needs an object with these two attribute names.
+    """
+
+    class _Source:
+        def __init__(self, path):
+            self.path = path
+
+    def __init__(self, meta, path=""):
+        self.meta = dict(meta or {})
+        self.col = self._Source(path)
+
+
 def serve(page, case_path, bind="127.0.0.1:8000", open_browser=True,
-          tables=None, meta=None, db_path=None, llm=None):
-    """Run the investigation server until interrupted."""
+          tables=None, meta=None, db_path=None, llm=None, console=None):
+    """Run the investigation server until interrupted.
+
+    `tables` is what the database is built from, and leaving it out is how a
+    case that already exists is served: the rows are in the database, so
+    rebuilding them from nothing to write them back unchanged would be the
+    parse this exists to avoid.
+    """
     host, port = parse_bind(bind)
     db = None
     if db_path:
         db = CaseDB(db_path)
         if tables:
-            db.build(tables, meta)
+            db.build(tables, meta, console=console)
     store = CaseStore(case_path, db)
     # Where the Ask panel looks for a model. Held on the store because
     # the request handler has one of those and nothing else.
@@ -32664,7 +32804,8 @@ def _emit_outputs(tri, tables, meta, opts, tb=None):
     # not to do.
     if getattr(opts, "db", None) and not getattr(opts, "serve", None):
         t0 = time.perf_counter()
-        CaseDB(opts.db).build(tables, tri.meta if tri is not None else meta)
+        CaseDB(opts.db).build(tables, tri.meta if tri is not None else meta,
+                              console=meta)
         writer_times.append(("write SQLite", time.perf_counter() - t0))
     if getattr(opts, "serve", None):
         # The server is the output. Building a page as well would write a
@@ -32692,6 +32833,9 @@ def _emit_outputs(tri, tables, meta, opts, tb=None):
             print_timing(tb, writer_times)
         serve(_page, case, opts.serve, tables=tables,
               meta=(tri.meta if tri is not None else meta),
+              # what the page has to be told rather than sniff, kept so that
+              # --serve over this database later rebuilds the same console
+              console=meta,
               db_path=(dbp or None),
               llm={"url": getattr(opts, "llm_url", None) or ASK_URL,
                    "model": getattr(opts, "llm_model", None) or ""})
@@ -35665,6 +35809,109 @@ def _case_db_beside(opts):
     return os.path.join(opts.export or os.getcwd(), "case.db")
 
 
+#: A file --serve will open as a case. The extension is checked rather than
+#: the contents because the message for "that is not a case" should name what
+#: was given, not what SQLite made of it.
+CASE_SUFFIX = (".db", ".sqlite", ".sqlite3")
+
+#: Extensions that settle a --serve value as a path rather than an address,
+#: for the one case where it does not exist: cases, collections and images.
+#: Only these, because a host name is full of dots too - 127.0.0.1 has the
+#: extension ".1" and web01.corp.local has ".local", and neither is a file.
+NOT_A_BIND = CASE_SUFFIX + (".tar", ".gz", ".tgz", ".bz2", ".xz", ".zip",
+                            ".e01", ".ex01", ".dd", ".raw", ".img", ".bin",
+                            ".ad1", ".qcow2", ".vmdk", ".vhd", ".vhdx", ".iso")
+
+
+def _serve_value(opts):
+    """What --serve was given: ("bind", text), ("case", path) or ("lost", text).
+
+    The flag takes an address to bind to and, since a case can be reopened,
+    also a case to reopen - so the two have to be told apart from the value
+    alone. A port is a port before the disk is consulted, which keeps a
+    directory called "8000" an address. Anything that exists on disk is the
+    case, which is also what settles a Windows path with a drive letter in
+    it being a path rather than a host called "C".
+
+    The third answer is the one worth having. `--serve` takes an optional
+    value, so `linsight --serve collection.tar.gz` hands argparse the
+    collection as this flag's value and leaves the run with nothing to parse.
+    Binding to a host named collection.tar.gz is not a useful reading of
+    that, and neither is "a collection is required".
+    """
+    text = (getattr(opts, "serve", "") or "").strip()
+    if not text or text.isdigit():
+        return "bind", text
+    if os.path.isdir(text):
+        return "case", os.path.join(text, "case.db")
+    if os.path.isfile(text):
+        if os.path.splitext(text)[1].lower() in CASE_SUFFIX:
+            return "case", text
+        return "lost", text
+    sep = [c for c in (os.sep, os.altsep) if c]
+    if (any(c in text for c in sep)
+            or os.path.splitext(text)[1].lower() in NOT_A_BIND):
+        # a path, and by here not one that holds anything
+        return "lost", text
+    return "bind", text                 # a bare host name, or host:port
+
+
+def _reopen_case(ap, opts):
+    """The investigation server over a case an earlier run wrote.
+
+    Parsing is the long half of a run - minutes on a triage collection, an
+    hour on a disk image - and what it produces is a database holding every
+    row the console shows. Stopping the server and starting it again should
+    cost the second half and not both, so --serve given a case rather than a
+    port reads the tables back out of it and serves those.
+
+    Nothing is parsed and nothing is rewritten. The marks and notes carry on
+    in the same case file beside the same database, which is the point: this
+    is the same investigation being resumed, not a new one over the same
+    evidence.
+    """
+    kind, value = _serve_value(opts)
+    path = value if kind == "case" else (opts.db or _case_db_beside(opts))
+    if kind == "lost":
+        ap.error("--serve %s is neither an address to bind to nor a case "
+                 "that exists.\n    If that is a collection, --serve read it "
+                 "as its own value: put it before the flag, or give --serve "
+                 "a port.\n    If it is a case, there is nothing at that "
+                 "path." % value)
+    if not os.path.isfile(path):
+        ap.error("no case database at %s\n    Name a collection to parse, "
+                 "or point --serve at the export directory of a run that "
+                 "already happened." % path)
+
+    db = CaseDB(path)
+    try:
+        tables, meta, console = db.reopen()
+    except CaseError as e:
+        ap.error(str(e))
+    if not tables:
+        ap.error("%s holds no artifact tables - it is not a case this tool "
+                 "wrote" % path)
+    status("[*] reopening %s: %d table(s), %s row(s), nothing re-parsed"
+           % (path, len(tables), "{:,}".format(sum(len(t) for t in tables))))
+
+    tri = ReopenedCase(meta, console.get("collection") or path)
+    case = opts.case or os.path.join(os.path.dirname(path) or ".", "case.json")
+
+    def _page():
+        # rebuilt per request, exactly as a parsing run's is: a rebuilt
+        # linsight.py reaches an already-running server on a refresh
+        css, js = live_assets()
+        return console_html(tables, opts.html_rows, console, tri, opts,
+                            served=True, css=css, js=js)
+
+    serve(_page, case, value if kind == "bind" else "127.0.0.1:8000",
+          tables=None,            # the rows are in the database already
+          meta=meta, console=console, db_path=path,
+          llm={"url": getattr(opts, "llm_url", None) or ASK_URL,
+               "model": getattr(opts, "llm_model", None) or ""})
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Parse a UAC or Velociraptor Linux collection, or a disk "
@@ -35679,6 +35926,9 @@ def main(argv=None):
                "  python linsight.py ./coll --sigma ./detections\n"
                "  python linsight.py ./coll --update-sigma\n"
                "  python linsight.py --file capture.txt:/var/log/auth.log\n"
+               "  python linsight.py ./coll --export ./out --serve\n"
+               "  python linsight.py --serve ./out"
+               "            # reopen it, parsing nothing\n"
                "\n"
                "more: README.md\n")
     ap.add_argument("--file", dest="files", action="append", metavar="PATH[:DEST]",
@@ -35821,13 +36071,19 @@ def main(argv=None):
                     help="write only the one-row-per-PID process table (.csv/.html/.json "
                          "by extension)")
     tg.add_argument("--serve", nargs="?", const="127.0.0.1:8000",
-                    metavar="[HOST:]PORT",
+                    metavar="[HOST:]PORT|CASE",
                     help="open the investigation server instead of writing a "
                          "page: the same console, plus marking, labelling, "
                          "scoring and notes saved to a case file. Builds the "
                          "SQLite database and skips the CSV/JSON exports "
                          "unless --csv-dir or --tables-json ask for them. "
-                         "Loopback only unless a host is named.")
+                         "Loopback only unless a host is named. Given an "
+                         "export directory or a case.db instead of an address "
+                         "- and no collection to parse - it reopens that case "
+                         "instead: the same console over the rows already in "
+                         "the database, in seconds rather than the length of "
+                         "the parse. Name the case with --db if you want to "
+                         "choose the port as well.")
     tg.add_argument("--ask", metavar="QUESTION",
                     help="put one question to a local model with the "
                          "case behind it, and print what it found and "
@@ -35867,11 +36123,13 @@ def main(argv=None):
                     help="write every artifact table into a SQLite database "
                          "as well - one SQL table each, plus the marks when "
                          "--serve is used. Implied by --serve, which defaults "
-                         "it to case.db beside the export.")
+                         "it to case.db beside the export. It also names the "
+                         "case to reopen when --serve is given a port rather "
+                         "than a path.")
     tg.add_argument("--case", metavar="PATH",
                     help="where --serve keeps its marks and notes (default: "
-                         "case.json beside the export, or in the working "
-                         "directory)")
+                         "case.json beside the export, or beside the case "
+                         "being reopened, or in the working directory)")
     tg.add_argument("--html-rows", type=int, default=0, metavar="N",
                     help="rows per table embedded in the HTML browser (0, the default, "
                          "embeds every row)")
@@ -35974,8 +36232,19 @@ def main(argv=None):
     if not targets:
         if opts.update_sigma:
             return 0                    # a rule refresh on its own
+        # A finished case is an input too. It holds every row a run produced,
+        # so --serve with nothing to parse is not a run missing its evidence -
+        # it is a console over evidence that has already been parsed once.
+        if opts.serve:
+            return _reopen_case(ap, opts)
         ap.error("a collection, a disk or --file is required (or "
-                 "--update-sigma on its own to refresh the rule cache)")
+                 "--update-sigma on its own to refresh the rule cache, or "
+                 "--serve over a case an earlier run wrote)")
+    if _serve_value(opts)[0] == "case":
+        ap.error("--serve %s names a case to reopen, and %s was given to "
+                 "parse as well. Reopening serves the case as it stands and "
+                 "parsing would overwrite it - drop one of the two."
+                 % (opts.serve, targets[0][1] or "--file"))
 
     if opts.list_volumes:
         disks = [t for t in targets if t[0] == "disk"]
