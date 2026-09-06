@@ -20,6 +20,7 @@ from .common import NDJSON_TIME_COLUMNS, human_size
 from .tables import TableBuilder, _s
 from .gui import APP_CSS, APP_JS, ATTACK_ORDER, ATTACK_TACTICS, _triage_payload
 from .ask import ASK_URL
+from .graph import write_correlation_svg
 from .serve import CaseDB, live_assets, serve
 
 
@@ -504,6 +505,15 @@ def _emit_outputs(tri, tables, meta, opts, tb=None):
     if outdir:
         os.makedirs(outdir, exist_ok=True)
     writer_times = []
+    # The correlation, drawn. Written whenever the table set holds the
+    # cross-host tables and there is somewhere to put it - it costs
+    # milliseconds, it is the first thing anybody opens on a multi-host case,
+    # and asking for it with a flag would mean most runs never see it.
+    if outdir:
+        t0 = time.perf_counter()
+        if write_correlation_svg(tables, os.path.join(outdir,
+                                                      "correlation.svg"), meta):
+            writer_times.append(("draw correlation", time.perf_counter() - t0))
     if csv_dir:
         t0 = time.perf_counter()
         n = write_tables_csv(tables, csv_dir)
