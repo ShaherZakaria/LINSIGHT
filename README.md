@@ -604,6 +604,15 @@ not a person — and worded as leads rather than as conclusions.
 The rules are independent statements about one inode rather than a classifier,
 so a file that fails two is reported under both.
 
+That holds between the five rules, and stops at the edge of them. The bodyfile
+analysis has its own older check — *an mtime far older than a ctime inside the
+window* — which is true of exactly the file `new_file_old_mtime` names, framed
+differently and with nothing in either finding to say they are the same file.
+Where the bodyfile carries a creation time, the older check now stands aside
+and says how many files it left to `TIMESTOMP`. Where it does not — a
+collector's bodyfile with no crtime column — `new_file_old_mtime` cannot fire
+at all, and that older check is the only handle on backdating there is.
+
 Each hit lands in three places: a finding per rule, a row in `TIMESTOMP` with
 all four clocks and the rule that objected, and — for the two provable rules —
 an event on the timeline. That event sits at **ctime**, not at mtime: dating a

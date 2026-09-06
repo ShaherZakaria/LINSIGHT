@@ -2982,19 +2982,35 @@ class Triage:
                 flag("pre_creation", "ctime %s precedes crtime %s by %s"
                      % (_ts_text(ctime), _ts_text(crtime),
                         self._stomp_gap(crtime - ctime)))
-            # Backdating, and the only rule here that needs the window: the
-            # gap on its own is what a packaged file looks like, and it is
-            # the file having been created during the incident that makes an
-            # ancient content date worth reading at all.
-            if ws and mtime and crtime >= ws \
-                    and mtime < crtime - self.TIMESTOMP_BACKDATE \
-                    and ("x" in mode[1:]
-                         or path.startswith(SYSTEM_BIN_DIRS + SYSTEM_CFG_DIRS
-                                            + TMPFS_DIRS)):
+            if self.backdated_at_creation(path, mode, mtime, crtime, ws):
                 flag("new_file_old_mtime",
                      "created %s, mtime reads %s - %s earlier"
                      % (_ts_text(crtime), _ts_text(mtime),
                         self._stomp_gap(crtime - mtime)))
+
+    def backdated_at_creation(self, path, mode, mtime, crtime, ws):
+        """The new_file_old_mtime condition, written once and read twice.
+
+        Backdating, and the only rule here that needs the window: the gap on
+        its own is what a packaged file looks like, and it is the file having
+        been created during the incident that makes an ancient content date
+        worth reading at all.
+
+        It is a method rather than four lines inside the scorer because the
+        older bodyfile check - "mtime far older than a ctime inside the
+        window" - has to be able to ask it. Both are true of a backdated
+        system binary, they are framed differently, and a reader has no way to
+        tell that the file named in one is the file named in the other. Where
+        this rule can speak, that one stands aside; where the bodyfile carries
+        no creation time, this rule cannot speak at all and the older check is
+        the only handle on backdating there is.
+        """
+        return bool(
+            ws and mtime and crtime and crtime >= ws
+            and mtime < crtime - self.TIMESTOMP_BACKDATE
+            and ("x" in mode[1:]
+                 or path.startswith(SYSTEM_BIN_DIRS + SYSTEM_CFG_DIRS
+                                    + TMPFS_DIRS)))
 
     #: Report order: the two provable rules first, then the corroborating ones.
     TIMESTOMP_ORDER = ("mtime_ahead", "pre_creation", "new_file_old_mtime",
@@ -3051,6 +3067,7 @@ class Triage:
         # dated by the files it names, which is the whole point of a bodyfile
         when = defaultdict(list)
         oldest = latest = None        # span of the timeline as a whole
+        stomped_in_timestomp = 0      # left to TIMESTOMP, which says it better
         total = 0
         recent_all = []
 
@@ -3127,13 +3144,24 @@ class Triage:
             # and the metadata change lands inside the incident window. A package
             # install rewrites ctime for thousands of files at once, so the volume
             # of hits is what separates "os install" from "someone forged mtime".
+            #
+            # Unless TIMESTOMP has already said it better. Where the bodyfile
+            # carries a creation time, new_file_old_mtime names the same file
+            # with the stronger claim - created during the window, not merely
+            # touched during it - and reporting both puts one file in front of
+            # the reader twice under two descriptions, with nothing to say
+            # they are the same file. Where there is no crtime that rule
+            # cannot fire, and this is the only handle on backdating left.
             if is_reg and mtime and ctime and ws and ctime >= ws and \
                     path.startswith(SYSTEM_BIN_DIRS + SYSTEM_CFG_DIRS) and \
                     (ctime - mtime).days > 180:
-                stomped.append("%s  mtime=%s  ctime=%s  (%d days apart)" % (
-                    path, mtime.strftime("%Y-%m-%d"), ctime.strftime("%Y-%m-%d"),
-                    (ctime - mtime).days))
-                when["stomped"].append(ctime)
+                if self.backdated_at_creation(path, mode, mtime, crtime, ws):
+                    stomped_in_timestomp += 1
+                else:
+                    stomped.append("%s  mtime=%s  ctime=%s  (%d days apart)" % (
+                        path, mtime.strftime("%Y-%m-%d"),
+                        ctime.strftime("%Y-%m-%d"), (ctime - mtime).days))
+                    when["stomped"].append(ctime)
 
             if ws and newest and newest >= ws:
                 recent_all.append((newest, mode, path, uid, size))
@@ -3170,7 +3198,13 @@ class Triage:
                       "in bulk, not timestomping - use the package logs to confirm the "
                       "session that caused it." if bulk else
                       "A content timestamp much older than the metadata timestamp is what "
-                      "remains when mtime is forged: ctime cannot be set from userspace."),
+                      "remains when mtime is forged: ctime cannot be set from userspace.")
+                     + (" %d further file(s) of this shape are in TIMESTOMP "
+                        "instead, under new_file_old_mtime: they carry a "
+                        "creation time inside the window, which is the "
+                        "stronger statement and would otherwise be the same "
+                        "file reported twice." % stomped_in_timestomp
+                        if stomped_in_timestomp else ""),
                      stomped[:25], source=src, mitre="T1070.006 Timestomp",
                      times=when["stomped"], count=len(stomped))
         self._timestomp_findings(src)

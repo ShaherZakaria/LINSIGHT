@@ -232,6 +232,42 @@ def check_events(L, res):
               not any("exact minute" in ev.description for ev in evs))
 
 
+def check_no_double_report(L, res):
+    """The older bodyfile check stands aside where TIMESTOMP says it better.
+
+    /usr/local/bin/updater satisfies both: created inside the window with a
+    2019 mtime, which is new_file_old_mtime, and an mtime far older than a
+    ctime inside the window, which is the check that was there first. Two
+    findings, framed differently, naming one file - and nothing in either to
+    tell a reader they are the same file.
+
+    /usr/bin/passwd is the reason the older check stays. Its bodyfile row has
+    no creation time, so the rule that would replace it cannot fire at all,
+    and the older check is the only thing left that sees the backdating.
+    """
+    print("\none file, one finding")
+    tri = run(L)
+    old = next((f for f in tri.findings
+                if "mtime far older than a ctime" in f.title), None)
+    res.check("the older check still fires where there is no crtime",
+              old is not None, "no finding at all")
+    ev = " ".join(old.evidence) if old else ""
+    res.check("  and names the file only it can see",
+              "/usr/bin/passwd" in ev, "evidence: %s" % ev)
+    res.check("  but not the one new_file_old_mtime already named",
+              "/usr/local/bin/updater" not in ev, "evidence: %s" % ev)
+    res.check("  counting only what it reports", old is not None
+              and old.count == len(old.evidence),
+              "count %s against %d evidence line(s)"
+              % (old and old.count, len(old.evidence if old else [])))
+    res.check("  and saying where the rest went",
+              old is not None and "new_file_old_mtime" in (old.detail or ""),
+              "detail: %s" % (old and old.detail))
+    still = fired(tri)["new_file_old_mtime"]
+    res.check("the file it stood aside for is still reported, in TIMESTOMP",
+              "/usr/local/bin/updater" in still, "got %s" % still)
+
+
 def check_bulk(L, res):
     """Above the bulk threshold a rule is demoted and stops raising events.
 
@@ -302,6 +338,7 @@ def main():
     check_no_window(L, res)
     check_findings(L, res)
     check_events(L, res)
+    check_no_double_report(L, res)
     check_bulk(L, res)
     check_cap(L, res)
 
