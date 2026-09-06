@@ -875,108 +875,6 @@ def check_findings_reach_the_merge(L, res):
               all(len(r) == len(tcols) for r in tl))
 
 
-def check_diagram(L, res):
-    """The diagram has to be drawn from the case, not from a case.
-
-    The first version of this picture was a script with one case's hosts,
-    counts and captions typed into it. That draws exactly one investigation
-    and silently mislabels every other. These checks are the difference: the
-    same code, handed this fixture, must produce this fixture's names and
-    numbers and nothing from anywhere else.
-    """
-    print("\nthe correlation, drawn")
-    cor = build(L)
-    svg = _build_svg(L)(cor.tables, {"hostname": "web01, db02, app03"})
-    res.check("something was drawn", bool(svg) and svg.startswith("<svg"),
-              "got %r" % (svg[:40] if svg else svg))
-    res.check("it is well-formed XML", _parses(svg))
-    for host in ("web01", "db02", "app03"):
-        res.check("  %s is on it" % host, host in svg)
-    res.check("the address that reached two hosts is on it too",
-              OUTSIDE in svg, "expected %s" % OUTSIDE)
-    # A host's own address belongs on its own card - that is what the arrows
-    # are about. What it must never be is a node of its own, so the check is
-    # against the titles, not against the whole document.
-    titles = _re().findall(r'class="t1"[^>]*>([^<]+)<', svg)
-    res.check("a host's address is shown on its card",
-              any(ADDR["web01"] in t for t in
-                  _re().findall(r'class="t3[^"]*"[^>]*>([^<]+)<', svg)),
-              "expected %s under a host name" % ADDR["web01"])
-    res.check("but it is not a node of its own",
-              ADDR["web01"] not in titles,
-              "%s drawn as an outsider" % ADDR["web01"])
-    # The cluster's own peers are the most-shared indicators in any real case,
-    # so a filter that only knows the collection *names* draws the machines
-    # themselves as strangers and pushes the real outsider off the picture.
-    res.check("nor is the peer address every host sees most often",
-              ADDR["db02"] not in titles,
-              "%s drawn as an outsider" % ADDR["db02"])
-    res.check("and the outsider survives being outranked by them",
-              OUTSIDE in svg, "expected %s to be drawn" % OUTSIDE)
-    res.check("HOSTS says what each collection answers on",
-              any(r.get("addresses") for r in rows_of(cor, "HOSTS")),
-              "no addresses column filled")
-    res.check("the sign-in edges are labelled with their count",
-              "sign-in" in svg and "refused" in svg)
-    res.check("a shared file is named on the line that carries it",
-              "file" in svg, "no file relation in any label")
-    res.check("and a command that names another host is named too",
-              "cmd" in svg, "no command relation in any label")
-    res.check("a pair related several ways gets one line saying all of it",
-              any(" · " in t for t in
-                  __import__("re").findall(r'class="lbl"[^>]*>([^<]+)', svg)),
-              "no combined label - every relation drew its own line again")
-    res.check("the caption says what it was drawn from", "drawn from:" in svg)
-    res.check("both themes are defined, not one flipped",
-              "prefers-color-scheme: dark" in svg
-              and 'data-theme="dark"' in svg)
-    res.check("nothing from another case leaked in",
-              "HDFS" not in svg and "hadoop" not in svg and "45010" not in svg)
-
-
-def check_diagram_one_host(L, res):
-    """One collection is not a correlation, and must not be drawn as one."""
-    print("\nthe diagram declines when there is nothing to correlate")
-    cor = build(L)
-    hosts = [t for t in cor.tables if t.name == "HOSTS"][0]
-    rows = list(hosts.iter_rows())
-    hosts.rows = rows[:1]
-    hosts._count = 1
-    hosts._spill_path = None
-    svg = _build_svg(L)(cor.tables, {})
-    res.check("a single collection draws nothing at all", svg == "",
-              "got %d bytes" % len(svg))
-
-
-def _re():
-    import re
-    return re
-
-
-def _build_svg(L):
-    """The drawing code of whichever build is under test.
-
-    Built, every module is one namespace and `build_svg` is on L itself.
-    From src, L is linsight.correlate and the drawing lives next door. Taking
-    it off L first is what makes `--built` test the built file rather than
-    quietly importing src and reporting a pass for code it never ran.
-    """
-    got = getattr(L, "build_svg", None)
-    if got is not None:
-        return got
-    from linsight.graph import build_svg
-    return build_svg
-
-
-def _parses(svg):
-    import xml.dom.minidom
-    try:
-        xml.dom.minidom.parseString(svg.encode("utf-8"))
-        return True
-    except Exception:
-        return False
-
-
 def check_cross_timeline(L, res):
     """One clock for the whole case, and it has to carry every dated kind."""
     print(chr(10) + "everything between the hosts, in order")
@@ -1089,8 +987,6 @@ def main():
     check_privilege(L, res)
     check_web(L, res)
     check_findings_reach_the_merge(L, res)
-    check_diagram(L, res)
-    check_diagram_one_host(L, res)
     check_cross_timeline(L, res)
     check_tab_contract(L, res)
 

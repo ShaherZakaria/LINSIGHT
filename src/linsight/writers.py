@@ -20,7 +20,6 @@ from .common import NDJSON_TIME_COLUMNS, human_size
 from .tables import TableBuilder, _s
 from .gui import APP_CSS, APP_JS, ATTACK_ORDER, ATTACK_TACTICS, _triage_payload
 from .ask import ASK_URL
-from .graph import build_svg, write_correlation_svg
 from .serve import CaseDB, live_assets, serve
 
 
@@ -333,14 +332,7 @@ def _write_console(fh, tables, html_cap, meta, tri, opts, served,
                # every one at boot to find out is the cost that design exists
                # to avoid.
                "hosts": list((meta or {}).get("hosts") or []),
-               "hostcol": (meta or {}).get("host_column") or "",
-               # The correlation drawn, for the tab that otherwise opens with
-               # twelve grids and no shape. Built here rather than in the page
-               # because it is the same drawing the export writes to
-               # correlation.svg, and two implementations of one picture is
-               # one of them being wrong later.
-               "corrsvg": build_svg(tables, meta) if len(
-                   (meta or {}).get("hosts") or []) > 1 else ""}
+               "hostcol": (meta or {}).get("host_column") or ""}
     if tri is not None:
         payload.update(_triage_payload(tri, opts))
     elif meta:
@@ -512,15 +504,6 @@ def _emit_outputs(tri, tables, meta, opts, tb=None):
     if outdir:
         os.makedirs(outdir, exist_ok=True)
     writer_times = []
-    # The correlation, drawn. Written whenever the table set holds the
-    # cross-host tables and there is somewhere to put it - it costs
-    # milliseconds, it is the first thing anybody opens on a multi-host case,
-    # and asking for it with a flag would mean most runs never see it.
-    if outdir:
-        t0 = time.perf_counter()
-        if write_correlation_svg(tables, os.path.join(outdir,
-                                                      "correlation.svg"), meta):
-            writer_times.append(("draw correlation", time.perf_counter() - t0))
     if csv_dir:
         t0 = time.perf_counter()
         n = write_tables_csv(tables, csv_dir)

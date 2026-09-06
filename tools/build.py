@@ -67,7 +67,6 @@ MODULES = [
     ("serve",     "the investigation server: the console plus a case file"),
     ("writers",   "table writers: CSV, JSON, HTML browser"),
     ("report",    "reporting"),
-    ("graph",     "the correlation, drawn as one standalone SVG"),
     ("correlate", "cross-host correlation: several collections at once"),
     ("cli",       "the command line"),
 ]

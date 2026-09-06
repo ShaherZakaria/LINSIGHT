@@ -263,12 +263,6 @@ Memory tracks the **number of files**, not the size of the image. The name index
 
 Above **500,000 names a run spills its tables to disk on its own** and says so — roughly half the peak memory for about a fifth more time. `--low-memory` asks for the same thing up front, and either of those decisions is left alone if you have made it. `--no-deleted` skips the deleted-inode scan, which is the slowest part of a large disk.
 
-### The correlation, drawn
-
-Every `--correlate` run also writes **`correlation.svg`** into the export — the hosts, who reached whom, what moved between them, and any address that touched several of the collections without being one of them. It is a standalone SVG: no JavaScript, no fonts to ship, its own light and dark palette, and it drops straight into a report.
-
-Nothing about a particular case is written into it. The nodes come from `HOSTS`, the arrows from `CROSS_SESSIONS`, `CROSS_COMMANDS`, `CROSS_TRANSFERS` and `CROSS_IOCS`, and the caption says which tables it was drawn from — so a run with nothing shared draws a picture that says so, and a single collection draws nothing at all, because one host is not a correlation.
-
 ### Seeing it rather than reading it
 
 **Relationships** draws the same thing. In a merged export each collection

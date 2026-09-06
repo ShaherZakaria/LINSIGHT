@@ -44,7 +44,6 @@ from .common import (
     PRIVILEGED_GROUPS, TMPFS_DIRS, _ts_text, ioc_type, span_of)
 from .triage import Triage
 from .tables import Table
-from .graph import write_correlation_svg
 from .writers import write_tables_csv, write_tables_html, write_tables_json
 
 
@@ -2244,7 +2243,6 @@ def write_correlation(cases, outdir, opts):
     json_path = os.path.join(outdir, "tables.json")
     html_path = os.path.join(outdir, "console.html")
     n = write_tables_csv(tables, csv_dir)
-    write_correlation_svg(tables, os.path.join(outdir, "correlation.svg"), meta)
     write_tables_json(tables, json_path, meta)
     write_tables_html(tables, html_path, getattr(opts, "html_rows", 0), meta,
                       cor.tri, opts)
