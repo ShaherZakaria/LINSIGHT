@@ -34,7 +34,7 @@ from .ask import ASK_URL, ask, llm_models
 from .mcp import CaseError, _open
 from .skills import available, render
 from .constants import VERSION
-from .tables import _s
+from .tables import Table, _s
 from .term import status
 
 #: How large a request body the API will read. A mark is a few hundred bytes;
@@ -157,18 +157,31 @@ class CaseDB:
             self._conn.execute("PRAGMA synchronous=NORMAL")
         return self._conn
 
-    def build(self, tables, meta=None, quiet=False):
+    def build(self, tables, meta=None, quiet=False, console=None):
         """Write every artifact table, one SQL table each. -> rows written."""
         db = self.connect()
         total = 0
         with self.lock:
             db.execute("DROP TABLE IF EXISTS _tables")
             db.execute("CREATE TABLE _tables (name TEXT PRIMARY KEY, "
-                       "title TEXT, category TEXT, description TEXT, rows INT)")
+                       "title TEXT, category TEXT, description TEXT, "
+                       "rows INT, sources TEXT)")
             db.execute("DROP TABLE IF EXISTS _meta")
             db.execute("CREATE TABLE _meta (key TEXT, value TEXT)")
             for k, v in (meta or {}).items():
                 db.execute("INSERT INTO _meta VALUES (?,?)", (str(k), str(v)))
+            # The console's own wiring, kept apart from _meta because the two
+            # are not the same dict and reopening needs both: _meta is the
+            # header an examiner reads - hostname, time zone, when the
+            # collection was taken - and this is what the page has to be told
+            # rather than sniff, such as which collections a merged export
+            # holds and the column that says which. Values are JSON because
+            # one of them is a list.
+            db.execute("DROP TABLE IF EXISTS _console")
+            db.execute("CREATE TABLE _console (key TEXT, value TEXT)")
+            for k, v in (console or {}).items():
+                db.execute("INSERT INTO _console VALUES (?,?)",
+                           (str(k), json.dumps(v)))
             db.execute("""CREATE TABLE IF NOT EXISTS marks (
                             key TEXT PRIMARY KEY, state TEXT, note TEXT,
                             labels TEXT, tbl TEXT, what TEXT, when_utc TEXT,
@@ -193,14 +206,105 @@ class CaseDB:
                     vals += [None] * (len(cols) - len(vals))
                     db.execute(ins, vals)
                     n += 1
-                db.execute("INSERT INTO _tables VALUES (?,?,?,?,?)",
-                           (name, t.title, t.category, t.description, n))
+                # sources as JSON: which files this table was built from is
+                # provenance, and a console reopened out of this database
+                # should be able to say it rather than shrug.
+                db.execute("INSERT INTO _tables VALUES (?,?,?,?,?,?)",
+                           (name, t.title, t.category, t.description, n,
+                            json.dumps(list(t.sources or []))))
                 total += n
             db.commit()
         if not quiet:
             status("[+] sqlite: %d row(s) in %d table(s) -> %s"
                    % (total, len(tables), self.path))
         return total
+
+    #: Tables whose rows the console needs while the page is being built
+    #: rather than when the examiner opens them: _address_owners reads these
+    #: two to say which host answers on an address. Both are tens of rows.
+    EAGER = ("HOSTS", "INTERFACES")
+
+    def reopen(self):
+        """A case already written, read back without parsing.
+
+        -> (table shells, the examiner's header, what the page is told)
+
+        The reverse of build(), and what lets --serve be pointed at a case
+        rather than at a collection. Served, the console carries no rows at
+        all - it asks this database for a table when the examiner opens that
+        table - so what it needs handed back is the shape of each one and
+        none of its contents: the name, the heading, the category, the
+        columns and the row count. build() recorded every one of those in
+        _tables, so a three-million-row case reopens in the time it takes to
+        read sixty PRAGMAs rather than the hour it took to parse.
+
+        The tables that come back are shells: len() is the real count and
+        iter_rows() yields nothing, because the rows are in SQLite and that
+        is where they stay. EAGER is the exception, and it is small.
+        """
+        with self.lock:
+            # connect() inside the try as well: opening a file that is not a
+            # database at all raises on the first PRAGMA, and "file is not a
+            # database" as a traceback is a worse answer to `--serve
+            # notes.db` than the sentence this raises.
+            try:
+                db = self.connect()
+                # Whichever of the index columns this database has, rather
+                # than all of them: a case written by an earlier build has no
+                # sources column, and refusing to open it would be this
+                # feature telling an examiner their evidence is not evidence.
+                have = [c[1] for c in db.execute("PRAGMA table_info(_tables)")]
+                want = [c for c in ("name", "title", "category",
+                                    "description", "rows", "sources")
+                        if c in have]
+                if "name" not in want:
+                    raise sqlite3.OperationalError("no _tables index")
+                index = db.execute("SELECT %s FROM _tables ORDER BY rowid"
+                                   % ", ".join(want)).fetchall()
+            except sqlite3.Error as e:
+                raise CaseError("%s is not a case this tool wrote: %s"
+                                % (self.path, e))
+            meta, console = {}, {}
+            # Both are optional rather than assumed: a database written by an
+            # older build has no _console, and one written by a run that
+            # recorded no metadata has an empty _meta. Neither is a reason to
+            # refuse to open a case whose evidence is all there.
+            for table, into, decode in (("_meta", meta, False),
+                                        ("_console", console, True)):
+                try:
+                    got = db.execute("SELECT key, value FROM %s" % table)
+                except sqlite3.Error:
+                    continue
+                for k, v in got.fetchall():
+                    if not decode:
+                        into[k] = v
+                        continue
+                    try:
+                        into[k] = json.loads(v)
+                    except (TypeError, ValueError):
+                        into[k] = v
+            tables = []
+            for values in index:
+                entry = dict(zip(want, values))
+                name = entry["name"]
+                cols = [c[1] for c in
+                        db.execute('PRAGMA table_info("%s")' % name)]
+                if not cols:
+                    continue        # _tables names one the database lost
+                try:
+                    sources = json.loads(entry.get("sources") or "[]")
+                except (TypeError, ValueError):
+                    sources = []
+                t = Table(name, entry.get("title") or name, cols,
+                          entry.get("category") or "",
+                          entry.get("description") or "", sources)
+                if name in self.EAGER:
+                    for row in db.execute('SELECT * FROM "%s"' % name):
+                        t.add(*[("" if v is None else v) for v in row])
+                else:
+                    t.declare_rows(entry.get("rows"))
+                tables.append(t)
+        return tables, meta, console
 
     def rows(self, name, offset=0, limit=0):
         """One table out of the database. -> {columns, rows, total} or None.
@@ -690,15 +794,40 @@ def parse_bind(text):
     return host, port
 
 
+class ReopenedCase:
+    """What the console asks a Triage for, answered out of a case database.
+
+    The page wants exactly two things from the run that produced it: the
+    header an examiner reads, and where the evidence came from. Both were
+    written into the database when it was built, so reopening a case needs
+    neither the triage engine nor the collection nor any of the parsing
+    behind them - it needs an object with these two attribute names.
+    """
+
+    class _Source:
+        def __init__(self, path):
+            self.path = path
+
+    def __init__(self, meta, path=""):
+        self.meta = dict(meta or {})
+        self.col = self._Source(path)
+
+
 def serve(page, case_path, bind="127.0.0.1:8000", open_browser=True,
-          tables=None, meta=None, db_path=None, llm=None):
-    """Run the investigation server until interrupted."""
+          tables=None, meta=None, db_path=None, llm=None, console=None):
+    """Run the investigation server until interrupted.
+
+    `tables` is what the database is built from, and leaving it out is how a
+    case that already exists is served: the rows are in the database, so
+    rebuilding them from nothing to write them back unchanged would be the
+    parse this exists to avoid.
+    """
     host, port = parse_bind(bind)
     db = None
     if db_path:
         db = CaseDB(db_path)
         if tables:
-            db.build(tables, meta)
+            db.build(tables, meta, console=console)
     store = CaseStore(case_path, db)
     # Where the Ask panel looks for a model. Held on the store because
     # the request handler has one of those and nothing else.

@@ -876,6 +876,98 @@ def check_server(L, db_path, res):
               bad is not None and "address" in bad, "said %r" % bad)
 
 
+def check_reopen(L, res):
+    """A case reopened has to be the same console over the same evidence.
+
+    This is the half of --serve that parses nothing: the tables come back out
+    of the database as shells, and the page is built from the shells while
+    the rows stay in SQLite. What can go wrong quietly is that a shell lies
+    about its size - the navigation reads len() - or that the page ships the
+    rows after all, which is the ten-megabyte file the server exists to
+    avoid.
+    """
+    print("\nreopening a case without parsing it")
+    try:
+        sys.path.insert(0, os.path.join(ROOT, "src"))
+        from linsight.serve import CaseDB, ReopenedCase
+        from linsight.tables import Table
+        from linsight.writers import console_html
+    except ImportError as e:
+        res.bad("a case can be reopened", "cannot import: %s" % e)
+        return
+
+    tmp = tempfile.mkdtemp(prefix="linsight-reopen-")
+    tables = []
+    for name, (cols, rows) in sorted(CASE.items()):
+        t = Table(name, name.title().replace("_", " "), cols,
+                  "Authentication", "what %s holds" % name)
+        for r in rows:
+            t.add(*r)
+        tables.append(t)
+    # the two the page reads while it is being built, not on demand
+    hosts = Table("HOSTS", "Hosts", ["hostname", "addresses"], "Collection")
+    hosts.add("web01", "10.0.0.4 10.0.0.5")
+    tables.append(hosts)
+
+    meta = {"Hostname": "web01", "Time zone": "UTC",
+            "Collection finished": "2026-03-08 04:00:00 UTC"}
+    console = {"collection": "/ev/web01.tar.gz", "hostname": "web01",
+               "hosts": ["web01", "db02"], "host_column": "host",
+               "rows_total": sum(len(t) for t in tables)}
+
+    path = os.path.join(tmp, "case.db")
+    CaseDB(path).build(tables, meta, quiet=True, console=console)
+    back, got_meta, got_console = CaseDB(path).reopen()
+
+    res.check("every table comes back",
+              [t.name for t in back] == [t.name for t in tables],
+              "got %s" % [t.name for t in back])
+    res.check("with its heading, its category and its columns",
+              all(b.title == t.title and b.category == t.category
+                  and b.columns == t.columns
+                  for b, t in zip(back, tables)))
+    res.check("and its true row count, which is what the navigation shows",
+              [len(b) for b in back] == [len(t) for t in tables],
+              "got %s, wanted %s"
+              % ([len(b) for b in back], [len(t) for t in tables]))
+    big = next(b for b in back if b.name == "FAILED_LOGINS")
+    res.check("while holding none of the rows - they stay in SQLite",
+              len(big) == 3 and list(big.iter_rows()) == [],
+              "held %d" % len(list(big.iter_rows())))
+    eager = next(b for b in back if b.name == "HOSTS")
+    res.check("except the few the page reads to say who owns an address",
+              [list(r) for r in eager.iter_rows()]
+              == [["web01", "10.0.0.4 10.0.0.5"]],
+              "held %s" % [list(r) for r in eager.iter_rows()])
+    res.check("the examiner's header survives", got_meta == meta,
+              "got %s" % got_meta)
+    res.check("and so does what the page is told rather than sniffs",
+              got_console == console, "got %s" % got_console)
+
+    tri = ReopenedCase(got_meta, got_console.get("collection"))
+    page = console_html(back, 0, got_console, tri, None, served=True)
+    res.check("the console builds from the shells",
+              "window.__LINSIGHT__=" in page and "web01" in page)
+    res.check("marked served, so the page asks for a table when it is opened",
+              '"served": true' in page or '"served":true' in page)
+    res.check("and ships no rows at all",
+              "window.__ROWS__={};" in page,
+              "payload carried rows")
+    res.check("the merged export's host filter survives the round trip",
+              '"db02"' in page, "hosts were not in the payload")
+
+    bad = os.path.join(tmp, "notes.db")
+    with open(bad, "w") as fh:
+        fh.write("this is not a database")
+    err = None
+    try:
+        CaseDB(bad).reopen()
+    except L.CaseError as e:
+        err = str(e)
+    res.check("a file that is not a case is refused in a sentence",
+              err is not None and "not a case" in err, "said %r" % err)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--built", action="store_true",
@@ -900,6 +992,7 @@ def main():
     check_timeout(L, db_path, res)
     if not opts.built:
         check_server(L, db_path, res)
+        check_reopen(L, res)
 
     print("\n%d passed, %d failed" % (res.passed, len(res.failed)))
     if res.failed:
