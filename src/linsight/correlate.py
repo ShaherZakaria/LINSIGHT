@@ -827,7 +827,8 @@ class Correlator(object):
     # -- 1. the hosts themselves -------------------------------------------
     def t_hosts(self):
         t = self.table("HOSTS", "The collections in this correlation",
-                       [HOST_COLUMN, "input", "hostname", "distribution", "layout",
+                       [HOST_COLUMN, "input", "hostname", "addresses",
+                        "distribution", "layout",
                         "collected_utc", "host_utc_offset", "findings",
                         "critical", "high", "medium", "low", "info",
                         "indicators", "events", "hashed_files"],
@@ -836,10 +837,17 @@ class Correlator(object):
                        "other table joins on - the same column a merged export "
                        "carries and the console filters by; `hostname` is what "
                        "the collection itself says it was, which is not always "
-                       "the same thing and is worth reading when it is not.")
+                       "the same thing and is worth reading when it is not. "
+                       "`addresses` is what this collection answers on, which "
+                       "is the whole mechanism behind CROSS_SESSIONS: a login "
+                       "from 10.0.0.11 is an address until one of these rows "
+                       "says whose it is. It is also what tells a reader that "
+                       "an address in CROSS_IOCS is one of these machines "
+                       "rather than something outside the case.")
         for c in self.cases:
             n = c.counts()
-            t.add(c.label, c.path, c.hostname, c.distro, c.layout,
+            t.add(c.label, c.path, c.hostname,
+                  ", ".join(sorted(c.addresses)), c.distro, c.layout,
                   c.collected, c.tz_offset, len(c.findings),
                   n["CRITICAL"], n["HIGH"], n["MEDIUM"], n["LOW"], n["INFO"],
                   len(c.iocs), len(c.events), len(c.hashes))

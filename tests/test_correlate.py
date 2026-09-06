@@ -297,17 +297,23 @@ def cases(L, third_clock_unknown=True):
            .ioc("203.0.113.9", "failed authentication source", 40,
                 ts(3, 0), ts(3, 2))
            .ioc("198.51.100.7", "web01 only", 3, ts(3, 0))
+           # the machines see each other constantly - far more often than they
+           # see an intruder, which is what makes "is this address one of us"
+           # the question the picture has to get right
+           .ioc(ADDR["db02"], "cluster peer", 60, ts(3, 0), ts(3, 30))
            .event(ts(3, 0), "HIGH", "Authentication", "failed login"))
     db = (FakeTri("db02")
           .finding("CRITICAL", "Filesystem", "7 executable file(s) in tmpfs",
                    "T1036", ts(3, 20), ts(3, 25), 7)
           .finding("LOW", "Software", "db02 only finding", "", ts(3, 20))
           .ioc("203.0.113.9", "authentication source", 5, ts(3, 14), ts(3, 30))
+          .ioc(ADDR["db02"], "cluster peer", 60, ts(3, 0), ts(3, 30))
           .event(ts(3, 14), "MEDIUM", "Authentication", "accepted password"))
     app = FakeTri("app03", offset="" if third_clock_unknown else "+00:00 (set)")
     app.finding("CRITICAL", "Filesystem", "1 executable file(s) in tmpfs",
                 "T1036", ts(4, 0), ts(4, 1), 1)
     app.ioc("203.0.113.9", "outbound connection", 2, ts(4, 0))
+    app.ioc(ADDR["db02"], "cluster peer", 60, ts(4, 0))
     app.event(ts(4, 0), "INFO", "Process", "start")
     out = []
     for label, tri, hashes in (
@@ -891,6 +897,17 @@ def check_diagram(L, res):
     res.check("an address belonging to one of the hosts is not a node",
               svg.count(ADDR["web01"]) == 0,
               "%s should not be drawn as an outsider" % ADDR["web01"])
+    # The cluster's own peers are the most-shared indicators in any real case,
+    # so a filter that only knows the collection *names* draws the machines
+    # themselves as strangers and pushes the real outsider off the picture.
+    res.check("nor is the peer address every host sees most often",
+              ADDR["db02"] not in svg,
+              "%s is one of these collections" % ADDR["db02"])
+    res.check("and the outsider survives being outranked by them",
+              OUTSIDE in svg, "expected %s to be drawn" % OUTSIDE)
+    res.check("HOSTS says what each collection answers on",
+              any(r.get("addresses") for r in rows_of(cor, "HOSTS")),
+              "no addresses column filled")
     res.check("the sign-in edges are labelled with their count",
               "sign-in" in svg and "refused" in svg)
     res.check("a shared file is drawn as movement", "shared file" in svg)

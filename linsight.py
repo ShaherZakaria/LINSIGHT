@@ -32682,6 +32682,17 @@ def _host_nodes(tables):
     return nodes
 
 
+def _own_addresses(tables):
+    """Every address the collections in this case answer on."""
+    own = set()
+    for r in _graph_rows(tables, "HOSTS"):
+        for a in (r.get("addresses") or "").split(","):
+            a = a.strip()
+            if a:
+                own.add(a)
+    return own
+
+
 def _external_nodes(tables, host_labels, cap=2):
     """Addresses that reached more than one collection but are not one of them.
 
@@ -32689,13 +32700,21 @@ def _external_nodes(tables, host_labels, cap=2):
     in the case is, by construction, somewhere else that touched several of
     them. That is the node a reader looks for first, and it is derivable -
     CROSS_IOCS already ranks them by how many hosts saw them.
+
+    "Not one of them" has to be checked against the addresses, not the
+    labels. A cluster's own nodes appear in each other's indicators far more
+    often than an intruder does, so filtering on the collection *name* drew
+    two of the machines as outsiders and pushed the one address that really
+    was outside off the picture - on a three-host cluster, .100 and .102 were
+    drawn as strangers and the attacker was not drawn at all.
     """
+    own = _own_addresses(tables)
     out = []
     for r in _graph_rows(tables, "CROSS_IOCS"):
         if r.get("type") not in ("ipv4", "ipv6"):
             continue
         value = (r.get("indicator") or "").strip()
-        if not value or value in host_labels:
+        if not value or value in host_labels or value in own:
             continue
         hosts = [h.strip() for h in (r.get("hosts") or "").split(",") if h.strip()]
         if len(hosts) < 2 or set(hosts) - set(host_labels):
@@ -33777,7 +33796,8 @@ class Correlator(object):
     # -- 1. the hosts themselves -------------------------------------------
     def t_hosts(self):
         t = self.table("HOSTS", "The collections in this correlation",
-                       [HOST_COLUMN, "input", "hostname", "distribution", "layout",
+                       [HOST_COLUMN, "input", "hostname", "addresses",
+                        "distribution", "layout",
                         "collected_utc", "host_utc_offset", "findings",
                         "critical", "high", "medium", "low", "info",
                         "indicators", "events", "hashed_files"],
@@ -33786,10 +33806,17 @@ class Correlator(object):
                        "other table joins on - the same column a merged export "
                        "carries and the console filters by; `hostname` is what "
                        "the collection itself says it was, which is not always "
-                       "the same thing and is worth reading when it is not.")
+                       "the same thing and is worth reading when it is not. "
+                       "`addresses` is what this collection answers on, which "
+                       "is the whole mechanism behind CROSS_SESSIONS: a login "
+                       "from 10.0.0.11 is an address until one of these rows "
+                       "says whose it is. It is also what tells a reader that "
+                       "an address in CROSS_IOCS is one of these machines "
+                       "rather than something outside the case.")
         for c in self.cases:
             n = c.counts()
-            t.add(c.label, c.path, c.hostname, c.distro, c.layout,
+            t.add(c.label, c.path, c.hostname,
+                  ", ".join(sorted(c.addresses)), c.distro, c.layout,
                   c.collected, c.tz_offset, len(c.findings),
                   n["CRITICAL"], n["HIGH"], n["MEDIUM"], n["LOW"], n["INFO"],
                   len(c.iocs), len(c.events), len(c.hashes))
