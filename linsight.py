@@ -33481,21 +33481,38 @@ class HostCase(object):
                 addr = addr.split("/")[0].strip()
                 if addr and not addr.startswith(("127.", "::1", "fe80:")):
                     self.addresses.add(addr)
-        # And off the configuration, which is where a disk image keeps it.
+        # And, only where that answered nothing, off the configuration.
         #
-        # INTERFACES is a live_response artifact - the output of `ip addr` at
-        # collection time - so a disk image produces none of it, and every
-        # host read from an image resolved to no addresses at all. That is not
-        # a small gap: it is the one input CROSS_SESSIONS runs on, so the
-        # table this whole module exists for silently reported nothing for
-        # disk images however much the logs held. On a three-host Hadoop
-        # cluster, slave1's auth.log carried 116 successful logins from the
-        # master and the correlation reported no sign-ins at all.
+        # INTERFACES is `ip addr` at collection time, so a disk image produced
+        # none of it and every host read from an image resolved to no
+        # addresses at all. That is not a small gap: it is the one input
+        # CROSS_SESSIONS runs on, so the table this whole module exists for
+        # silently reported nothing for disk images however much the logs
+        # held. On a three-host Hadoop cluster, slave1's auth.log carried 116
+        # successful logins from the master and the correlation reported no
+        # sign-ins at all.
         #
-        # /etc/network/interfaces and netplan are on the disk and say what the
-        # host gives itself. Only the address keys are read: `network`,
-        # `broadcast`, `gateway` and `dns-nameservers` are addresses too, and
-        # none of them is this host.
+        # INTERFACES now reads the on-disk configuration itself when no
+        # command ran, and it reads it with the file's structure intact -
+        # which is the whole difference. NETWORK_CONFIG is a flat list of
+        # key-value pairs, so a netplan file's
+        #
+        #     nameservers:
+        #       addresses: [8.8.8.8, 1.1.1.1]
+        #
+        # arrives here as the key `addresses` with nothing left to say it was
+        # nested under nameservers, and this host claimed Google's resolver as
+        # one of its own interfaces. An address wrongly attributed to a host
+        # is worse than one missing: _who_is answers with a machine in the
+        # case, and every table that names the address then labels traffic to
+        # a public resolver as one of these machines.
+        #
+        # So the flat scrape is kept for the collection that produced neither
+        # command output nor a configuration file this parser understands, and
+        # is skipped entirely the moment the interface list said anything.
+        if self.addresses:
+            self._identity_names(tables)
+            return
         for r in self._cells(tables, "NETWORK_CONFIG", ("key", "value")):
             m = _SELF_ADDRESS_RE.match(r["key"].strip())
             if not m:
@@ -33505,6 +33522,10 @@ class HostCase(object):
                 addr = tok.split("/")[0].strip()
                 if _is_address(addr):
                     self.addresses.add(addr)
+        self._identity_names(tables)
+
+    def _identity_names(self, tables):
+        """The name half of the identity - reached by both paths above."""
         for r in self._cells(tables, "DEVICE_PROFILE", ("category", "value")):
             if r["category"] == "hostname" and r["value"]:
                 self.names.add(r["value"].strip().lower())
