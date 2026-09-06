@@ -26,8 +26,8 @@ from .ask import ASK_URL, ask
 from .skills import SKILLS, render
 from .mcp import CaseError, _open, serve_mcp
 from .correlate import (
-    Correlator, HostCase, _label_for, merge_tables, merge_triage,
-    write_correlation)
+    Correlator, HostCase, _label_for, fold_correlation, merge_tables,
+    merge_triage, write_correlation)
 from .report import (
     print_banner, print_console, write_html, write_json, write_timeline)
 
@@ -595,8 +595,17 @@ def main(argv=None):
         # The same rule the output paths follow: a ruleset written under the
         # collection contaminates it, and the next run would read it back as a
         # collected artifact.
-        if opts.collection and os.path.isdir(opts.collection):
-            base = os.path.abspath(opts.collection)
+        #
+        # Against every input, because there can be several and
+        # because this runs before any of them is resolved. It used to
+        # read opts.collection - which the run sets on itself later,
+        # and which stopped existing at all when the positional became
+        # plural, so --sigma-cached and --update-sigma raised
+        # AttributeError before reading a single byte of evidence.
+        for cand in _input_paths(opts):
+            if not os.path.isdir(cand):
+                continue        # only a directory can hold the cache
+            base = os.path.abspath(cand)
             if cache == base or cache.startswith(base + os.sep):
                 ap.error("refusing to keep the rule cache inside the "
                          "collection:\n      %s\n    choose a --sigma-dir "
@@ -691,8 +700,13 @@ def main(argv=None):
         # the cross-host tables join the export rather than becoming a second
         # one: the console carrying every host's rows is also where "which of
         # these hosts share this" is the natural next question
-        tables += [t for t in cor.run()
+        cross = cor.run()
+        tables += [t for t in cross
                    if t.name not in ("FINDINGS", "TIMELINE")]
+        # and its findings join the merged FINDINGS rather than being dropped
+        # with the table that held them - the console reads its findings out
+        # of that table, so anything not in it is computed and never shown
+        fold_correlation(tables, cross, hostcol)
     status("[*] merged %d table(s) from %d collections, %s row(s) total"
            % (len(tables), len(per_host),
               "{:,}".format(sum(len(t) for t in tables))))
@@ -835,6 +849,22 @@ def _host_opts(opts, label):
         # analyst wants from it is the export they would have asked for
         o.export = hdir
     return o
+
+
+def _input_paths(opts):
+    """Every path this run was pointed at, however it was named.
+
+    The positionals and the flags that declare a kind, flattened.
+    Called before anything is resolved, so it asks for nothing but
+    the strings the command line carried.
+    """
+    out = []
+    for attr in ("collections", "disk", "archive", "ad1"):
+        got = getattr(opts, attr, None) or []
+        out.extend(got if isinstance(got, list) else [got])
+    for raw in getattr(opts, "files", None) or []:
+        out.append(parse_file_spec(raw)[0])
+    return [p for p in out if p]
 
 
 def _run_one(ap, opts, forced, target, collect=False):
