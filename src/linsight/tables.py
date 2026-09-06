@@ -37,7 +37,7 @@ from .decode import (
 from .collect import (
     VelociraptorResults, _velo_cell, _velo_table_name, velo_get)
 from .rules import (
-    Keywords, Row, _win_long, eval_sigma, parse_sigma, parse_yara)
+    Keywords, Row, _win_long, eval_sigma, load_yaml, parse_sigma, parse_yara)
 from .triage import Triage
 
 
@@ -371,6 +371,29 @@ def _port_text(addr):
     if not sep or h.count(":") >= 2:      # bare IPv6, no port
         return ""
     return p
+
+
+def _netmask_prefix(mask):
+    """Dotted netmask -> prefix length as a string, or ''.
+
+    'address 10.0.0.5' + 'netmask 255.255.255.0' is the older spelling of
+    'address 10.0.0.5/24', and the interface table should not print the same
+    fact two ways depending on which decade the config was written in.
+    Anything that is not a contiguous mask is refused rather than guessed at.
+    """
+    parts = (mask or "").strip().split(".")
+    if len(parts) != 4:
+        return ""
+    try:
+        octets = [int(p) for p in parts]
+    except ValueError:
+        return ""
+    if any(o < 0 or o > 255 for o in octets):
+        return ""
+    bits = "".join(bin(o)[2:].zfill(8) for o in octets)
+    if "01" in bits:                      # holes in it - not a netmask
+        return ""
+    return str(bits.count("1"))
 
 
 def _s(v):
@@ -2053,7 +2076,13 @@ class TableBuilder:
                        "Parsed from ip addr show / ip link show / ifconfig. Each "
                        "command contributes its own row, so source says which "
                        "tool the row came from and promiscuous-mode disagreements "
-                       "between them stay visible.")
+                       "between them stay visible. Where the collection ran none "
+                       "of those - a disk image, an offline scope, a UAC profile "
+                       "without the network commands - the rows come from the "
+                       "interface configuration on disk instead: source names the "
+                       "file, flags holds the configuration keywords rather than "
+                       "the kernel's, and state is empty because there was no "
+                       "running link to have one.")
         cur = None
         rx = re.compile(r"^(\d+):\s+([^:@]+)[:@]\S*\s+<([^>]*)>\s+mtu\s+(\d+)(.*)$")
         for rel in ("live_response/network/ip_addr_show.txt",
@@ -2118,6 +2147,180 @@ class TableBuilder:
                     cur["addresses"] = (cur["addresses"] + " " + am.group(1)).strip()
             if cur:
                 t.add_dict(cur)
+        # Nothing ran ip or ifconfig. What the host gives itself is still on
+        # disk, in the configuration that would have produced that output.
+        if not len(t):
+            self._iface_from_config(t)
+
+    def _iface_from_config(self, t):
+        """Fill INTERFACES from the on-disk configuration, with no ip output.
+
+        `ip addr` is a live_response artifact, so a disk image produces none
+        of it - and an empty table is dropped from the export, which left the
+        console with no interface list at all for exactly the collections
+        where the configuration is the only record of what the host answers
+        on. correlate.py already reads these files for that reason; this puts
+        the same fact in the table an analyst goes looking for it in.
+
+        Configuration is what the host was told to be, not what it was: an
+        address here may never have been brought up, and an interface that
+        held a DHCP lease has no address here at all. source names the file
+        rather than a command, so the difference stays readable in the grid.
+
+        The four spellings read are the ones NETWORK_CONFIG already collects -
+        ifupdown, netplan, ifcfg and NetworkManager keyfiles - because a
+        fallback that understood only Debian's would still be empty on most of
+        the hosts that get read from an image.
+        """
+        def row(name, flags, mtu, mac, addrs, src):
+            name = _s(name).strip()
+            if not name:
+                return
+            t.add_dict({"index": "", "name": name,
+                        "flags": ",".join([_s(f).strip() for f in flags
+                                           if _s(f).strip()]),
+                        "mtu": _s(mtu or ""), "state": "",
+                        "mac": _s(mac or ""),
+                        "addresses": " ".join([_s(a).strip() for a in addrs
+                                               if _s(a).strip()]),
+                        "source": src})
+
+        # -- ifupdown: /etc/network/interfaces and its .d directory ---------
+        for rel in (self.col.rootfs_glob("/etc/network/interfaces")
+                    + self.col.rootfs_glob("/etc/network/interfaces.d/*")):
+            src = self.col.host_path(rel)
+            auto, stanzas, cur = {}, [], None
+            for ln in self.lines(rel, "INTERFACES"):
+                s = ln.strip()
+                if not s or s.startswith("#"):
+                    continue
+                f = s.split()
+                kw = f[0].lower()
+                if kw in ("auto", "allow-auto", "allow-hotplug"):
+                    # keep which word it was: allow-hotplug is "when the
+                    # device appears", which is not the same claim as auto
+                    for nm in f[1:]:
+                        auto[nm] = kw
+                    continue
+                if kw == "iface":
+                    cur = {"name": f[1] if len(f) > 1 else "",
+                           "family": f[2] if len(f) > 2 else "",
+                           "method": f[3] if len(f) > 3 else "",
+                           "addrs": [], "mask": "", "mtu": "", "mac": ""}
+                    stanzas.append(cur)
+                    continue
+                if cur is None or len(f) < 2:
+                    continue
+                if kw == "address":
+                    cur["addrs"].append(f[1])
+                elif kw == "netmask":
+                    cur["mask"] = f[1]
+                elif kw == "mtu":
+                    cur["mtu"] = f[1]
+                elif kw == "hwaddress":
+                    cur["mac"] = f[-1]          # 'hwaddress ether 00:0c:29:..'
+            for st in stanzas:
+                pre = _netmask_prefix(st["mask"])
+                row(st["name"],
+                    [auto.get(st["name"], ""), st["family"], st["method"]],
+                    st["mtu"], st["mac"],
+                    [a if "/" in a or not pre else "%s/%s" % (a, pre)
+                     for a in st["addrs"]], src)
+                auto.pop(st["name"], None)
+            # brought up at boot and configured nowhere else: that is how a
+            # DHCP interface is usually written, and it is still an interface
+            for name in sorted(auto):
+                row(name, [auto[name]], "", "", [], src)
+
+        # -- netplan --------------------------------------------------------
+        for rel in self.col.rootfs_glob("/etc/netplan/*"):
+            src = self.col.host_path(rel)
+            try:
+                docs = load_yaml(self.text(rel, "INTERFACES"))
+            except Exception:
+                continue                  # a malformed file costs its own rows
+            for doc in docs:
+                net = doc.get("network") if isinstance(doc, dict) else None
+                if not isinstance(net, dict):
+                    continue
+                for kind, group in net.items():
+                    if kind in ("version", "renderer") or \
+                            not isinstance(group, dict):
+                        continue
+                    for name, cfg in group.items():
+                        cfg = cfg if isinstance(cfg, dict) else {}
+                        addrs = cfg.get("addresses")
+                        if isinstance(addrs, str):
+                            addrs = [addrs]
+                        out = []
+                        for a in (addrs or []):
+                            # 'addresses: [{10.0.0.5/24: {lifetime: 0}}]'
+                            out.extend(list(a) if isinstance(a, dict) else [a])
+                        flags = [kind]
+                        for k in ("dhcp4", "dhcp6"):
+                            if _s(cfg.get(k)).lower() in ("true", "yes", "1"):
+                                flags.append(k)
+                        row(name, flags, cfg.get("mtu"), cfg.get("macaddress"),
+                            out, src)
+
+        # -- ifcfg: RHEL and SUSE -------------------------------------------
+        for pat in ("/etc/sysconfig/network-scripts/ifcfg-*",
+                    "/etc/sysconfig/network/ifcfg-*"):
+            for rel in self.col.rootfs_glob(pat):
+                src, kv = self.col.host_path(rel), {}
+                for ln in self.lines(rel, "INTERFACES"):
+                    s = ln.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, _sep, v = s.partition("=")
+                    kv[k.strip().upper()] = v.strip().strip("\"'")
+                addrs = []
+                for k in sorted(kv):
+                    m = re.match(r"^(IPADDR|IPV6ADDR)_?(\d*)$", k)
+                    if not m or not kv[k]:
+                        continue
+                    v, sfx = kv[k], m.group(2)
+                    if m.group(1) == "IPADDR" and "/" not in v:
+                        pre = kv.get("PREFIX" + sfx) or \
+                            _netmask_prefix(kv.get("NETMASK" + sfx, ""))
+                        v = "%s/%s" % (v, pre) if pre else v
+                    addrs.append(v)
+                row(kv.get("DEVICE") or kv.get("NAME")
+                    or os.path.basename(rel).split("ifcfg-", 1)[-1],
+                    [kv.get("BOOTPROTO", ""),
+                     "onboot" if kv.get("ONBOOT", "").lower() in ("yes", "true")
+                     else ""],
+                    kv.get("MTU"), kv.get("HWADDR") or kv.get("MACADDR"),
+                    addrs, src)
+
+        # -- NetworkManager keyfiles ----------------------------------------
+        for pat in ("/etc/NetworkManager/system-connections/*",
+                    "/run/NetworkManager/system-connections/*",
+                    "/var/run/NetworkManager/system-connections/*"):
+            for rel in self.col.rootfs_glob(pat):
+                src, sect, kv = self.col.host_path(rel), "", {}
+                for ln in self.lines(rel, "INTERFACES"):
+                    s = ln.strip()
+                    if s.startswith("[") and s.endswith("]"):
+                        sect = s[1:-1].strip().lower()
+                        continue
+                    if not s or s[0] in "#;" or "=" not in s:
+                        continue
+                    k, _sep, v = s.partition("=")
+                    kv[(sect, k.strip().lower())] = v.strip()
+                g = lambda s_, k_: kv.get((s_, k_), "")
+                # 'address1=10.0.0.5/24,10.0.0.1' - the gateway is not an
+                # address of this interface, so only the first field is read
+                row(g("connection", "interface-name") or g("connection", "id"),
+                    [g("connection", "type"), g("ipv4", "method")],
+                    g("ethernet", "mtu") or g("802-3-ethernet", "mtu"),
+                    g("ethernet", "mac-address")
+                    or g("802-3-ethernet", "mac-address")
+                    or g("wifi", "mac-address"),
+                    [kv[k].split(",")[0] for k in sorted(kv)
+                     if k[0] in ("ipv4", "ipv6")
+                     and re.match(r"^address\d+$", k[1]) and kv[k]],
+                    src)
 
     def t_routes(self):
         t = self.table("ROUTES", "Routing table",
@@ -8869,8 +9072,11 @@ class TableBuilder:
     # UNPARSED_FILES) and derived views (FINDINGS, TIMELINE), plus the
     # handful of tables that genuinely merge both sides - FIREWALL holds the
     # running ruleset and the saved rules file, PACKAGES the dpkg output and
-    # the dpkg database, MOUNTS the mount command and fstab. Those keep both
-    # halves in a narrow scope: --scope chooses tables, never lines within one.
+    # the dpkg database, MOUNTS the mount command and fstab, INTERFACES the
+    # output of `ip addr` and, where nothing ran it, the interface
+    # configuration on disk that says what it would have printed. Those keep
+    # both halves in a narrow scope: --scope chooses tables, never lines
+    # within one.
     # Defaulting an untagged extractor to 'runs everywhere' is deliberate - a
     # new extractor someone forgets to tag shows up in too many scopes, which
     # is visible, rather than silently vanishing from all of them.
@@ -8880,7 +9086,7 @@ class TableBuilder:
         "t_process_tree_raw", "t_process_hashes",
         "t_hidden_pids", "t_open_files",
         "t_sockets", "t_netstat", "t_proc_net", "t_unix_sockets",
-        "t_interfaces", "t_routes", "t_arp",
+        "t_routes", "t_arp",
         "t_modules", "t_sysctl", "t_services", "t_timers",
         "t_system_info", "t_env", "t_hardware", "t_storage_raw",
         "t_live_sessions", "t_memory_output", "t_chkrootkit",
