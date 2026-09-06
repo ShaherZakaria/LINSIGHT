@@ -161,7 +161,16 @@ def side_tables(label):
     keys = [["authorized_keys", "/root/.ssh/authorized_keys", "root",
              "ssh-rsa " + KEY_A + " ops@jump"]]
     cron = [["/etc/crontab", "root", "crontab", "* * * * *",
-             "root", "/usr/local/bin/collect.sh", "", "1"]]
+             "root", "/usr/local/bin/collect.sh", "", "1"],
+            # what every Debian host runs, which is not shared persistence
+            ["/etc/cron.daily/apache2", "root", "script", "",
+             "root", "apache2", "", "1"],
+            # and the lines *inside* a cron script, which the table keeps so
+            # an examiner can read it and which are not autostart entries
+            ["/etc/cron.daily/man-db", "root", "script_line", "",
+             "root", "$iosched_idle \\", "", "7"],
+            ["/etc/cron.daily/man-db", "root", "script_line", "",
+             "root", ") | do_sendmail", "", "8"]]
     pre = []
     if label == "web01":
         # a second uid-0 account, and a key nobody else trusts
@@ -177,14 +186,18 @@ def side_tables(label):
         users.append(["deploy", "1002", "/home/deploy", "/bin/bash", "", "", "0"])
     # who logged in here, and from where
     auth = [["2026-03-24 03:00:00", "failed password", "root", OUTSIDE,
-             "failure", "sshd"]]
+             "failure", "sshd"],
+            # sshd writes this after a login, after a refusal, and after a
+            # scanner opens a socket and leaves. It is not a sign-in.
+            ["2026-03-24 03:50:00", "connection closed", "", ADDR["web01"],
+             "success", "sshd"]]
     logins = []
     hist = [["root", "2026-03-24 02:50:00", "bash", "/root/.bash_history", "1",
              "cat /etc/passwd"]]
     ifaces = [["eth0", ADDR[label] + "/24"], ["lo", "127.0.0.1/8"]]
     if label == "db02":
         # web01 signed in here, successfully - the finding this exists for
-        auth.append(["2026-03-24 03:20:00", "accepted publickey", "root",
+        auth.append(["2026-03-24 03:20:00", "accepted login", "root",
                      ADDR["web01"], "success", "sshd"])
         logins.append(["root", "sshd", "pts/1", ADDR["web01"],
                        "2026-03-24 03:20:01", "success"])
@@ -193,7 +206,7 @@ def side_tables(label):
         auth.append(["2026-03-24 03:40:00", "failed password", "deploy",
                      ADDR["web01"], "failure", "sshd"])
         # and db02 got in - which makes web01 -> db02 -> app03 one route
-        auth.append(["2026-03-24 03:35:00", "accepted publickey", "root",
+        auth.append(["2026-03-24 03:35:00", "accepted login", "root",
                      ADDR["db02"], "success", "sshd"])
         logins.append(["root", "sshd", "pts/0", ADDR["db02"],
                        "2026-03-24 03:35:01", "success"])
@@ -233,13 +246,27 @@ def side_tables(label):
     if label == "app03":
         # mtime only: the copy carried its timestamp and nothing wrote a crtime
         inv.append(["/usr/local/lib/hide.so", "", "2026-03-24 02:30:00"])
-    return [
+    # A disk image produces no INTERFACES - that is `ip addr` at collection
+    # time - so the only record of what this host answers on is its own
+    # configuration. app03 is read this way on purpose.
+    netcfg = [["/etc/network/interfaces", "auto ens33", ""],
+              ["/etc/network/interfaces", "iface ens33 inet static", ""],
+              ["/etc/network/interfaces", "address " + ADDR[label], ""],
+              ["/etc/network/interfaces", "netmask 255.255.255.0", ""],
+              ["/etc/network/interfaces", "network 10.0.0.0", ""],
+              ["/etc/network/interfaces", "broadcast 10.0.0.255", ""],
+              ["/etc/network/interfaces", "gateway 10.0.0.1", ""],
+              ["/etc/network/interfaces", "dns-nameservers 10.0.0.53 8.8.8.8",
+               ""]]
+    grids = [
+        Grid("NETWORK_CONFIG", ["source", "key", "value"], netcfg),
         Grid("FILE_INVENTORY", ["host_path", "crtime_utc", "mtime_utc"], inv),
         Grid("SUDOERS", ["file", "rule", "nopasswd"], sudo),
         Grid("GROUPS", ["group", "gid", "members", "member_count"], groups),
         Grid("WEB_LOG", ["timestamp_utc", "client_ip", "method", "resource",
                          "status"], web),
-        Grid("INTERFACES", ["name", "addresses"], ifaces),
+        Grid("INTERFACES", ["name", "addresses"], [] if label == "app03"
+             else ifaces),
         Grid("AUTH_LOG", ["timestamp_utc", "event", "user", "source_ip",
                           "result", "process"], auth),
         Grid("LOGINS", ["user", "service", "terminal", "source_host", "start",
@@ -253,6 +280,7 @@ def side_tables(label):
                       "command", "running_pids", "line_no"], cron),
         Grid("LD_PRELOAD", ["path", "entry", "note"], pre),
     ]
+    return grids
 
 
 SHARED_OS = "a" * 64          # /usr/bin/curl - every host has it, and should
@@ -564,6 +592,39 @@ def check_persistence(L, res):
               "got %s" % [(f.severity, f.title) for f in cor.tri.findings])
 
 
+def check_persistence_is_entries(L, res):
+    """A line inside a cron script is not a thing that runs.
+
+    CRON keeps 'script_line' rows so an examiner can read what a cron script
+    does. Joining on them turned CROSS_PERSISTENCE into the fragments two
+    stock Debian hosts have in common - '$iosched_idle \\', ') | do_sendmail'
+    - 183 of them on the two disk images this was found on.
+    """
+    print("\npersistence - entries, and whose they are")
+    cor = build(L)
+    rows = rows_of(cor, "CROSS_PERSISTENCE")
+    values = [r["value"] for r in rows]
+    res.check("a line inside a cron script is not an autostart entry",
+              not any("do_sendmail" in v or "iosched_idle" in v
+                      for v in values), "got %s" % values)
+    res.check("the entry that runs the script still is",
+              "/usr/local/bin/collect.sh" in values, "got %s" % values)
+    by = dict((r["value"], r) for r in rows)
+    res.check("something run out of /usr/local is notable",
+              by["/usr/local/bin/collect.sh"]["notable"] == "yes",
+              "got %s" % by.get("/usr/local/bin/collect.sh"))
+    res.check("a stock cron.daily script is not",
+              by.get("apache2", {}).get("notable") == "",
+              "got %s" % by.get("apache2"))
+    res.check("an ld.so.preload entry always is",
+              by["/usr/lib/libhide.so"]["notable"] == "yes",
+              "got %s" % by.get("/usr/lib/libhide.so"))
+    res.check("and the stock ones are counted apart, at INFO",
+              any(f.severity == "INFO" and "further autostart" in f.title
+                  for f in cor.tri.findings),
+              "got %s" % [(f.severity, f.title) for f in cor.tri.findings])
+
+
 def check_techniques(L, res):
     print("\ntechniques - and which host is missing one")
     cor = build(L)
@@ -577,6 +638,37 @@ def check_techniques(L, res):
               "got %s" % rows.get("T1110"))
     res.check("severity is the worst that carried it",
               rows["T1036"]["severity"] == "CRITICAL")
+
+
+def check_identity_from_config(L, res):
+    """A host read from a disk image still has to be recognisable.
+
+    INTERFACES is `ip addr` at collection time and a disk image has none, so
+    identity resolved to nothing and CROSS_SESSIONS - the table this module
+    exists for - reported no sign-ins however many the logs held. On a real
+    three-host Hadoop cluster that was 116 successful logins from the master
+    in slave1's auth.log, and a correlation that said nothing happened.
+    """
+    print("\nidentity, for a host that was read as a disk")
+    cor = build(L)
+    by_label = dict((c.label, c) for c in cor.cases)
+    app = by_label["app03"]
+    res.check("app03 is resolved to its own address, from the configuration",
+              ADDR["app03"] in app.addresses,
+              "got %s" % sorted(app.addresses))
+    for wrong in ("10.0.0.0", "10.0.0.255", "10.0.0.1", "255.255.255.0",
+                  "10.0.0.53", "8.8.8.8"):
+        res.check("  %s is not this host" % wrong, wrong not in app.addresses,
+                  "got %s" % sorted(app.addresses))
+    res.check("which is what lets a login from it be attributed",
+              cor._who_is(ADDR["app03"]) == "app03",
+              "got %r" % cor._who_is(ADDR["app03"]))
+    res.check("and an address in the case's range but nobody's is still nobody",
+              not cor._who_is("10.0.0.99"),
+              "got %r" % cor._who_is("10.0.0.99"))
+    web = by_label["web01"]
+    res.check("a host that did report an interface list still uses it",
+              ADDR["web01"] in web.addresses, "got %s" % sorted(web.addresses))
 
 
 def check_paths(L, res):
@@ -593,6 +685,11 @@ def check_paths(L, res):
               one["first_utc"].endswith("03:20:00")
               and one["last_utc"].endswith("03:35:00"),
               "got %s .. %s" % (one["first_utc"], one["last_utc"]))
+    res.check("a closed connection is not a sign-in",
+              not any(r["result"] == "connection closed"
+                      or "connection closed" in (r["evidence"] or "")
+                      for r in rows_of(cor, "CROSS_SESSIONS")),
+              "got %s" % [r["result"] for r in rows_of(cor, "CROSS_SESSIONS")])
     res.check("a route travelled end to end is CRITICAL",
               any(f.severity == "CRITICAL" and "travelled end to end" in f.title
                   for f in cor.tri.findings),
@@ -710,6 +807,141 @@ def check_web(L, res):
               "/shell.php" not in reqs and "/only-here" not in reqs)
 
 
+def check_findings_reach_the_merge(L, res):
+    """A correlation finding has to be in the merged FINDINGS table.
+
+    The console reads its findings list, its severity chips and its ATT&CK
+    matrix out of that table rather than out of a Triage. The merged export
+    holds the cross-host tables back from a second FINDINGS - and held the
+    findings back with them, so "one of these machines signed in to another"
+    was computed and then shown in no console, no CSV and no case.db.
+    """
+    print("\nthe correlation's own findings, in the merged export")
+    cor = build(L)
+    cross = cor.tables
+    # a merged export, as cli.py builds one: per-host tables joined, then the
+    # cross tables added and the correlation's findings folded in
+    def table(name, cols, rows):
+        t = L.Table(name, name.title(), cols, "Analysis", "")
+        for r in rows:
+            t.add(*r)
+        return t
+
+    per_host = [(c.label,
+                 [table("FINDINGS", ["severity", "category", "title",
+                                     "artifact", "count"],
+                        [["HIGH", "Filesystem", "%s only" % c.label,
+                          "bodyfile", 1]]),
+                  table("TIMELINE", ["timestamp_utc", "severity", "category",
+                                     "description"],
+                        [[ts(3, 0), "HIGH", "Authentication",
+                          "%s event" % c.label]])])
+                for c in cor.cases]
+    tables, column = L.merge_tables(per_host)
+    L.fold_correlation(tables, cross, column)
+    merged = dict((t.name, t) for t in tables)
+
+    rows = list(merged["FINDINGS"].iter_rows())
+    cols = merged["FINDINGS"].columns
+    ti, ci = cols.index("title"), cols.index(column)
+    titles = [r[ti] for r in rows]
+    res.check("a per-host finding is still there",
+              any(t.endswith(" only") for t in titles), "got %s" % titles[:4])
+    res.check("and the correlation's own findings are too",
+              any("machine-to-machine" in t for t in titles),
+              "got %s" % titles[:8])
+    corr = [r for r in rows if "machine-to-machine" in r[ti]]
+    ai = cols.index("artifact")
+    res.check("carrying the cross table it came from, in the column the "
+              "console reads",
+              all(r[ai] for r in corr), "got %s" % [r[ai] for r in corr])
+    res.check("labelled as the correlation, not as one of the hosts",
+              all(r[ci] == L.CORRELATION_LABEL for r in corr),
+              "got %s" % [r[ci] for r in corr])
+    res.check("which is not one of the input labels",
+              L.CORRELATION_LABEL not in [c.label for c in cor.cases])
+    tl = list(merged["TIMELINE"].iter_rows())
+    tcols = merged["TIMELINE"].columns
+    res.check("the correlation's timeline rows are folded in as well",
+              len(tl) > len(cor.cases),
+              "%d row(s) for %d host(s)" % (len(tl), len(cor.cases)))
+    res.check("every folded row keeps its own columns",
+              all(len(r) == len(tcols) for r in tl))
+
+
+def check_diagram(L, res):
+    """The diagram has to be drawn from the case, not from a case.
+
+    The first version of this picture was a script with one case's hosts,
+    counts and captions typed into it. That draws exactly one investigation
+    and silently mislabels every other. These checks are the difference: the
+    same code, handed this fixture, must produce this fixture's names and
+    numbers and nothing from anywhere else.
+    """
+    print("\nthe correlation, drawn")
+    cor = build(L)
+    svg = _build_svg(L)(cor.tables, {"hostname": "web01, db02, app03"})
+    res.check("something was drawn", bool(svg) and svg.startswith("<svg"),
+              "got %r" % (svg[:40] if svg else svg))
+    res.check("it is well-formed XML", _parses(svg))
+    for host in ("web01", "db02", "app03"):
+        res.check("  %s is on it" % host, host in svg)
+    res.check("the address that reached two hosts is on it too",
+              OUTSIDE in svg, "expected %s" % OUTSIDE)
+    res.check("an address belonging to one of the hosts is not a node",
+              svg.count(ADDR["web01"]) == 0,
+              "%s should not be drawn as an outsider" % ADDR["web01"])
+    res.check("the sign-in edges are labelled with their count",
+              "sign-in" in svg and "refused" in svg)
+    res.check("a shared file is drawn as movement", "shared file" in svg)
+    res.check("and a command that names another host is its own kind",
+              "remote command" in svg)
+    res.check("the caption says what it was drawn from", "drawn from:" in svg)
+    res.check("both themes are defined, not one flipped",
+              "prefers-color-scheme: dark" in svg
+              and 'data-theme="dark"' in svg)
+    res.check("nothing from another case leaked in",
+              "HDFS" not in svg and "hadoop" not in svg and "45010" not in svg)
+
+
+def check_diagram_one_host(L, res):
+    """One collection is not a correlation, and must not be drawn as one."""
+    print("\nthe diagram declines when there is nothing to correlate")
+    cor = build(L)
+    hosts = [t for t in cor.tables if t.name == "HOSTS"][0]
+    rows = list(hosts.iter_rows())
+    hosts.rows = rows[:1]
+    hosts._count = 1
+    hosts._spill_path = None
+    svg = _build_svg(L)(cor.tables, {})
+    res.check("a single collection draws nothing at all", svg == "",
+              "got %d bytes" % len(svg))
+
+
+def _build_svg(L):
+    """The drawing code of whichever build is under test.
+
+    Built, every module is one namespace and `build_svg` is on L itself.
+    From src, L is linsight.correlate and the drawing lives next door. Taking
+    it off L first is what makes `--built` test the built file rather than
+    quietly importing src and reporting a pass for code it never ran.
+    """
+    got = getattr(L, "build_svg", None)
+    if got is not None:
+        return got
+    from linsight.graph import build_svg
+    return build_svg
+
+
+def _parses(svg):
+    import xml.dom.minidom
+    try:
+        xml.dom.minidom.parseString(svg.encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+
 def check_tab_contract(L, res):
     """The console's Correlation tab reads these by name, so they must exist."""
     print("\nthe Correlation tab table contract")
@@ -790,12 +1022,17 @@ def main():
     check_keys(L, res)
     check_accounts(L, res)
     check_persistence(L, res)
+    check_persistence_is_entries(L, res)
     check_techniques(L, res)
+    check_identity_from_config(L, res)
     check_paths(L, res)
     check_paths_window(L, res)
     check_transfers(L, res)
     check_privilege(L, res)
     check_web(L, res)
+    check_findings_reach_the_merge(L, res)
+    check_diagram(L, res)
+    check_diagram_one_host(L, res)
     check_tab_contract(L, res)
 
     print("\n%d passed, %d failed" % (res.passed, len(res.failed)))

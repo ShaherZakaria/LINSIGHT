@@ -844,6 +844,7 @@ function viewIocs(){
    rather than animated: it has to settle the same way twice so that a
    screenshot in a report matches what the examiner saw. */
 var NODE_KIND={ip:'#58a6ff',user:'#f5d067',file:'#ff9f43',rule:'#ff5f56',cmd:'#a371f7',url:'#3fb950',tool:'#ff7b72',host:'#79c0ff',collection:'#79c0ff'};
+var EV_SHOWN=6;    /* sample rows the hover panel has room for */
 var EGN=44;        /* how many circles to draw - the examiner's choice */
 var EGISO=null;    /* the node the picture is narrowed to, by key */
 /* Which kinds of thing are drawn. All of them to start, because the first
@@ -896,6 +897,19 @@ function _egRank(why){
 /* An activity that succeeded is drawn differently from one that did not.
    Colour rather than a footnote, because on a busy picture the question is
    always which of these lines mattered. */
+/* One round of each source table, then the next, until the panel is full.
+   A node touched by four tables shows one row from each before it shows a
+   second from any. */
+function egEv(o){
+ var by=o&&o.evs,out=[],names,i,j;
+ if(!by)return out;
+ names=Object.keys(by);
+ for(i=0;i<EV_SHOWN&&out.length<EV_SHOWN;i++){
+  for(j=0;j<names.length&&out.length<EV_SHOWN;j++){
+   var lst=by[names[j]];
+   if(i<lst.length)out.push(lst[i]);}}
+ return out;
+}
 function egEdgeColour(e){
  if(e.kind==='move')return 'var(--gold)';
  if(e.kind==='in')return NODE_KIND.collection;
@@ -907,18 +921,33 @@ function egEdgeColour(e){
 function egBuild(){
  var nodes={},edges={},order=[];
  EGSRC={rows:0,tables:0};
- /* Six rows kept per node and per edge, so hovering can show the evidence
+ /* Six rows shown per node and per edge, so hovering can show the evidence
     rather than a count of it. Six because that is what fits in the panel -
-    the full set is one click away in the table it names. */
- var KEEP=6;
+    the full set is one click away in the table it names.
+
+    Kept per source table rather than first-come, because first-come is
+    whichever table egBuild happens to walk first. AUTH_LOG is walked before
+    PRIVILEGE_ACTIVITY, so on a host where root is the target of 168 sudo
+    calls and of a handful of refused logins, the root circle filled all six
+    of its slots with the refused logins and showed not one sudo call - and
+    the sudo calls are the reason anybody hovers root. Three per table, then
+    interleaved, so a node with two relations shows both and a node with one
+    still shows six of it: the interleave takes one row from each table in
+    turn, so six tables give one row each and one table gives all six. Up to
+    six are kept per table rather than three, or the single-relation node -
+    the common one - would show half a panel. */
  function node(kind,id,extra){
   if(!EGKIND[kind])return null;
   var k=kind+':'+id;
-  if(!nodes[k]){nodes[k]={k:k,kind:kind,id:id,n:0,extra:extra||'',ev:[]};
+  if(!nodes[k]){nodes[k]={k:k,kind:kind,id:id,n:0,extra:extra||'',evs:{}};
    order.push(nodes[k]);}
   nodes[k].n++;return nodes[k];}
  function evid(o,ctx){
-  if(ctx&&o.ev.length<KEEP)o.ev.push(ctx);}
+  if(!ctx)return;
+  var t=ctx.t||'';
+  if(!o.evs)o.evs={};
+  if(!o.evs[t])o.evs[t]=[];
+  if(o.evs[t].length<EV_SHOWN)o.evs[t].push(ctx);}
  /* `why` is the activity, and it is now the edge's own property rather than
     a string hidden in a tooltip: it is drawn on the line, it colours the
     line, and it is what the legend of relations counts. `kind` separates the
@@ -928,7 +957,7 @@ function egBuild(){
  function edge(a,b,why,ctx,kind){
   if(!a||!b||a===b)return null;
   var k=a.k+'>'+b.k;
-  if(!edges[k])edges[k]={a:a,b:b,n:0,why:why||'',ev:[],
+  if(!edges[k])edges[k]={a:a,b:b,n:0,why:why||'',evs:{},
                          kind:kind||'act',whys:{}};
   var e=edges[k];
   e.n++;
@@ -1406,12 +1435,12 @@ function egWire(){
   L.onmouseenter=function(){
    var e=EG.edges[i];
    detail(evHtml(e.a.id+'  \u2192  '+e.b.id,
-     e.n+' row(s) recorded this - '+e.why,e.ev));};});
+     e.n+' row(s) recorded this - '+e.why,egEv(e)));};});
  nodes.forEach(function(g,i){
   g.onmouseenter=function(){
    if(!drag&&!EG.focus)highlight(EG.nodes[i]);
    var nd=EG.nodes[i];
-   detail(evHtml(nd.kind+'  '+nd.id,nd.n+' row(s) name it',nd.ev));};
+   detail(evHtml(nd.kind+'  '+nd.id,nd.n+' row(s) name it',egEv(nd)));};
   g.onmouseleave=function(){if(!drag&&!EG.focus)highlight(null);};
   g.onmousedown=function(ev){
    ev.preventDefault();drag={i:i,moved:false};g.style.cursor='grabbing';};
@@ -2820,7 +2849,8 @@ function viewCorrelation(){
    ['kind','grant','host_count','hosts','notable','nopasswd']);
  h+=crossPanel('CROSS_ACCOUNTS',
    ['username','uid','host_count','hosts','consistent','shells']);
- h+=crossPanel('CROSS_PERSISTENCE',['kind','value','host_count','hosts']);
+ h+=crossPanel('CROSS_PERSISTENCE',
+   ['kind','value','host_count','hosts','notable']);
  h+=crossPanel('CROSS_FINDINGS',
    ['severity','category','finding','host_count','hosts'],
    function(c,v){
