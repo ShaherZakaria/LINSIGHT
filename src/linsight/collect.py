@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import sys
 import tarfile
 import urllib.parse
 import zipfile
@@ -198,6 +199,7 @@ class Collection:
         self._mtimes = {}         # lowercase relative name -> epoch, where known
         self._names = {}          # lowercase relative name -> the same name, cased
         self._raw = {}            # lowercase relative name -> archive member name
+        self._owners = {}         # lowercase relative name -> tar uname/uid
         self.prefix = ""          # archive dir that holds the layout's marker
         self.mounted_root = False # the collection root IS the host filesystem
         self.layout = "uac"       # 'uac' or 'velociraptor'; see _find_prefix
@@ -270,6 +272,18 @@ class Collection:
     #: differs and the difference matters. Overridden by the backends that
     #: read the source filesystem's own metadata.
     time_source = "archive"
+
+    def member_owner(self, rel):
+        """Who the container says owns this file, or '' where it says nothing.
+
+        A tar written by the collector on the host carries the host's own
+        uname and gname in every header, which makes it the same kind of
+        evidence as the mtime beside it - weaker than an inode read but the
+        only answer a collection with no bodyfile has. A zip has no POSIX
+        owner to carry, and the owner of an extracted directory is whoever
+        ran tar -x, so both answer nothing rather than answering wrongly.
+        """
+        return self._owners.get((self.prefix + rel.lstrip("/")).lower(), "")
 
     def member_time(self, rel):
         """(mtime, atime, ctime, crtime) for a member, as UTC strings.
@@ -351,6 +365,15 @@ class Collection:
                 if not rel:
                     continue
                 self._add_member(rel, ti.name, ti.size, ti.mtime)
+                # Interned: a host has a handful of distinct owners and a
+                # collection has thousands of files, so the dict holds one
+                # pointer per member rather than one string. uname where the
+                # header carries it, the numeric uid where it does not -
+                # which is what a tar written on a host with no matching
+                # passwd entry looks like, and is itself worth seeing.
+                own = ti.uname or (str(ti.uid) if ti.uid is not None else "")
+                if own:
+                    self._owners[rel.lower()] = sys.intern(own)
         if not self._names:
             raise SystemExit("[!] no readable files found in %s" % self.path)
 
@@ -810,6 +833,7 @@ class FilesCollection(Collection):
         self._mtimes = {}
         self._names = {}
         self._raw = {}             # unused here - members are already normalised
+        self._owners = {}          # a loose file's owner is the analyst's
         self._disk = {}            # synthetic member name -> real path on disk
         self.prefix = ""
         self.layout = "uac"

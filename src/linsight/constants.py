@@ -61,7 +61,8 @@ Three tables exist to make that accounting honest rather than merely true:
                      read 'no extractor for this artifact' are the real
                      residue, the rest are classified (distribution reference
                      data, vendored source, application state)
-  FILE_INVENTORY     one row per collected file naming the table that took it
+  FILE_INVENTORY     one row per collected file, with its owner and the
+                     table that took it
 
 UAC's own layout moves between profile generations - suid/sgid and the
 filesystem surveys live under system/ in recent profiles and

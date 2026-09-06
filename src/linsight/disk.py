@@ -83,6 +83,7 @@ class DiskCollection(Collection):
         self._mtimes = {}
         self._names = {}
         self._raw = {}
+        self._owners = {}     # the inode's uid answers instead; see member_owner
         self.prefix = ""
         # 'uac' is where the parsers look for a copied filesystem, so it is the
         # layout the members are named for. display_layout is what the report
