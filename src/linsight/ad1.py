@@ -519,6 +519,7 @@ class Ad1Collection(Collection):
         self._mtimes = {}
         self._names = {}
         self._raw = {}
+        self._owners = {}     # the AD1's own metadata answers instead
         self.prefix = ""
         # the members are named the way UAC names a copied filesystem, which
         # is what lets every parser above find them without knowing this is

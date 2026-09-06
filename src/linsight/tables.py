@@ -696,21 +696,31 @@ class TableBuilder:
         """Every file in the collection - the 'did anything get missed' table."""
         t = self.table("FILE_INVENTORY", "Every file in the collection",
                        ["path", "host_path", "top_level", "category", "size_bytes",
-                        "size_human", "mtime_utc", "atime_utc", "ctime_utc",
-                        "crtime_utc", "time_source", "parsed_into"],
+                        "size_human", "owner", "owner_source", "mtime_utc",
+                        "atime_utc", "ctime_utc", "crtime_utc", "time_source",
+                        "parsed_into"],
                        "Collection",
-                       "One row per collected file, with its times and the "
-                       "table that parsed it. Under a narrowed --scope, "
-                       "parsed_into says so for the half that was not read - "
-                       "an empty cell always means 'offered to every extractor "
-                       "and taken by none'. time_source says where the times "
-                       "came from, because that decides what they mean: "
-                       "'bodyfile' and 'filesystem' are the host's own, read "
-                       "from the inode; 'archive' is the mtime the collector "
-                       "preserved into the tar or zip, which is the host's "
-                       "when it was collected with the flags to keep it; "
-                       "'collected file' is the extracted copy's own mtime and "
-                       "is the weakest of the three.")
+                       "One row per collected file, with its times, who owned "
+                       "it and the table that parsed it. Under a narrowed "
+                       "--scope, parsed_into says so for the half that was not "
+                       "read - an empty cell always means 'offered to every "
+                       "extractor and taken by none'. time_source says where "
+                       "the times came from, because that decides what they "
+                       "mean: 'bodyfile' and 'filesystem' are the host's own, "
+                       "read from the inode; 'archive' is the mtime the "
+                       "collector preserved into the tar or zip, which is the "
+                       "host's when it was collected with the flags to keep "
+                       "it; 'collected file' is the extracted copy's own mtime "
+                       "and is the weakest of the three. owner_source says the "
+                       "same about the owner: 'bodyfile' and 'filesystem' are "
+                       "the inode's uid resolved against this host's own "
+                       "/etc/passwd, 'archive' is the uname the collector "
+                       "wrote into the tar header. An owner left as a bare "
+                       "number is one no passwd entry claims, which is worth "
+                       "looking at rather than a formatting failure. Empty "
+                       "means nothing recorded it: a zip carries no owner, "
+                       "and the owner of an extracted directory is whoever "
+                       "unpacked it, so neither is guessed at.")
         plen = len(self.col.prefix)
         rootfs = tuple(rd + "/" for rd in self.col.rootfs_dirs)
         # The bodyfile is the authoritative record of the host's own times
@@ -739,6 +749,25 @@ class TableBuilder:
                     into = "not read under --scope %s" % self.scope
             times = self.col.member_time(rel)
             bf = meta.get(host) if host else None
+            # The inode's own record first, the container's header second -
+            # the same order the times below are settled in, and for the same
+            # reason. A disk and an AD1 reach the bodyfile too: both generate
+            # one from the inodes they read, so this one lookup answers for
+            # every backend that knows the owner at all.
+            owner, owner_src = "", ""
+            if bf and bf.get("uid"):
+                owner = self.uid_name(bf["uid"]) or bf["uid"]
+                # A backend that read the source metadata itself generated
+                # this bodyfile out of what it read, so the owner came from
+                # the same place the times did and is named in the same
+                # words. Only a bodyfile the collector left behind is called
+                # one here.
+                owner_src = (self.col.time_source
+                             if self.col.time_source not in
+                             ("archive", "collected file") else "bodyfile")
+            else:
+                owner = self.col.member_owner(rel)
+                owner_src = "archive" if owner else ""
             if times[1] or times[2] or times[3]:
                 # the backend read the inode itself, so it has all four and
                 # the bodyfile - which on these backends is built from the
@@ -752,6 +781,7 @@ class TableBuilder:
                 mtime, atime, ctime, crtime = times
                 origin = fallback if mtime else ""
             t.add(rel, host, top, cat, size, human_size(size),
+                  owner, owner_src,
                   mtime, atime, ctime, crtime, origin, into)
 
     # -- 2. processes -------------------------------------------------------

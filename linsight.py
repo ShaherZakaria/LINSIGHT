@@ -63,7 +63,8 @@ Three tables exist to make that accounting honest rather than merely true:
                      read 'no extractor for this artifact' are the real
                      residue, the rest are classified (distribution reference
                      data, vendored source, application state)
-  FILE_INVENTORY     one row per collected file naming the table that took it
+  FILE_INVENTORY     one row per collected file, with its owner and the
+                     table that took it
 
 UAC's own layout moves between profile generations - suid/sgid and the
 filesystem surveys live under system/ in recent profiles and
@@ -1852,6 +1853,7 @@ class Collection:
         self._mtimes = {}         # lowercase relative name -> epoch, where known
         self._names = {}          # lowercase relative name -> the same name, cased
         self._raw = {}            # lowercase relative name -> archive member name
+        self._owners = {}         # lowercase relative name -> tar uname/uid
         self.prefix = ""          # archive dir that holds the layout's marker
         self.mounted_root = False # the collection root IS the host filesystem
         self.layout = "uac"       # 'uac' or 'velociraptor'; see _find_prefix
@@ -1924,6 +1926,18 @@ class Collection:
     #: differs and the difference matters. Overridden by the backends that
     #: read the source filesystem's own metadata.
     time_source = "archive"
+
+    def member_owner(self, rel):
+        """Who the container says owns this file, or '' where it says nothing.
+
+        A tar written by the collector on the host carries the host's own
+        uname and gname in every header, which makes it the same kind of
+        evidence as the mtime beside it - weaker than an inode read but the
+        only answer a collection with no bodyfile has. A zip has no POSIX
+        owner to carry, and the owner of an extracted directory is whoever
+        ran tar -x, so both answer nothing rather than answering wrongly.
+        """
+        return self._owners.get((self.prefix + rel.lstrip("/")).lower(), "")
 
     def member_time(self, rel):
         """(mtime, atime, ctime, crtime) for a member, as UTC strings.
@@ -2005,6 +2019,15 @@ class Collection:
                 if not rel:
                     continue
                 self._add_member(rel, ti.name, ti.size, ti.mtime)
+                # Interned: a host has a handful of distinct owners and a
+                # collection has thousands of files, so the dict holds one
+                # pointer per member rather than one string. uname where the
+                # header carries it, the numeric uid where it does not -
+                # which is what a tar written on a host with no matching
+                # passwd entry looks like, and is itself worth seeing.
+                own = ti.uname or (str(ti.uid) if ti.uid is not None else "")
+                if own:
+                    self._owners[rel.lower()] = sys.intern(own)
         if not self._names:
             raise SystemExit("[!] no readable files found in %s" % self.path)
 
@@ -2464,6 +2487,7 @@ class FilesCollection(Collection):
         self._mtimes = {}
         self._names = {}
         self._raw = {}             # unused here - members are already normalised
+        self._owners = {}          # a loose file's owner is the analyst's
         self._disk = {}            # synthetic member name -> real path on disk
         self.prefix = ""
         self.layout = "uac"
@@ -8079,6 +8103,7 @@ class DiskCollection(Collection):
         self._mtimes = {}
         self._names = {}
         self._raw = {}
+        self._owners = {}     # the inode's uid answers instead; see member_owner
         self.prefix = ""
         # 'uac' is where the parsers look for a copied filesystem, so it is the
         # layout the members are named for. display_layout is what the report
@@ -9092,6 +9117,7 @@ class Ad1Collection(Collection):
         self._mtimes = {}
         self._names = {}
         self._raw = {}
+        self._owners = {}     # the AD1's own metadata answers instead
         self.prefix = ""
         # the members are named the way UAC names a copied filesystem, which
         # is what lets every parser above find them without knowing this is
@@ -15970,21 +15996,31 @@ class TableBuilder:
         """Every file in the collection - the 'did anything get missed' table."""
         t = self.table("FILE_INVENTORY", "Every file in the collection",
                        ["path", "host_path", "top_level", "category", "size_bytes",
-                        "size_human", "mtime_utc", "atime_utc", "ctime_utc",
-                        "crtime_utc", "time_source", "parsed_into"],
+                        "size_human", "owner", "owner_source", "mtime_utc",
+                        "atime_utc", "ctime_utc", "crtime_utc", "time_source",
+                        "parsed_into"],
                        "Collection",
-                       "One row per collected file, with its times and the "
-                       "table that parsed it. Under a narrowed --scope, "
-                       "parsed_into says so for the half that was not read - "
-                       "an empty cell always means 'offered to every extractor "
-                       "and taken by none'. time_source says where the times "
-                       "came from, because that decides what they mean: "
-                       "'bodyfile' and 'filesystem' are the host's own, read "
-                       "from the inode; 'archive' is the mtime the collector "
-                       "preserved into the tar or zip, which is the host's "
-                       "when it was collected with the flags to keep it; "
-                       "'collected file' is the extracted copy's own mtime and "
-                       "is the weakest of the three.")
+                       "One row per collected file, with its times, who owned "
+                       "it and the table that parsed it. Under a narrowed "
+                       "--scope, parsed_into says so for the half that was not "
+                       "read - an empty cell always means 'offered to every "
+                       "extractor and taken by none'. time_source says where "
+                       "the times came from, because that decides what they "
+                       "mean: 'bodyfile' and 'filesystem' are the host's own, "
+                       "read from the inode; 'archive' is the mtime the "
+                       "collector preserved into the tar or zip, which is the "
+                       "host's when it was collected with the flags to keep "
+                       "it; 'collected file' is the extracted copy's own mtime "
+                       "and is the weakest of the three. owner_source says the "
+                       "same about the owner: 'bodyfile' and 'filesystem' are "
+                       "the inode's uid resolved against this host's own "
+                       "/etc/passwd, 'archive' is the uname the collector "
+                       "wrote into the tar header. An owner left as a bare "
+                       "number is one no passwd entry claims, which is worth "
+                       "looking at rather than a formatting failure. Empty "
+                       "means nothing recorded it: a zip carries no owner, "
+                       "and the owner of an extracted directory is whoever "
+                       "unpacked it, so neither is guessed at.")
         plen = len(self.col.prefix)
         rootfs = tuple(rd + "/" for rd in self.col.rootfs_dirs)
         # The bodyfile is the authoritative record of the host's own times
@@ -16013,6 +16049,25 @@ class TableBuilder:
                     into = "not read under --scope %s" % self.scope
             times = self.col.member_time(rel)
             bf = meta.get(host) if host else None
+            # The inode's own record first, the container's header second -
+            # the same order the times below are settled in, and for the same
+            # reason. A disk and an AD1 reach the bodyfile too: both generate
+            # one from the inodes they read, so this one lookup answers for
+            # every backend that knows the owner at all.
+            owner, owner_src = "", ""
+            if bf and bf.get("uid"):
+                owner = self.uid_name(bf["uid"]) or bf["uid"]
+                # A backend that read the source metadata itself generated
+                # this bodyfile out of what it read, so the owner came from
+                # the same place the times did and is named in the same
+                # words. Only a bodyfile the collector left behind is called
+                # one here.
+                owner_src = (self.col.time_source
+                             if self.col.time_source not in
+                             ("archive", "collected file") else "bodyfile")
+            else:
+                owner = self.col.member_owner(rel)
+                owner_src = "archive" if owner else ""
             if times[1] or times[2] or times[3]:
                 # the backend read the inode itself, so it has all four and
                 # the bodyfile - which on these backends is built from the
@@ -16026,6 +16081,7 @@ class TableBuilder:
                 mtime, atime, ctime, crtime = times
                 origin = fallback if mtime else ""
             t.add(rel, host, top, cat, size, human_size(size),
+                  owner, owner_src,
                   mtime, atime, ctime, crtime, origin, into)
 
     # -- 2. processes -------------------------------------------------------

@@ -596,6 +596,27 @@ and a `time_source` saying what they mean, because that differs:
 | `archive` | the mtime preserved into the tar or zip — the host's, when it was collected with the flags to keep it |
 | `collected file` | the extracted copy's own mtime, and the weakest of the five |
 
+### Who owned every file
+
+Beside them, `owner` and an `owner_source` saying where that came from. The
+uid is resolved against **the collection's own `/etc/passwd`**, never the
+analysis box's, so `1001` becomes the account that host knew — and an owner
+left as a bare number is one no passwd entry claims, which is a lead rather
+than a formatting failure.
+
+| `owner_source` | |
+|---|---|
+| `filesystem` | the inode's uid, read by the disk backend |
+| `the AD1's recorded metadata` | the uid as FTK recorded it at acquisition |
+| `bodyfile` | the inode's uid, from the bodyfile the collector produced |
+| `archive` | the `uname` the collector wrote into the tar header — the host's, since UAC tars as root |
+| *(empty)* | nothing recorded it |
+
+The inode wins where both exist. Empty is the honest answer in two cases and
+neither is guessed at: a **zip** has no POSIX owner in the format at all, and
+the owner of an **extracted directory** is whoever ran `tar -x` — reading it
+back would report the analyst as the owner of every file on the host.
+
 ### Timestamps that disagree with each other
 
 Three of a file's four timestamps can be written from userspace: `utimensat`
@@ -1106,7 +1127,7 @@ claude mcp add linsight -- python /path/to/linsight.py --mcp /path/to/case.db
 |---|---|
 | `COLLECTION_ERRORS` | the `.stderr` UAC saved per command — so an absent artifact says whether the tool was missing, the command was denied, or the profile never ran it |
 | `UNPARSED_FILES` | what no extractor claimed, with a reason |
-| `FILE_INVENTORY` | one row per collected file, naming the table that took it |
+| `FILE_INVENTORY` | one row per collected file, with its owner and the table that took it |
 
 The same rule drives Velociraptor support: which artifacts a collection holds is decided by whoever built the collector, so the artifact set is discovered from `results/` rather than assumed. An artifact with no mapping still reaches the export as its own `VELO_*` table, and `VELO_ARTIFACTS` lists every artifact found with its row count and destination.
 
