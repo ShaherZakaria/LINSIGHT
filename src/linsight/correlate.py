@@ -1043,7 +1043,15 @@ class Correlator(object):
                     if not hit:
                         continue
                     rows.append((cmd["when"], c.label, other.label, cmd["who"],
-                                 hit, trunc(cmd["cmd"], 200), cmd["source"],
+                                 # The whole command. It is the evidence -
+                                 # `scp ../45010 hadoop@10.0.0.12:/home/...`
+                                 # cut at 200 characters loses the path it was
+                                 # written to, which is the half that says
+                                 # what happened. The console wraps it and the
+                                 # row opens in full on a click; the summary
+                                 # line on the finding is where shortening
+                                 # belongs.
+                                 hit, cmd["cmd"], cmd["source"],
                                  cmd["where"]))
                     p = pairs[(c.label, other.label)]
                     p["n"] += 1
@@ -1907,7 +1915,7 @@ class Correlator(object):
             if when:
                 rows.append((when, r.get("from_collection"),
                              r.get("to_collection"), "remote command",
-                             trunc(r.get("command") or "", 160),
+                             r.get("command") or "",
                              "CROSS_COMMANDS"))
         for r in self._rows_of("CROSS_TRANSFERS"):
             if r.get("first_utc"):
