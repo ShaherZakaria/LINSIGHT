@@ -7,6 +7,7 @@ import csv
 import html as htmllib
 import io
 import json
+import re
 import zlib
 import itertools
 import base64
@@ -265,6 +266,63 @@ def _packed_rows(table, limit):
 PINNED_TABLES = ("HACKTOOL_HITS", "HACKTOOL_VARIANTS")
 
 
+# Addresses that belong to a machine in this export, so the console can say
+# whose they are wherever one turns up.
+#
+# A login on db02 from 10.0.0.14 is an address until something says 10.0.0.14
+# is web01 - and that is the difference between a row and lateral movement.
+# The correlation already makes that call once, in CROSS_SESSIONS, and the
+# answer stopped there: the same address in AUTH_LOG, in SHELL_HISTORY, in a
+# scp command line or in the relationship graph was still a bare number the
+# reader had to recognise for themselves.
+#
+# Built from HOSTS where the run was correlated, and from INTERFACES - which
+# now carries the on-disk configuration for collections that ran no `ip addr`
+# - otherwise.
+#
+# Only emitted when it names more than one machine. In a single-collection
+# console every address in the map is this host's own, and tagging its own
+# address on every row of SOCKETS and NETSTAT is noise over a fact the reader
+# already has from the header.
+_OWNER_SKIP = ("127.", "169.254.", "fe80:", "0.0.0.0", "::1", "::")
+
+
+def _address_owners(tables, meta, host):
+    """{address: the collection that answers on it}."""
+    by, owners = dict((t.name, t) for t in tables), {}
+    hostcol = (meta or {}).get("host_column") or ""
+
+    def put(addr, label):
+        a = _s(addr).strip().lower().strip("[]").split("/")[0].strip()
+        if not a or not label or a.startswith(_OWNER_SKIP):
+            return
+        owners.setdefault(a, _s(label))
+
+    def cells(t, name):
+        return t.columns.index(name) if name in t.columns else -1
+
+    t = by.get("HOSTS")
+    if t is not None and "addresses" in t.columns:
+        li = cells(t, hostcol)
+        ai, ni = cells(t, "addresses"), cells(t, "hostname")
+        for row in t.iter_rows():
+            label = (_s(row[li]) if li >= 0 else "") or \
+                    (_s(row[ni]) if ni >= 0 else "")
+            for a in re.split(r"[,\s]+", _s(row[ai]) if ai >= 0 else ""):
+                put(a, label)
+    t = by.get("INTERFACES")
+    if not owners and t is not None and "addresses" in t.columns:
+        li = cells(t, hostcol)
+        ai, ni = cells(t, "addresses"), cells(t, "name")
+        for row in t.iter_rows():
+            if ni >= 0 and _s(row[ni]).lower() in ("lo", "lo0"):
+                continue
+            label = (_s(row[li]) if li >= 0 else "") or _s(host or "")
+            for a in re.split(r"[,\s]+", _s(row[ai]) if ai >= 0 else ""):
+                put(a, label)
+    return owners if len(set(owners.values())) > 1 else {}
+
+
 def console_html(tables, html_cap=2000, meta=None, tri=None, opts=None,
                  served=False, css=None, js=None):
     """The console as a string, for --serve to hand out without a file."""
@@ -339,6 +397,7 @@ def _write_console(fh, tables, html_cap, meta, tri, opts, served,
         payload["meta"] = [[k, str(v)] for k, v in meta.items() if v]
     host = (tri.meta.get("Hostname") if tri is not None else None) or \
            (meta or {}).get("Hostname") or "collection"
+    payload["owners"] = _address_owners(tables, meta, host)
     src = tri.col.path if tri is not None else (meta or {}).get("Collection", "")
     _emit_console(fh, esc, host, src, payload, packed, css, js)
 
