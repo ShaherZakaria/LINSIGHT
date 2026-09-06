@@ -324,6 +324,12 @@ def _case_db_beside(opts):
     return os.path.join(opts.export or os.getcwd(), "case.db")
 
 
+#: What --hash will compute, in the order the columns appear. md5 and sha1 are
+#: here because an indicator feed is as likely to be written in one of them as
+#: in sha256, not because they are worth trusting for anything else.
+HASH_ALGOS = ("md5", "sha1", "sha256")
+
+
 #: A file --serve will open as a case. The extension is checked rather than
 #: the contents because the message for "that is not a case" should name what
 #: was given, not what SQLite made of it.
@@ -398,6 +404,10 @@ def _reopen_case(ap, opts):
                  "or point --serve at the export directory of a run that "
                  "already happened." % path)
 
+    if getattr(opts, "hash_algos", None):
+        ap.error("--hash reads every file in the collection to hash it, and "
+                 "reopening a case parses nothing at all. Re-run over the "
+                 "collection with --hash, then serve the export it writes.")
     db = CaseDB(path)
     try:
         tables, meta, console = db.reopen()
@@ -652,12 +662,33 @@ def main(argv=None):
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colour")
     ap.add_argument("--quiet", action="store_true", help="suppress the console report")
     ap.add_argument("--debug", action="store_true", help="re-raise analyzer exceptions")
+    ap.add_argument("--hash", nargs="?", const="sha256", metavar="ALGO[,ALGO]",
+                    help="hash every file in the inventory, which means "
+                         "reading every one of them - the only thing in here "
+                         "whose cost is the size of the evidence rather than "
+                         "its shape. sha256 unless md5 or sha1 is named; "
+                         "several run in one pass over each file. Hashes the "
+                         "collection already recorded are shown either way "
+                         "and are never recomputed, so leave this off unless "
+                         "you need the files nothing hashed.")
     ap.add_argument("--low-memory", action="store_true",
                     help="spill large tables to a temp file - roughly half the peak "
                          "memory, about a fifth more time")
     ap.add_argument("--timing", action="store_true",
                     help="report wall time per table extractor and per output writer")
     opts = ap.parse_args(argv)
+
+    # Validated here rather than where the files are read: a run that spends
+    # four minutes parsing and then refuses '--hash sha257' has wasted the
+    # four minutes, and the misspelling is visible before any of them.
+    opts.hash_algos = ()
+    if opts.hash is not None:
+        want = [a.strip().lower() for a in opts.hash.split(",") if a.strip()]
+        bad = [a for a in want if a not in HASH_ALGOS]
+        if bad:
+            ap.error("--hash takes %s; got %s"
+                     % (", ".join(HASH_ALGOS), ", ".join(bad)))
+        opts.hash_algos = tuple(a for a in HASH_ALGOS if a in want)
 
     # set before any table is built, because a table that has already buffered
     # its rows cannot be made to have spilled them

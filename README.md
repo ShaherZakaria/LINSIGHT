@@ -617,6 +617,50 @@ neither is guessed at: a **zip** has no POSIX owner in the format at all, and
 the owner of an **extracted directory** is whoever ran `tar -x` — reading it
 back would report the analyst as the owner of every file on the host.
 
+### Hashing every file
+
+Hashes the collection already recorded are shown for nothing, and always
+were: UAC's `hash_executables` pass and the MD5/SHA-1 FTK stores beside every
+file in an AD1 both land in `FILE_INVENTORY` beside the file they belong to,
+marked `collected`. On an AD1 that is a hash for most of the acquisition
+without reading a byte.
+
+`--hash` computes the rest.
+
+```bash
+python linsight.py ./coll --hash                  # sha256
+python linsight.py ./coll --hash md5,sha256       # both, in one pass per file
+```
+
+**It is opt-in because it is the only thing in here whose cost is the size of
+the evidence rather than the shape of it.** Everything else reads the
+artifacts; this reads every file. A triage collection is seconds. A 200 GB
+disk image is the time it takes to read 200 GB — twenty minutes on a fast
+local copy, hours over a network share — and the run says what it read:
+
+```
+[+] --hash: 41.2 GB of disk read to hash 812,004 file(s) (sha256)
+```
+
+sha256 alone runs at ~1.5 GB/s and stays comfortably behind any disk; asking
+for all three drops that to ~350 MB/s, which on fast storage becomes the
+bottleneck rather than the reading. That is the whole reason the default is
+one algorithm rather than the set.
+
+Three things it will not do. It never recomputes a hash the collection
+already recorded — that one was taken on the host, or at acquisition, rather
+than off a copy afterwards, and is the better record. It never hashes a
+directory or a symlink, which have no contents and would otherwise all carry
+the same real-looking digest for the empty string. And on a **`.tar.gz`** it
+reads the archive in one forward pass rather than seeking to each member:
+gzip is a single stream, so a backward seek re-decompresses from the
+beginning — measured at 0.2 ms a file in archive order against **55 ms out of
+it**, on an archive of only 58 MB, and worse as the archive grows.
+
+The hash columns appear only when the run has something to put in them, so a
+collection nobody hashed carries no empty hash headings. `hash_source` says
+which of the two each row is.
+
 ### Timestamps that disagree with each other
 
 Three of a file's four timestamps can be written from userspace: `utimensat`
