@@ -796,7 +796,8 @@ class Correlator(object):
     #: the strongest claim first. A shared indicator or a shared key is
     #: evidence of one intrusion; a shared technique is evidence of one
     #: playbook, which is weaker and much more often innocent.
-    CROSS_TABLES = ("CROSS_SESSIONS", "CROSS_PATHS", "CROSS_COMMANDS",
+    CROSS_TABLES = ("CROSS_TIMELINE", "CROSS_SESSIONS", "CROSS_PATHS",
+                    "CROSS_COMMANDS",
                     "CROSS_TRANSFERS", "CROSS_IOCS", "CROSS_WEB_CLIENTS",
                     "CROSS_WEB_REQUESTS", "CROSS_HASHES", "CROSS_KEYS",
                     "CROSS_PRIVILEGE", "CROSS_ACCOUNTS", "CROSS_PERSISTENCE",
@@ -816,6 +817,7 @@ class Correlator(object):
         self.t_cross_privilege()
         self.t_cross_accounts()
         self.t_cross_persistence()
+        self.t_cross_timeline()      # after the tables it reads
         self.t_cross_findings()
         self.t_cross_techniques()
         self.tri.findings.sort(key=lambda f: (SEV_RANK[f.severity], f.category,
@@ -823,6 +825,15 @@ class Correlator(object):
         self.t_findings()
         self.t_timeline()
         return self.tables
+
+    def _rows_of(self, name):
+        """Rows of a table this run has already built, as dicts."""
+        t = next((x for x in self.tables if x.name == name), None)
+        if t is None:
+            return []
+        at = dict((c, i) for i, c in enumerate(t.columns))
+        return [dict((c, (row[i] if i < len(row) else "") or "")
+                     for c, i in at.items()) for row in t.iter_rows()]
 
     # -- 1. the hosts themselves -------------------------------------------
     def t_hosts(self):
@@ -1863,6 +1874,94 @@ class Correlator(object):
                      "looks like. Listed in CROSS_PERSISTENCE rather than "
                      "here.",
                      source="CROSS_PERSISTENCE", count=rest)
+
+    # -- 4d. everything between these hosts, in the order it happened -------
+    def t_cross_timeline(self):
+        """Every dated cross-host event on one clock, earliest first.
+
+        The other cross tables answer "what is shared" a kind at a time - a
+        sign-in here, a command there, a file on both. None of them answers
+        "what happened, in what order", and that is the question an incident
+        report is written to. Reading it out of five tables means sorting five
+        different timestamp columns by eye and hoping the offsets agreed.
+
+        Every row carries the time, both ends and what it was, so the whole
+        cross-host story sorts in one column. `basis` says which table the row
+        came from, because a sign-in recorded by the destination and a command
+        recorded by the source are different kinds of evidence and a reader
+        should not have to remember which is which.
+        """
+        rows = []
+        for r in self._rows_of("CROSS_SESSIONS"):
+            when = r.get("timestamp_utc")
+            if when:
+                ok = "fail" not in (r.get("result") or "").lower()
+                rows.append((when, r.get("from_collection"),
+                             r.get("to_collection"),
+                             "sign-in" if ok else "sign-in refused",
+                             "%s%s" % (r.get("user") or "(no user)",
+                                       " over %s" % r["service"]
+                                       if r.get("service") else ""),
+                             "CROSS_SESSIONS"))
+        for r in self._rows_of("CROSS_COMMANDS"):
+            when = r.get("timestamp_utc")
+            if when:
+                rows.append((when, r.get("from_collection"),
+                             r.get("to_collection"), "remote command",
+                             trunc(r.get("command") or "", 160),
+                             "CROSS_COMMANDS"))
+        for r in self._rows_of("CROSS_TRANSFERS"):
+            if r.get("first_utc"):
+                rows.append((r["first_utc"], r.get("from_collection"),
+                             r.get("to_collection"), "file first seen",
+                             "%s (%s)" % (r.get("from_path") or "",
+                                          r.get("basis") or ""),
+                             "CROSS_TRANSFERS"))
+            if r.get("last_utc"):
+                rows.append((r["last_utc"], r.get("from_collection"),
+                             r.get("to_collection"), "file reached the second",
+                             "%s (%s)" % (r.get("to_path") or "",
+                                          r.get("basis") or ""),
+                             "CROSS_TRANSFERS"))
+        for r in self._rows_of("CROSS_IOCS"):
+            if r.get("first_utc") and r.get("first_host"):
+                rows.append((r["first_utc"], r.get("first_host"),
+                             r.get("last_host") or "", "indicator first seen",
+                             "%s - %s" % (r.get("indicator") or "",
+                                          trunc(r.get("why") or "", 80)),
+                             "CROSS_IOCS"))
+        if not rows:
+            return
+        rows.sort(key=lambda r: (r[0], r[5]))
+        t = self.table("CROSS_TIMELINE",
+                       "Everything between these collections, in order",
+                       ["timestamp_utc", "from_collection", "to_collection",
+                        "event", "detail", "basis"],
+                       "Correlation",
+                       "One clock for the whole case. Every dated row the "
+                       "cross-host tables hold, sorted - a sign-in, a command "
+                       "that names another machine, a file appearing on a "
+                       "second host, an indicator reaching one before the "
+                       "other. `basis` names the table it came from, because "
+                       "a sign-in the destination logged and a command the "
+                       "source ran are different kinds of evidence. Every "
+                       "time here is UTC normalised by each host's own "
+                       "resolved offset: HOSTS says what those were, and a "
+                       "host that never resolved one is its own finding.")
+        for r in rows:
+            t.add(*r)
+        first, last = rows[0][0], rows[-1][0]
+        self.add("INFO", "Correlation",
+                 "%d dated cross-host event(s), %s to %s"
+                 % (len(rows), first[:19], last[:19]),
+                 "The order things happened in, across every machine in the "
+                 "case. Read it before the per-kind tables: they say what is "
+                 "shared, this says what happened.",
+                 evidence=["%s  %-13s -> %-13s %-22s %s"
+                           % (r[0][:19], r[1], r[2], r[3], trunc(r[4], 60))
+                           for r in rows[: self.EVIDENCE]],
+                 source="CROSS_TIMELINE", count=len(rows),
+                 times=[r[0] for r in rows])
 
     # -- 5e. the shape of the intrusion, per host --------------------------
     def t_cross_techniques(self):

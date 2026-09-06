@@ -20,7 +20,7 @@ from .common import NDJSON_TIME_COLUMNS, human_size
 from .tables import TableBuilder, _s
 from .gui import APP_CSS, APP_JS, ATTACK_ORDER, ATTACK_TACTICS, _triage_payload
 from .ask import ASK_URL
-from .graph import write_correlation_svg
+from .graph import build_svg, write_correlation_svg
 from .serve import CaseDB, live_assets, serve
 
 
@@ -333,7 +333,14 @@ def _write_console(fh, tables, html_cap, meta, tri, opts, served,
                # every one at boot to find out is the cost that design exists
                # to avoid.
                "hosts": list((meta or {}).get("hosts") or []),
-               "hostcol": (meta or {}).get("host_column") or ""}
+               "hostcol": (meta or {}).get("host_column") or "",
+               # The correlation drawn, for the tab that otherwise opens with
+               # twelve grids and no shape. Built here rather than in the page
+               # because it is the same drawing the export writes to
+               # correlation.svg, and two implementations of one picture is
+               # one of them being wrong later.
+               "corrsvg": build_svg(tables, meta) if len(
+                   (meta or {}).get("hosts") or []) > 1 else ""}
     if tri is not None:
         payload.update(_triage_payload(tri, opts))
     elif meta:
