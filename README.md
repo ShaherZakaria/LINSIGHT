@@ -28,7 +28,7 @@ A UAC collection is a few thousand files of raw command output. The evidence is 
 There is nothing to install. Copy `linsight.py` onto the analysis box and run it.
 
 ```bash
-git clone https://github.com/ShaherZakaria/linsight.git
+git clone https://github.com/ShaherZakaria/LINSIGHT.git
 cd linsight
 python linsight.py <collection>
 ```
@@ -174,6 +174,8 @@ python linsight.py ./coll --serve 0.0.0.0:9000          # anyone who can reach i
 ```
 
 Loopback only unless you name a host, and it says so loudly when you do: this hands out the parsed contents of somebody's compromised host.
+
+**Saved views** go in the same case file. A view is the whole filter state under a name — which table, its sort, the text in every box, the values ticked in every column, the severity chips, the categories, techniques and collections picked, and the time window — so "the four hosts' sudo failures in the incident hour" is reached again by name, by you tomorrow or by whoever picks the case up. Saved into the case rather than the browser, so it travels with the marks.
 
 ### Reopening a case, without parsing it again
 
@@ -1205,9 +1207,105 @@ python linsight.py .\uac-ApacheWebServer-linux-20211208202503.tar --sigma .\sigm
 
 ## Full options
 
-```
-python linsight.py --help
-```
+`python linsight.py --help` prints these. Everything is optional except an
+input, and every flag that names a path is repeatable where repeating it makes
+sense.
+
+**Input, and saying what it is**
+
+| flag | what it does |
+|---|---|
+| `COLLECTION\|DISK ...` | a collection (directory, `.tar`, `.tar.gz`, `.zip`) or a disk (raw/dd, E01, qcow2, vmdk, vhdx, vhd, `/dev/sda`) — which it is, is detected. Repeatable |
+| `--file PATH[:DEST]` | parse loose files instead of a collection; `:/host/path` says what a file is when its name does not |
+| `-d`, `--dir PATH` | read PATH as a directory: an extracted collection, or a mounted filesystem root |
+| `--archive PATH` | read PATH as a collection archive |
+| `--ad1 PATH` | read PATH as an AccessData/FTK logical image, with its `.ad2`/`.ad3` parts |
+| `--disk PATH` | read PATH as a disk even when it does not look like one |
+
+**Disks**
+
+| flag | what it does |
+|---|---|
+| `--list-volumes` | print the disk's volumes and stop — run this first on an unfamiliar image |
+| `--disk-volume NAME` | read this volume (`part1`, `p2`, `vg/lv`) instead of the one holding `/etc` |
+| `--disk-max-files N` | stop the filesystem walk after N names (default 3,000,000); a truncated walk becomes a finding |
+| `--no-deleted` | skip the deleted-inode scan — the slowest part of a large disk |
+
+**Findings and reports**
+
+| flag | what it does |
+|---|---|
+| `--min-severity {CRITICAL,HIGH,MEDIUM,LOW,INFO}` | lowest severity to print on the console (default INFO) |
+| `--window H` | incident window in hours before collection time (default 72) |
+| `--max-evidence N` | evidence lines printed per finding on the console (default 25) |
+| `--json PATH` | write full findings as JSON |
+| `--html PATH` | write a self-contained HTML findings report |
+| `--timeline PATH` | write the event timeline as CSV |
+| `--show-timeline` | also print the timeline on the console |
+| `--timeline-show N` | timeline rows to print with `--show-timeline` (default 60) |
+| `--timeline-limit N` | max file events kept in the timeline (default 3000) |
+
+**Artifact tables and the console**
+
+| flag | what it does |
+|---|---|
+| `--export DIR` | write every table into DIR — `csv/`, `json/` and `browser.html` |
+| `--csv-dir DIR` | write one CSV per table into DIR |
+| `--tables-json PATH` | write every table as a single JSON document |
+| `--tables-html PATH` | write the self-contained console on its own |
+| `--process-map PATH` | write only the one-row-per-PID process table (`.csv`/`.html`/`.json` by extension) |
+| `--scope {full,live,offline}` | which half of the collection to build tables from (default full); findings and the timeline always use everything |
+| `--html-rows N` | rows per table embedded in the HTML console (0, the default, embeds every row) |
+| `--db PATH` | write every artifact table into a SQLite database as well |
+
+**Several collections at once**
+
+| flag | what it does |
+|---|---|
+| `--split DIR` | keep the inputs apart: one directory of output per input, under `DIR/<name>/` |
+| `--correlate` | also work out what is true of more than one of them — shared indicators, findings and hashes, and which host saw each first. Needs two or more inputs |
+
+**Hunting and detection rules**
+
+| flag | what it does |
+|---|---|
+| `--pivot TERM` | search every artifact for TERM, case-insensitively. `@file` reads an indicator list, matched in one pass |
+| `--pivot-limit N` | max indicators to search for (default 500) |
+| `--count-iocs` | also count every indicator the analyzers extracted, not just the pivoted ones |
+| `--deep` | also scan `memory_dump/*strings*` (slow, multi-GB) |
+| `--yara PATH` | YARA rule file or directory; scans collected files and per-process memory strings |
+| `--sigma PATH` | Sigma rule file or directory, routed to the normalised tables by each rule's logsource |
+| `--update-sigma` | fetch the current SigmaHQ ruleset into the cache and hunt with it — the only option that uses the network |
+| `--sigma-cached` | hunt with the cached ruleset, offline |
+| `--sigma-dir DIR` | where the cache lives (or `$LINSIGHT_SIGMA_DIR`) |
+| `--sigma-source URL\|ZIP\|DIR` | what `--update-sigma` reads instead of SigmaHQ's zip |
+| `--sigma-all` | cache every rule found, including ones for platforms this tool builds no table for |
+| `--keywords PATH` | file of extra terms to hunt for, one per line |
+| `--no-hunt` | skip the built-in offensive-tool keyword sweep |
+| `--hash [ALGO[,ALGO]]` | hash every file in the inventory (sha256 unless md5 or sha1 is named); never recomputes a hash the collection already recorded |
+
+**The server, and asking a model**
+
+| flag | what it does |
+|---|---|
+| `--serve [[HOST:]PORT\|CASE]` | open the investigation server instead of writing a page: the same console plus marks, labels, scores, notes and saved views. Given an export or a `case.db` and no collection, it reopens that case instead of parsing |
+| `--case PATH` | where `--serve` keeps its marks and notes (default `case.json` beside the export) |
+| `--ask QUESTION` | put one question to a local model with the case behind it, and print what it found and the queries it ran |
+| `--skill [NAME]` | run an investigative playbook instead of a bare question; no value lists them |
+| `--skill-arg NAME=VALUE` | what to point a playbook at, e.g. `--skill-arg address=203.0.113.9` |
+| `--llm-url URL` | an OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp, vLLM). The server calls it; the page never does |
+| `--llm-model NAME` | which model to ask — it must support tool calling |
+| `--mcp [DB]` | answer MCP over stdin/stdout against a case an earlier run wrote, read-only |
+
+**Run control**
+
+| flag | what it does |
+|---|---|
+| `--quiet` | suppress the console report |
+| `--no-color` | disable ANSI colour |
+| `--low-memory` | spill large tables to a temp file — roughly half the peak memory, about a fifth more time |
+| `--timing` | report wall time per table extractor and per output writer |
+| `--debug` | re-raise analyzer exceptions |
 
 ## Where this fits
 
