@@ -1045,7 +1045,7 @@ A rule the engine cannot represent faithfully is **rejected** and listed in `RUL
 
 An offensive-tooling keyword sweep runs by default. `--keywords file` adds case-specific terms; `--no-hunt` skips it entirely (it reads the normalised tables, so it costs the table build even when you asked for no export — roughly 12–65s on a mid-size collection).
 
-**Half the toolkit is named after ordinary things**, and a host nobody has touched is full of those words: an account called `john`, a Vue app under `node_modules/quasar`, an `nmap` script the distribution shipped, a `cdk.json` in a project root, `beacon received` in a log line. So the names are in two tiers. The unambiguous ones — `mimikatz`, `linpeas`, `bloodhound`, `xmrig` — are reported wherever they appear, because nobody else uses those words. The ambiguous ones are reported only where the word is naming something that runs:
+**Half the toolkit is named after ordinary things**, and a host nobody has touched is full of those words: an account called `john`, a Vue app under `node_modules/quasar`, an `nmap` script the distribution shipped, a `cdk.json` in a project root, `beacon received` in a log line. So the names are in two tiers, and the line between them is not how dangerous the tool is — it is whether anybody else uses the word. The unambiguous ones — `mimikatz`, `linpeas`, `bloodhound`, `xmrig` — are reported wherever they appear, because nobody else uses those. The ambiguous ones are reported only where the word is naming something that runs:
 
 | what is seen | what it is taken for |
 |---|---|
@@ -1055,6 +1055,7 @@ An offensive-tooling keyword sweep runs by default. `--keywords file` adds case-
 | `node_modules/quasar`, `site-packages/nmap` | whatever the package manager unpacked |
 | `/usr/share/nmap/scripts/*.nse` | the distribution's own copy |
 | `beacon received from monitor` in a log | a word in a sentence |
+| `engines-1.1/gost.so`, `GOST2001-GOST89` | the Russian cipher standard, not the Go tunnel |
 
 A name explained by a **local account of the same name** — `/home/john` where `/etc/passwd` says john lives there — is demoted to INFO and says so in `HACKTOOL_HITS` rather than disappearing: the evidence stays readable, the findings list stays quiet. The suppression is deliberately narrow, and `tests/test_hunting.py` asserts both halves — that the ordinary host raises nothing, and that a cracker sitting in the home directory of the account it is named after is still CRITICAL. A filter that cannot tell those apart is not a filter, it is a blindfold.
 

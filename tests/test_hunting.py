@@ -76,6 +76,12 @@ FILES = (
     ("var/lib/ghost/content/themes/package.json", "{}\n"),
     ("usr/share/nmap/scripts/http-enum.nse", "-- nse\n"),
     ("var/log/syslog", "Dec  5 06:26:02 h app: beacon received from monitor\n"),
+    # GOST is a Russian cryptographic standard before it is a Go tunnel, and
+    # an OpenSSL build that supports it ships every one of these
+    ("usr/lib/x86_64-linux-gnu/engines-1.1/gost.so", "ELF\n"),
+    ("usr/lib64/engines-3/gost.so", "ELF\n"),
+    ("etc/ssl/gost.cnf", "[gost_section]\n"),
+    ("usr/local/bin/gost", "#!/bin/sh\n"),              # and this is the tunnel
 )
 
 #: What has to be reported, and at what strength. The severity matters as
@@ -92,6 +98,7 @@ MUST_FIND = (
     ("linpeas", "/root/linpeas.sh", "HIGH"),
     ("masscan", "/tmp/masscan", "HIGH"),
     ("pupy", "/tmp/pupy/pupysh.py", "CRITICAL"),
+    ("gost", "/usr/local/bin/gost", "CRITICAL"),
 )
 
 #: What must raise no finding at all. Each is a real thing on a real host.
@@ -104,6 +111,9 @@ MUST_NOT_FIND = (
     ("cdk", "cdk.json", "an AWS CDK project file"),
     ("nmap", "http-enum.nse", "the distribution's own nmap"),
     ("beacon", "beacon received", "a word in a log line"),
+    ("gost", "engines-1.1/gost.so", "the OpenSSL GOST engine"),
+    ("gost", "engines-3/gost.so", "the same engine, on an RPM distribution"),
+    ("gost", "/etc/ssl/gost.cnf", "that engine's own configuration"),
 )
 
 
@@ -204,6 +214,8 @@ def check_position(L, res):
         ("cat /home/john/x.txt", "john", "command", False),
         ("grep empire /var/log/x", "empire", "command", False),
         ("/var/www/empire-blog/index.php", "empire", "path", False),
+        ("openssl ciphers GOST2001-GOST89", "gost", "command", False),
+        ("/usr/local/bin/gost -L=:8080", "gost", "command", True),
     )
     for text, name, kind, want in cases:
         low = text.lower()
