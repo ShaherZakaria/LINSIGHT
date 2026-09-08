@@ -26756,7 +26756,8 @@ function viewState(){
          t0:(el('t0')||{}).value||'',t1:(el('t1')||{}).value||'',
          cols:(typeof colFilters!=='undefined')?colFilters.slice():[],
          picks:(typeof colPicks!=='undefined')
-               ?colPicks.map(function(p){return (p||[]).slice();}):[]};
+               ?colPicks.map(function(p){return (p||[]).slice();}):[],
+         sort:{c:sortCol,a:sortAsc}};
 }
 function saveView(name){
  if(!name)return;
@@ -26786,10 +26787,19 @@ function loadView(name){
     null. Both are 'nothing ticked here'. */
  if(typeof colPicks!=='undefined')
   colPicks=(q.picks||[]).map(function(p){return p?p.slice():[];});
+ /* A view saved before the sort travelled with it opens its table the way
+    opening that table opens it - in time order where there is a clock. */
+ if(q.sort&&typeof q.sort.c==='number'){sortCol=q.sort.c;sortAsc=!!q.sort.a;}
+ else openSort(TB[st.table]);
  cmClose();
  if(el('t0'))el('t0').value=q.t0||'';
  if(el('t1'))el('t1').value=q.t1||'';
  if(typeof readWin==='function')readWin();
+ /* setView writes the address bar and loadView never did, so a view opened
+    over another table left '#t/USERS' in the bar over an AUTH_LOG grid - and
+    a reload, or the link somebody copied out of it, then opened the table the
+    view had just replaced. */
+ location.hash=(st.view==='table')?'t/'+st.table:st.view;
  draw();
 }
 function pushCase(){
@@ -27223,7 +27233,7 @@ function frows(skip){
 function setView(v,name){
  if(v==='table'){
   if(name!==st.table){
-   st.table=name;sortCol=-1;colFilters=[];colPicks=[];st.tq='';
+   st.table=name;openSort(TB[name]);colFilters=[];colPicks=[];st.tq='';
    cmClose();selClear();}
  }else if(vt(v)){
   /* A console view is a table too, so switching to one carries the same
@@ -27231,7 +27241,7 @@ function setView(v,name){
      its own. */
   var n=V[v];
   if(n!==st.table){
-   st.table=n;sortCol=-1;colFilters=[];colPicks=[];st.tq='';
+   st.table=n;openSort(TB[n]);colFilters=[];colPicks=[];st.tq='';
    cmClose();selClear();}
  }
  st.view=v;
@@ -28259,7 +28269,7 @@ function render(){
    table leaves the reader to retype the name they just clicked. */
 function goTable(name,q){
  if(!TB[name])return;
- st.table=name;sortCol=-1;colFilters=[];colPicks=[];st.tq=q||'';
+ st.table=name;openSort(TB[name]);colFilters=[];colPicks=[];st.tq=q||'';
  cmClose();selClear();
  st.view='table';
  location.hash='t/'+name;
@@ -28504,6 +28514,20 @@ function start(){
 }
 /* ---------- tables ---------- */
 var sortCol=-1,sortAsc=true;
+/* The column a grid sorts itself by when it is opened, and -1 for a grid with
+   no clock in it. Evidence is read forwards: a log, a timeline, a list of
+   sessions all mean the order they happened in, and leaving that to the order
+   the parser happened to append rows in is leaving it to how many files the
+   artifact was split across. Only the event tables answer to this - tcols()
+   names the columns that make a row an event, so a table where a time is an
+   attribute of a standing thing (USERS.last_login_utc, SUID_SGID.mtime_utc)
+   opens in its own order, which for a tree or an inventory is the meaningful
+   one. Clicking any heading takes it from here. */
+function openSort(t){
+ var tc=t?tcols(t):null;
+ sortCol=(!tc)?-1:(tc.p>=0?tc.p:(tc.f>=0?tc.f:-1));
+ sortAsc=true;
+}
 var colFilters=[],lay=null;   /* per-column filter text; measured column tLayout */
 /* ---------- the per-column value picker -------------------------------------
    A filter box takes text, and text can only ever say "these letters". The
@@ -28602,13 +28626,88 @@ function tLayout(t,rows,cap){
  }
  return out;
 }
+/* What kind of thing a column holds, decided once per sort from the column
+   itself rather than once per pair. The old comparator asked the question of
+   each pair as it went - both numbers? compare as numbers, else compare as
+   text - and that is not merely slow. A column of sizes with one blank cell
+   in it made '9' vs '10' a text comparison and '9' vs '11' a numeric one, so
+   the answers disagreed about the same rows depending on what they were
+   asked beside. A comparator that contradicts itself does not sort a list; it
+   shuffles it, and the browser is entitled to any order at all.
+
+   Sampled, like the column widths are, and for the same reason: the answer
+   does not change in the tail of a million rows, and reading all of them to
+   find that out costs more than the sort. */
+var NUMRE=/^-?(?:\\d+\\.?\\d*|\\.\\d+)$/;
+/* Date.parse says yes to '123' and to '1970' - both are years to it - so a
+   value has to look like a clock before it is read as one, and numbers are
+   tested first either way. */
+var DATEISH=/\\d{4}-\\d{2}-\\d{2}|\\d{1,2}:\\d{2}/;
+/* The shape every clock in these tables is normalised to, and the reason the
+   common case costs nothing: '2026-01-14 03:22:07' already sorts
+   chronologically as text, so a column of them needs no parsing at all.
+   Measured over 300,000 rows, reading each value through Date.parse was
+   249ms on every keystroke in every filter; comparing them as the strings
+   they already are is a fraction of that. An offset or a trailing Z would
+   break the equivalence, so a value carrying either is not this kind and
+   goes the long way round. */
+var ISORE=/^\\d{4}-\\d{2}-\\d{2}(?:[ T]\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?)?$/;
+function sortKind(rows,j){
+ var n=rows.length,step=Math.max(1,Math.floor(n/400));
+ var seen=0,num=0,dat=0,iso=0,i;
+ for(i=0;i<n;i+=step){
+  var v=rows[i][j];
+  v=(v===undefined||v===null)?'':String(v).trim();
+  if(!v)continue;
+  seen++;
+  if(NUMRE.test(v)){num++;continue;}
+  if(ISORE.test(v)){iso++;dat++;continue;}
+  if(DATEISH.test(v)&&ts(v)!==null)dat++;}
+ if(!seen)return 'text';
+ if(num===seen)return 'num';
+ if(iso===seen)return 'iso';
+ if(dat===seen)return 'date';
+ return 'text';
+}
+/* One key per row, computed once. `g` groups before it compares: a blank is
+   group 2 and stays at the bottom whichever way the arrow points, because a
+   column sorted to bring the largest to the top should not bring forty empty
+   cells instead. In a mixed column the numbers are group 0 and the words are
+   group 1, so '9' still sits below '10' and both sit above 'n/a'. */
+function sortKeys(rows,j,kind){
+ var out=[],n=rows.length,i;
+ for(i=0;i<n;i++){
+  var v=rows[i][j];
+  var t=((v===undefined||v===null)?'':String(v)).trim(),g=0,k=0,f;
+  if(!t){g=2;}
+  else if(kind==='num'){f=parseFloat(t);if(isNaN(f)){g=2;}else{k=f;}}
+  else if(kind==='iso'){k=t;}
+  else if(kind==='date'){f=ts(t);if(f===null){g=2;}else{k=f;}}
+  else if(NUMRE.test(t)){k=parseFloat(t);}
+  else{g=1;k=t.toLowerCase();}
+  out.push({r:rows[i],g:g,k:k,i:i});}
+ return out;
+}
+function sortCmp(a,b){
+ /* blanks last in both directions, and never reordered among themselves */
+ if(a.g===2||b.g===2)return (a.g===b.g)?(a.i-b.i):(a.g===2?1:-1);
+ var c=(a.g!==b.g)?(a.g-b.g):(a.k<b.k?-1:(a.k>b.k?1:0));
+ if(c===0)return a.i-b.i;      /* equal values keep the order they arrived in */
+ return sortAsc?c:-c;
+}
 function tSortRows(rows){
- return rows.slice().sort(function(a,b){
-  var x=a[sortCol]||'',y=b[sortCol]||'';
-  var nx=parseFloat(x),ny=parseFloat(y);
-  var c=(!isNaN(nx)&&!isNaN(ny)&&/^-?[\\d.]+$/.test(x)&&/^-?[\\d.]+$/.test(y))
-       ?nx-ny:String(x).localeCompare(String(y));
-  return sortAsc?c:-c;});
+ if(sortCol<0||!rows.length)return rows;
+ var ks=sortKeys(rows,sortCol,sortKind(rows,sortCol)),i,n=ks.length;
+ /* Most of these grids arrive in the order they are about to be put into -
+    a log is read in the order it was written, and the timeline is built
+    sorted - so the common case is checked for before it is paid for. One
+    pass rather than n log n of them, on every keystroke in every filter. */
+ for(i=1;i<n;i++)if(sortCmp(ks[i-1],ks[i])>0)break;
+ if(i>=n)return rows;
+ ks.sort(sortCmp);
+ var out=[];
+ for(i=0;i<n;i++)out.push(ks[i].r);
+ return out;
 }
 /* The global box searches the whole row; a per-column box searches only its
    own column. They combine with AND, which is what makes them worth having
@@ -29869,12 +29968,17 @@ function tWire(){
  wireHead();
  wireRows();
  wireSel();
- [].forEach.call(document.querySelectorAll('#hdr th'),function(th){
+ /* [data-i], not every th: the Analyst mark and Notes headings are not
+    columns of the table and carry no index. Selected loosely they answered
+    getAttribute with null, +null is 0, and so clicking either of them sorted
+    the grid by its first column while the repaint below relabelled both of
+    them 'timestamp_utc'. */
+ [].forEach.call(document.querySelectorAll('#hdr th[data-i]'),function(th){
   th.onclick=function(){var i=+th.getAttribute('data-i');
    if(sortCol===i){sortAsc=!sortAsc;}else{sortCol=i;sortAsc=true;}
    /* repaint the sort arrows in place rather than re-rendering the head,
       which would take the filter inputs and their values with it */
-   [].forEach.call(document.querySelectorAll('#hdr th'),function(o){
+   [].forEach.call(document.querySelectorAll('#hdr th[data-i]'),function(o){
     var j=+o.getAttribute('data-i');
     o.querySelector('.lbl').textContent=TB[st.table].columns[j]+
      (sortCol===j?(sortAsc?' \\u25b2':' \\u25bc'):'');});
