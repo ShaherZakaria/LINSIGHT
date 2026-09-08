@@ -15,7 +15,8 @@ is about:
   /home/john/notes.txt      a path, and the word is an account
   ssh john@db01             a command, and the word is an account
   node_modules/quasar       a path, and the word is a Vue framework
-  /srv/app/cdk.json         a path, and the word is an AWS project file
+  /srv/app/cdk.json         a path, and the word is a file that is read
+  engines-1.1/gost.so       a path, and the word is a cipher standard
   /usr/share/nmap/*.nse     a path, and the word is the distribution's
 
 Every one of those was a CRITICAL or HIGH finding, on a host where nothing had
@@ -228,9 +229,18 @@ def check_position(L, res):
     res.check("a dependency directory is recognised anywhere in a path",
               L.in_library_dir("/var/www/app/node_modules/quasar/dist/q.js")
               and not L.in_library_dir("/tmp/quasar"))
-    res.check("cdk.json is the AWS file, /tmp/cdk is the container tool",
-              L.benign_filename("cdk", "/srv/app/cdk.json")
-              and not L.benign_filename("cdk", "/tmp/cdk"))
+    print("\n  and whether the file it names is a program or something read")
+    for name, want in (("/usr/local/bin/gost", True),        # a program
+                       ("/usr/local/bin/nmap-7.94", True),   # a version is not
+                       ("/opt/empire/empire.py", True),      # a script
+                       ("/mod/quasar.ko", True),             # a module
+                       ("/usr/lib/engines-1.1/gost.so", False),   # a library
+                       ("/srv/app/cdk.json", False),              # a config
+                       ("/app/quasar.conf.js", False),            # a config
+                       ("/static/beacon.min.js", False),          # a script
+                       ("/home/x/john.txt", False)):              # a document
+        res.check("%-32s %s" % (name, "program" if want else "read, not run"),
+                  L.program_suffix(name) == want)
 
 
 def check_true_positives(L, rows, res):

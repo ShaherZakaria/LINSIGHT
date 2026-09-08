@@ -1055,7 +1055,9 @@ An offensive-tooling keyword sweep runs by default. `--keywords file` adds case-
 | `node_modules/quasar`, `site-packages/nmap` | whatever the package manager unpacked |
 | `/usr/share/nmap/scripts/*.nse` | the distribution's own copy |
 | `beacon received from monitor` in a log | a word in a sentence |
-| `engines-1.1/gost.so`, `GOST2001-GOST89` | the Russian cipher standard, not the Go tunnel |
+| `engines-1.1/gost.so`, `cdk.json`, `beacon.min.js` | a library, a config or a document — something read, not run |
+
+None of that is a list of exceptions. There is no table of forgiven filenames to keep up to date, because such a table is never finished — it grows a row every time somebody names a file after a word this tool watches for. Each rule above is a property of where the name sits: the element of the path it is in, the suffix the file wears, the directory a package manager owns, the home `/etc/passwd` declares. They apply to names nobody has collided with yet.
 
 A name explained by a **local account of the same name** — `/home/john` where `/etc/passwd` says john lives there — is demoted to INFO and says so in `HACKTOOL_HITS` rather than disappearing: the evidence stays readable, the findings list stays quiet. The suppression is deliberately narrow, and `tests/test_hunting.py` asserts both halves — that the ordinary host raises nothing, and that a cracker sitting in the home directory of the account it is named after is still CRITICAL. A filter that cannot tell those apart is not a filter, it is a blindfold.
 

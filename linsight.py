@@ -593,32 +593,41 @@ def in_library_dir(path):
     return any(d in low for d in LIBRARY_DIRS)
 
 
-#: Files whose name is an ambiguous tool's name and whose job is something
-#: else entirely. Only ever consulted for the ambiguous tier, and only against
-#: the last element of a path: a project's own cdk.json sits in its root
-#: rather than in node_modules, so the dependency rule above never sees it.
-#: Deliberately short. Every entry here is a name this tool will not report,
-#: so it holds only files whose purpose is unmistakable and whose collision is
-#: common enough to matter on a real host.
-HACKTOOL_BENIGN_NAMES = {
-    "cdk": ("cdk.json", "cdk.out", "cdk.context.json"),          # AWS CDK
-    "quasar": ("quasar.conf.js", "quasar.config.js",
-               "quasar.extensions.json"),                        # Vue Quasar
-    "beacon": ("beacon.js", "beacon.min.js"),                    # web analytics
-    # the OpenSSL GOST engine and its friends: a cryptographic standard, not
-    # a tunnel, and it is installed wherever the engine is
-    "gost": ("gost.so", "gost.cnf", "gostsum", "gost89sum",
-             "gost_engine.so", "libgost.so"),
-}
+#: Suffixes a program wears. Everything else with a suffix is a library, a
+#: configuration, a document or a piece of data - something loaded or read
+#: rather than something run.
+#:
+#: This is the general form of a list that used to name files one at a time -
+#: cdk.json, quasar.conf.js, gost.so - which is a list that is never finished,
+#: because it has to be extended every time somebody else names a file after a
+#: word this tool also watches for. What those entries had in common was not
+#: their names: it was that none of them is a program. The ambiguous tier asks
+#: only one question - is this name naming something that runs - and a suffix
+#: answers it for every name at once, including the ones nobody has hit yet.
+EXEC_SUFFIXES = frozenset((
+    "sh", "bash", "zsh", "ksh", "py", "pyc", "pl", "rb", "php", "lua", "tcl",
+    "exe", "elf", "bin", "out", "run", "jar", "ko", "app", "appimage",
+    "ps1", "psm1", "bat", "cmd", "com", "scr", "msi", "dll",
+))
 
 
-def benign_filename(tool, token):
-    """Is this path one of the files that legitimately carries the name?"""
-    names = HACKTOOL_BENIGN_NAMES.get(tool)
-    if not names:
-        return False
-    base = token.rsplit("/", 1)[-1]
-    return base in names
+def program_suffix(name):
+    """Does this filename read as a program rather than as data?
+
+    A version is not a suffix - nmap-7.94 and python3.11 are programs, and
+    what follows their last dot is a number rather than a word. Nor is a long
+    trailing word: 'backup.2026notes' is not an extension anybody uses. So the
+    test is a short alphabetic tail, and only then whether it is one a program
+    wears.
+    """
+    base = name.rsplit("/", 1)[-1]
+    dot = base.rfind(".")
+    if dot <= 0:
+        return True                       # no suffix at all: john, nmap, gost
+    ext = base[dot + 1:].lower()
+    if not ext.isalpha() or len(ext) > 8:
+        return True                       # a version, a date, a hash
+    return ext in EXEC_SUFFIXES
 
 
 def match_token(text, start, end):
@@ -23353,7 +23362,11 @@ class TableBuilder:
                                 if "/" in tok and (tok.startswith(self.DISTRO_PATHS)
                                                    or in_library_dir(tok)):
                                     continue
-                                if benign_filename(tool, tok):
+                                # a library, a config or a document that
+                                # happens to carry the name: engines/gost.so
+                                # is the GOST cipher, cdk.json is an AWS
+                                # project, quasar.conf.js is a Vue build
+                                if not program_suffix(tok):
                                     continue
                                 # The home directory itself, and not what is
                                 # inside it: /home/john is the account, and
