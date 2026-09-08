@@ -937,6 +937,17 @@ ROOTKIT_NAMES = [
     "brootus", "nurupo", "wukong", "hiddenwasp", "drovorub", "symbiote",
     "medusa", "tinyshell", "bpfdoor", "ebpfkit", "boopkit", "tripleCross",
 ]
+#: The same names as a pattern, with the edges a filename is allowed to have.
+#: `'adore' in name` was what asked this question, and a substring test says
+#: yes to every word that happens to contain a rootkit's name - which on a
+#: list this short is not hypothetical: 'medusa' is a password cracker and a
+#: Debian package, 'khook' and 'adore' are four and five letters of ordinary
+#: consonants. A digit, a dot, an underscore or a hyphen may touch the name,
+#: because that is how these arrive - adore-ng, diamorphine_v2, reptile.ko -
+#: and only a letter may not.
+ROOTKIT_RE = re.compile(NAME_EDGE % "|".join(
+    re.escape(n) for n in sorted(ROOTKIT_NAMES, key=len, reverse=True)), re.I)
+
 
 BENIGN_HIDDEN = re.compile(
     r"(^|/)\.(placeholder|updated|pwd\.lock|X11-unix|ICE-unix|XIM-unix|font-unix|"
@@ -13893,8 +13904,8 @@ class Triage:
                          "behaviour.",
                          ghost, source=src, mitre="T1014 Rootkit")
 
-        named = [m for m in lsmod if any(r in m.lower() for r in ROOTKIT_NAMES)]
-        named += [d for d in sys_modules if any(r in d.lower() for r in ROOTKIT_NAMES)]
+        named = [m for m in lsmod if ROOTKIT_RE.search(m)]
+        named += [d for d in sys_modules if ROOTKIT_RE.search(d)]
         if named:
             self.add("CRITICAL", "Rootkit", "Module name matching a known Linux rootkit",
                      evidence=sorted(set(named)), source=src, mitre="T1014 Rootkit")
@@ -13916,7 +13927,7 @@ class Triage:
                 body = [l.strip() for l in self.col.lines(rel)
                         if l.strip() and not l.strip().startswith("#")]
                 sus = [b for b in body if re.search(r"install\s+\S+\s+/", b) or
-                       any(r in b.lower() for r in ROOTKIT_NAMES)]
+                       ROOTKIT_RE.search(b)]
                 if sus:
                     self.add("HIGH", "Persistence", "Module configuration executes a command",
                              evidence=["%s: %s" % (self.col.host_path(rel), s) for s in sus],

@@ -575,6 +575,17 @@ ROOTKIT_NAMES = [
     "brootus", "nurupo", "wukong", "hiddenwasp", "drovorub", "symbiote",
     "medusa", "tinyshell", "bpfdoor", "ebpfkit", "boopkit", "tripleCross",
 ]
+#: The same names as a pattern, with the edges a filename is allowed to have.
+#: `'adore' in name` was what asked this question, and a substring test says
+#: yes to every word that happens to contain a rootkit's name - which on a
+#: list this short is not hypothetical: 'medusa' is a password cracker and a
+#: Debian package, 'khook' and 'adore' are four and five letters of ordinary
+#: consonants. A digit, a dot, an underscore or a hyphen may touch the name,
+#: because that is how these arrive - adore-ng, diamorphine_v2, reptile.ko -
+#: and only a letter may not.
+ROOTKIT_RE = re.compile(NAME_EDGE % "|".join(
+    re.escape(n) for n in sorted(ROOTKIT_NAMES, key=len, reverse=True)), re.I)
+
 
 BENIGN_HIDDEN = re.compile(
     r"(^|/)\.(placeholder|updated|pwd\.lock|X11-unix|ICE-unix|XIM-unix|font-unix|"
