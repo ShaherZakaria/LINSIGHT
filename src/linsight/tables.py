@@ -27,7 +27,8 @@ from .common import (
     HACKTOOL_VARIANT_OTHER, NDJSON_TIME_COLUMNS, PRIVILEGED_GROUPS,
     PRIV_HINT_RE, TMPFS_DIRS, _printable, _ts_text, _tz_delta, clean_addr,
     _trie_alt,
-    epoch,
+    benign_filename,
+    epoch, executable_position, in_library_dir, match_token,
     hexip_to_str, human_size, ioc_mitre, ioc_type, match_failed_login,
     norm_ip, norm_log_ts, span_add, split_hostport, variant_add)
 from .decode import (
@@ -7622,7 +7623,10 @@ class TableBuilder:
         ("CRON", ("command",), "command"),
         ("SYSTEMD_UNITS", ("exec_start", "exec_start_pre"), "command"),
         ("INIT_AND_PROFILE", ("text",), "command"),
-        ("PACKAGES", ("name", "description"), "path"),
+        ("PACKAGES", ("name",), "path"),
+        # the description is prose - 'a fast password cracker' - and prose is
+        # where an ordinary word is only ever an ordinary word
+        ("PACKAGES", ("description",), "text"),
         ("SUID_SGID", ("path",), "path"),
         ("CAPABILITIES", ("path",), "path"),
         ("FILE_HASHES", ("path",), "path"),
@@ -7722,6 +7726,18 @@ class TableBuilder:
         builtin = not getattr(self.tri.opts, "no_hunt", False)
         if not builtin and not extra:
             return
+        # Accounts whose name is also a tool name, and where they live. The
+        # commonest false positive in the whole sweep is a home directory: a
+        # host with a user called john has /home/john in every path table it
+        # produces, and 'john' is a password cracker. An account that /etc/
+        # passwd declares, with the path sitting inside its own home, is that
+        # account - so the hit is kept as evidence and no finding is raised
+        # off it.
+        tool_homes = {}
+        for home, user in self.homes().items():
+            low = str(user).strip().lower()
+            if low in HACKTOOL_CTX_CAT:
+                tool_homes.setdefault(low, []).append(home.rstrip("/"))
         seen = defaultdict(list)                  # (tool, cat, table) -> details
         tally = defaultdict(int)                  # same key -> every match
         spans = defaultdict(lambda: ["", ""])     # same key -> [first, last]
@@ -7758,6 +7774,8 @@ class TableBuilder:
                         continue
                     val = str(val)
                     distro = val.startswith(self.DISTRO_PATHS)
+                    library = (not distro and kind != "text"
+                               and in_library_dir(val))
                     # lowered once per cell, not per tier, and matched against
                     # case-sensitive patterns built from lowercased names. The
                     # evidence below still quotes `val`, so what an analyst
@@ -7766,8 +7784,12 @@ class TableBuilder:
                     for rx, catmap, ambiguous in tiers:
                         # an ordinary word inside distribution content is the
                         # distribution's word: hydra.h is a PowerPC kernel
-                        # header, terminfo/b/beacon is a terminal definition
-                        if ambiguous and distro:
+                        # header, terminfo/b/beacon is a terminal definition -
+                        # and the same is true one directory deeper, in
+                        # whatever npm, pip or composer unpacked:
+                        # node_modules/quasar is a Vue framework and
+                        # site-packages/nmap is a python binding
+                        if ambiguous and (distro or library):
                             continue
                         # search first: it is a single C call that returns None
                         # for the overwhelming majority of log lines, where
@@ -7785,11 +7807,41 @@ class TableBuilder:
                             cat = catmap.get(tool)
                             if cat is None or cat in done:
                                 continue
+                            # An ambiguous name has to be naming something that
+                            # runs, which is a question about where in the cell
+                            # it sits rather than about which cell it is. Not
+                            # marked done when it fails: /opt/john/run/john
+                            # names a directory first and the cracker second,
+                            # and rejecting the first occurrence must not take
+                            # the second one with it.
+                            if ambiguous and not executable_position(
+                                    low, mt.start(1), mt.end(1), kind):
+                                continue
+                            weak = ("distro" if distro else
+                                    "library" if library else "")
+                            if ambiguous and not weak:
+                                # against the path the name is in, not the
+                                # whole cell: 'ls /home/john' is one command
+                                # naming one home directory, and the cell it
+                                # sits in starts with 'ls'
+                                tok = match_token(low, mt.start(1), mt.end(1))
+                                if "/" in tok and (tok.startswith(self.DISTRO_PATHS)
+                                                   or in_library_dir(tok)):
+                                    continue
+                                if benign_filename(tool, tok):
+                                    continue
+                                # The home directory itself, and not what is
+                                # inside it: /home/john is the account, and
+                                # /home/john/john is a password cracker in that
+                                # account's home, which is the sort of thing
+                                # this whole sweep exists to find.
+                                if tok.rstrip("/") in tool_homes.get(tool, ()):
+                                    weak = "account"
                             done.add(cat)
                             if rowts is None:
                                 rowts = (_ts_text(row[ts_i])
                                          if 0 <= ts_i < len(row) else "")
-                            key = (tool, cat, tname, kind, distro)
+                            key = (tool, cat, tname, kind, weak)
                             tally[key] += 1
                             span_add(spans[key], rowts)
                             variant_add(variants[key], val, cname, rowts)
@@ -7800,7 +7852,8 @@ class TableBuilder:
                             if rowts is None:
                                 rowts = (_ts_text(row[ts_i])
                                          if 0 <= ts_i < len(row) else "")
-                            key = (term, "user keyword", tname, kind, distro)
+                            key = (term, "user keyword", tname, kind,
+                                   "distro" if distro else "")
                             tally[key] += 1
                             span_add(spans[key], rowts)
                             variant_add(variants[key], val, cname, rowts)
@@ -7815,16 +7868,28 @@ class TableBuilder:
                                         "n": 0, "span": ["", ""]})
         graded = []
         for key, rows in sorted(seen.items()):
-            tool, cat, tname, kind, distro = key
+            tool, cat, tname, kind, weak = key
             # A name in a log message is weaker evidence than the same name as
-            # something that ran, and a name inside a distribution-owned path
-            # is weaker still, so each knocks the severity down one step.
-            step = (1 if kind == "text" else 0) + (1 if distro else 0)
+            # something that ran, and a name inside somebody else's package is
+            # weaker still, so each knocks the severity down one step.
+            step = (1 if kind == "text" else 0) + (1 if weak else 0)
             base = HACKTOOL_SEVERITY.get(cat, "HIGH")
-            sev = SEVERITIES[min(len(SEVERITIES) - 1,
-                                 SEVERITIES.index(base) + step)]
-            where = "%s (distribution-owned path)" % kind if distro else kind
+            sev = ("INFO" if weak == "account" else
+                   SEVERITIES[min(len(SEVERITIES) - 1,
+                                  SEVERITIES.index(base) + step)])
+            where = kind if not weak else "%s (%s)" % (kind, {
+                "distro": "distribution-owned path",
+                "library": "dependency directory",
+                "account": "the local account of that name, in its own home",
+            }[weak])
             graded.append((key, rows, sev, where))
+            # The row stays and says why; the finding does not get raised off
+            # it. An examiner reading HACKTOOL_HITS should still see that the
+            # word was there and what explained it - what they should not get
+            # is a CRITICAL finding about a password cracker because somebody
+            # is called john.
+            if weak == "account":
+                continue
             agg = per_tool[(tool, cat)]
             if SEVERITIES.index(sev) < SEVERITIES.index(agg["sev"]):
                 agg["sev"] = sev
@@ -7836,10 +7901,12 @@ class TableBuilder:
             self.tri.ioc(tool, "hacktool:%s" % tname)
         # rows only once every table has been graded: each carries its tool's
         # totals, which are not known until the last table has been read
-        for (tool, cat, tname, _kind, _distro), rows, sev, where in graded:
-            agg = per_tool[(tool, cat)]
+        for (tool, cat, tname, _kind, _weak), rows, sev, where in graded:
+            agg = per_tool.get((tool, cat))
+            n, span = ((agg["n"], agg["span"]) if agg else
+                       (tally[(tool, cat, tname, _kind, _weak)], ["", ""]))
             for cname, detail, rowts in rows:
-                t.add(sev, cat, tool, agg["n"], agg["span"][0], agg["span"][1],
+                t.add(sev, cat, tool, n, span[0], span[1],
                       rowts, cname, tname, where, detail)
         for (tool, cat), agg in sorted(per_tool.items()):
             self.tri.add(agg["sev"], "Detection",
@@ -7855,7 +7922,7 @@ class TableBuilder:
         # and how often", where thirteen masscan rows are two scanner builds.
         roll = {}
         for key, _rows, sev, where in graded:
-            tool, cat, tname, _kind, _distro = key
+            tool, cat, tname, _kind, _weak = key
             for text, (n, span, cols) in variants.get(key, {}).items():
                 r = roll.get((tool, cat, text))
                 if r is None:

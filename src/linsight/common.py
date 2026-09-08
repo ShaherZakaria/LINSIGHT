@@ -186,6 +186,134 @@ HACKTOOL_AMBIGUOUS = {
 }
 
 
+# Words that run something else, so what follows one of them is a command
+# rather than an argument. 'sudo john' is the cracker; 'ssh john@host' is an
+# account, and the difference is entirely in what stands to the left.
+TOOL_RUNNERS = frozenset((
+    "sudo", "doas", "su", "nohup", "setsid", "exec", "env", "time", "nice",
+    "ionice", "timeout", "watch", "xargs", "strace", "ltrace", "ld_preload",
+    "sh", "bash", "dash", "zsh", "ksh", "csh", "fish", "screen", "tmux",
+    "python", "python2", "python3", "perl", "ruby", "php", "node", "java",
+    "docker", "podman", "kubectl", "nsenter", "chroot", "unshare", "runuser",
+))
+#: What separates one command from the next, so the word after it starts one.
+_CMD_BREAK = frozenset(";&|(){}`\n")
+
+#: Directories a language's package manager fills. A tool name inside one is
+#: that library's own word - node_modules/quasar is the Vue framework, not the
+#: RAT of the same name, and site-packages/nmap is python-nmap. Matched
+#: anywhere in the path rather than at its start, because these sit wherever
+#: the application was deployed: /var/www/app/node_modules, /srv/venv/lib/
+#: python3.11/site-packages, /opt/app/vendor.
+LIBRARY_DIRS = ("/node_modules/", "/site-packages/", "/dist-packages/",
+                "/vendor/", "/.git/", "/.cache/", "/.npm/", "/.cargo/",
+                "/.m2/", "/gems/", "/bower_components/", "/.venv/",
+                "/virtualenv/", "/.gradle/", "/.nuget/", "/target/classes/",
+                "/pkg/mod/", "/.pub-cache/", "/wp-content/", "/.terraform/")
+
+
+def in_library_dir(path):
+    """Is this path inside a dependency tree somebody's package manager wrote?"""
+    low = path.lower()
+    return any(d in low for d in LIBRARY_DIRS)
+
+
+#: Files whose name is an ambiguous tool's name and whose job is something
+#: else entirely. Only ever consulted for the ambiguous tier, and only against
+#: the last element of a path: a project's own cdk.json sits in its root
+#: rather than in node_modules, so the dependency rule above never sees it.
+#: Deliberately short. Every entry here is a name this tool will not report,
+#: so it holds only files whose purpose is unmistakable and whose collision is
+#: common enough to matter on a real host.
+HACKTOOL_BENIGN_NAMES = {
+    "cdk": ("cdk.json", "cdk.out", "cdk.context.json"),          # AWS CDK
+    "quasar": ("quasar.conf.js", "quasar.config.js",
+               "quasar.extensions.json"),                        # Vue Quasar
+    "beacon": ("beacon.js", "beacon.min.js"),                    # web analytics
+}
+
+
+def benign_filename(tool, token):
+    """Is this path one of the files that legitimately carries the name?"""
+    names = HACKTOOL_BENIGN_NAMES.get(tool)
+    if not names:
+        return False
+    base = token.rsplit("/", 1)[-1]
+    return base in names
+
+
+def match_token(text, start, end):
+    """The word the match sits in - one argument of a command line, or the
+    whole cell where the cell is a filename.
+
+    A command line is a sentence about several files at once: 'ls /home/john'
+    is a path table's row and a log line's word in one cell, and asking
+    whether *the cell* is under somebody's home answers the wrong question.
+    Every test below the match is about the path the name is actually in.
+    """
+    i = start
+    while i > 0 and text[i - 1] not in " \t\"'":
+        i -= 1
+    j, n = end, len(text)
+    while j < n and text[j] not in " \t\"'":
+        j += 1
+    return text[i:j]
+
+
+def executable_position(text, start, end, kind):
+    """Is the name at `start:end` naming something to run, or just a word?
+
+    The ambiguous tier - 'john', 'empire', 'beacon', 'nmap' - is only ever
+    matched in a command line or a path, on the reasoning that there the word
+    is naming something executable. It is not, though, and this is where the
+    false positives came from: `/home/john/notes.txt` names an account,
+    `ssh john@db01` names an account, `/var/www/empire-blog/index.php` names a
+    blog. The word is in a path or a command in all three, and in none of them
+    is it a tool.
+
+    So the test is not 'is this a path' but 'is this the thing being run or
+    the file being named':
+
+      - inside a path, only the last element counts. /opt/john/run/john is the
+        cracker and /home/john/notes.txt is not, and a real tool directory
+        holds the executable of its own name anyway - the sweep reads every
+        collected filename, so the binary itself is what fires.
+      - as a bare word in a command, it has to stand where a command stands:
+        first, after a ; & | or a backtick, or after sudo / nohup / python and
+        the rest of the words that run things.
+
+    `kind` is the column's own kind: a 'path' column holds one filename per
+    cell, so a cell with no separator in it is the filename.
+    """
+    token_start = start
+    while token_start > 0 and text[token_start - 1] not in " \t\"'":
+        token_start -= 1
+    token_end = end
+    n = len(text)
+    while token_end < n and text[token_end] not in " \t\"'":
+        token_end += 1
+    token = text[token_start:token_end]
+    if "/" in token:
+        # a path: the name has to be in the last element of it
+        return text.find("/", end) < 0 or end > token_start + token.rfind("/")
+    if "@" in token or ":" in token:
+        return False              # user@host, host:port, a URL's authority
+    if kind == "path":
+        return True               # a bare filename column
+    # a bare word in a command line: it has to be where a command goes
+    i = token_start - 1
+    while i >= 0 and text[i] in " \t":
+        i -= 1
+    if i < 0:
+        return True                               # the first word
+    if text[i] in _CMD_BREAK:
+        return True                               # right after a separator
+    j = i
+    while j >= 0 and text[j] not in " \t\"';&|(){}`":
+        j -= 1
+    return text[j + 1:i + 1].lower().lstrip("-") in TOOL_RUNNERS
+
+
 def trie_pattern(terms):
     r"""Many literals as one prefix-tree regex, rather than one alternation.
 

@@ -1045,6 +1045,19 @@ A rule the engine cannot represent faithfully is **rejected** and listed in `RUL
 
 An offensive-tooling keyword sweep runs by default. `--keywords file` adds case-specific terms; `--no-hunt` skips it entirely (it reads the normalised tables, so it costs the table build even when you asked for no export — roughly 12–65s on a mid-size collection).
 
+**Half the toolkit is named after ordinary things**, and a host nobody has touched is full of those words: an account called `john`, a Vue app under `node_modules/quasar`, an `nmap` script the distribution shipped, a `cdk.json` in a project root, `beacon received` in a log line. So the names are in two tiers. The unambiguous ones — `mimikatz`, `linpeas`, `bloodhound`, `xmrig` — are reported wherever they appear, because nobody else uses those words. The ambiguous ones are reported only where the word is naming something that runs:
+
+| what is seen | what it is taken for |
+|---|---|
+| `sudo john -w rockyou shadow` | the cracker — it stands where a command stands |
+| `/home/john/john`, `/tmp/john` | the cracker — the name is the file, not a directory on the way to one |
+| `/home/john/notes.txt`, `ssh john@db01` | the account, and no finding is raised |
+| `node_modules/quasar`, `site-packages/nmap` | whatever the package manager unpacked |
+| `/usr/share/nmap/scripts/*.nse` | the distribution's own copy |
+| `beacon received from monitor` in a log | a word in a sentence |
+
+A name explained by a **local account of the same name** — `/home/john` where `/etc/passwd` says john lives there — is demoted to INFO and says so in `HACKTOOL_HITS` rather than disappearing: the evidence stays readable, the findings list stays quiet. The suppression is deliberately narrow, and `tests/test_hunting.py` asserts both halves — that the ordinary host raises nothing, and that a cracker sitting in the home directory of the account it is named after is still CRITICAL. A filter that cannot tell those apart is not a filter, it is a blindfold.
+
 ## Asking a model
 
 A finished case is a SQLite database of normalised tables — 75 of them, and on
