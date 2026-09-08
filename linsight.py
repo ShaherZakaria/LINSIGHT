@@ -492,22 +492,22 @@ HACKTOOL_UNAMBIGUOUS = {
     "privilege escalation enumeration": [
         "linpeas", "winpeas", "linenum", "lse.sh", "linux-smart-enumeration",
         "unix-privesc-check", "linux-exploit-suggester", "les.sh", "pspy",
-        "gtfoblookup", "beroot", "privesccheck", "suid3num", "traitor",
+        "gtfoblookup", "beroot", "privesccheck", "suid3num",
         "sudo_killer", "sudokiller",
     ],
     "active directory attack": [
         "bloodhound", "sharphound", "azurehound", "rusthound", "soaphound",
         "crackmapexec", "netexec", "smbmap", "smbexec", "wmiexec", "psexec",
         "atexec", "dcomexec", "evil-winrm", "kerbrute", "rubeus", "impacket",
-        "responder", "ntlmrelayx", "mitm6", "petitpotam", "printnightmare",
+        "ntlmrelayx", "mitm6", "petitpotam", "printnightmare",
         "zerologon", "noPac", "adidnsdump", "windapsearch", "ldapdomaindump",
     ],
     "command and control": [
         "meterpreter", "msfvenom", "msfconsole", "metasploit", "cobaltstrike",
         "cobalt strike", "teamserver", "beacon.dll", "sliver-client",
-        "sliver-server", "mythic", "poshc2", "covenant", "brute ratel",
-        "bruteratel", "havoc-client", "merlin", "koadic", "pupy", "villain",
-        "hoaxshell", "chisel", "ligolo", "revsocks", "gost", "frpc", "frps",
+        "sliver-server", "poshc2", "brute ratel",
+        "bruteratel", "havoc-client", "koadic", "pupy",
+        "hoaxshell", "ligolo", "revsocks", "frpc", "frps",
         "sshuttle", "ngrok", "cloudflared tunnel", "pivotnacci", "reGeorg",
         "neo-regeorg", "tunna",
     ],
@@ -535,13 +535,26 @@ HACKTOOL_UNAMBIGUOUS = {
         "termbin", "oshi.at",
     ],
 }
-# ordinary words that are also tool names - command/path context only
+# Ordinary words that are also tool names - command/path context only, and
+# subject to every rule in executable_position() below.
+#
+# The line between the tiers is not how dangerous the tool is, it is whether
+# anybody else uses the word. 'gost' is a Go tunnel and it is also the Russian
+# cryptographic standard, so an OpenSSL build ships engines/gost.so and a TLS
+# session logs GOST2001-GOST89-GOST89 - on the unambiguous tier that was a
+# CRITICAL command-and-control finding about a cipher suite. 'chisel',
+# 'covenant', 'villain', 'mythic', 'responder' and 'traitor' are English words
+# before they are anything else, and they were on that tier for the same
+# reason: the tool is real and the name is not its own.
 HACKTOOL_AMBIGUOUS = {
     "credential access": ["john", "hydra", "medusa", "patator", "crowbar",
                           "cewl", "ophcrack"],
-    "active directory attack": ["certify", "seatbelt", "sharpview"],
+    "active directory attack": ["certify", "seatbelt", "sharpview",
+                                "responder"],
+    "privilege escalation enumeration": ["traitor"],
     "command and control": ["empire", "sliver", "havoc", "merlin", "beacon",
-                            "silenttrinity", "quasar"],
+                            "silenttrinity", "quasar", "gost", "chisel",
+                            "covenant", "villain", "mythic"],
     "scanning and exploitation": ["nmap", "dirb", "ffuf", "amass", "subfinder",
                                   "arjun", "dalfox"],
     "container escape": ["cdk"],
@@ -592,6 +605,10 @@ HACKTOOL_BENIGN_NAMES = {
     "quasar": ("quasar.conf.js", "quasar.config.js",
                "quasar.extensions.json"),                        # Vue Quasar
     "beacon": ("beacon.js", "beacon.min.js"),                    # web analytics
+    # the OpenSSL GOST engine and its friends: a cryptographic standard, not
+    # a tunnel, and it is installed wherever the engine is
+    "gost": ("gost.so", "gost.cnf", "gostsum", "gost89sum",
+             "gost_engine.so", "libgost.so"),
 }
 
 
@@ -23164,6 +23181,11 @@ class TableBuilder:
     # fact from /root/nmap.
     DISTRO_PATHS = ("/usr/share/", "/usr/src/", "/usr/lib/", "/usr/include/",
                     "/lib/", "/lib64/", "/usr/share/man/", "/usr/share/doc/",
+                    # /usr/lib64 is where a 64-bit RPM distribution puts what
+                    # /usr/lib holds on Debian, and it was not in this list -
+                    # so an OpenSSL engine under it was read as an operator's
+                    # file on exactly the distributions that ship it there
+                    "/usr/lib64/", "/usr/lib32/", "/usr/libexec/", "/opt/rh/",
                     "/var/lib/dpkg/", "/var/lib/rpm/", "/snap/", "/etc/alternatives/")
 
     def _collected_files(self):

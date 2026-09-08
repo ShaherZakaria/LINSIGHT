@@ -7661,6 +7661,11 @@ class TableBuilder:
     # fact from /root/nmap.
     DISTRO_PATHS = ("/usr/share/", "/usr/src/", "/usr/lib/", "/usr/include/",
                     "/lib/", "/lib64/", "/usr/share/man/", "/usr/share/doc/",
+                    # /usr/lib64 is where a 64-bit RPM distribution puts what
+                    # /usr/lib holds on Debian, and it was not in this list -
+                    # so an OpenSSL engine under it was read as an operator's
+                    # file on exactly the distributions that ship it there
+                    "/usr/lib64/", "/usr/lib32/", "/usr/libexec/", "/opt/rh/",
                     "/var/lib/dpkg/", "/var/lib/rpm/", "/snap/", "/etc/alternatives/")
 
     def _collected_files(self):
