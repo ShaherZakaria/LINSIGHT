@@ -137,10 +137,10 @@ python linsight.py ./coll --tables-html b.html  # just the console
 | view | what it is for |
 |---|---|
 | **Overview** | twelve panels: severity cards, the offensive tooling named on the host, two clocks (what the collection recorded and what the analysis raised), a day-by-hour heatmap and the same activity folded onto 24 UTC hours, the loudest categories, techniques, tactics and artifacts, what the rule engines and the pivot fired on, and the largest tables — every bar is a click through to what is behind it |
-| **Findings** | the `FINDINGS` grid: sort any column, filter per column, and click a row to open its evidence, ATT&CK techniques and time span above the table |
-| **ATT&CK** | the techniques the findings actually carry, laid out by tactic and coloured by the worst severity in each cell; click a technique to filter the findings to it |
+| **Findings** | the `FINDINGS` grid: sort any column, tick the values you want in any column, and click a row to open its evidence, ATT&CK techniques and time span above the table |
+| **ATT&CK** | the techniques the findings actually carry, laid out by tactic and coloured by the worst severity in each cell; click a technique to filter the findings to it, `ctrl`-click to filter on several at once. The matrix keeps drawing every technique while you pick, the way the timeline chart keeps drawing the whole span — the ones you picked are outlined |
 | **Timeline** | the `TIMELINE` grid under a severity-stacked histogram — click a column to set the time window, shift-click another to extend it, click the lit one to let go. The chart keeps drawing the full span so you can see where the window sits. Every dated finding is on it too, at its `first_utc` and under its own severity, so isolating CRITICAL answers here with the same set the findings list does |
-| **Tables** | `HACKTOOL_HITS` and `HACKTOOL_VARIANTS` pinned at the top of the nav, then the remaining artifact grids, each sortable, with a row filter and a per-column filter that combine with AND |
+| **Tables** | `HACKTOOL_HITS` and `HACKTOOL_VARIANTS` pinned at the top of the nav, then the remaining artifact grids, each sortable, with a row filter and a per-column filter that combine with AND. Every column carries a **tick list of the values it actually holds**, with the number of rows behind each one — tick as many as the question needs |
 
 **Findings and Timeline *are* those tables.** There is one findings list, not a view and a table saying the same thing twice — the console half (chips, chart, evidence pane) sits on top of the same grid every other table gets, so sorting and per-column filtering work there too. Nothing is embedded twice, and the two halves have no way to disagree.
 
@@ -152,7 +152,13 @@ The boxes still accept typing for anyone who prefers it: `2021-12-08`, `2021-12-
 
 It narrows what happened, never what exists. A row is only filtered when it *is* an event (`timestamp_utc`, or a finding's `first_utc`/`last_utc` span). Tables where a timestamp is an attribute of a standing thing — `USERS.last_login_utc`, `SUID_SGID.mtime_utc`, `PROCESS_MASTER.start_utc` — are left whole, because a one-hour window that deletes the account list and every suid binary is not a narrower answer. Each grid says which case it is, and how many of its rows carry no time at all.
 
-`1`–`4` switch views, `/` focuses the row filter, `t` the time window, `j`/`k` walk the rows.
+**Nothing here is a one-of-these picker.** Categories, techniques and collections all hold as many values as you give them — a plain click picks one and drops whatever was picked before, `ctrl`-click (or `shift`) adds one or takes one away, and a plain click on the only thing selected lets go. It is the same gesture on a bar in the overview, a cell in the matrix, a severity card and a name in the collection list, and each chosen value gets its own pill above the grid that drops only itself. Several values in one filter are OR; the filters are AND with each other.
+
+**Every column of every table is one of those pickers.** The `▾` beside a column's filter box opens the list of values that column actually holds — loudest first, each with the number of rows behind it — and you tick as many as you need: `sshd` *and* `sudo`, three paths, two accounts. The list is what the *other* filters leave, so it narrows as you work and never narrows itself out of the values you have not picked yet; a search box finds a value in a column that holds thousands, `tick listed` takes everything that search left, and each ticked value gets its own pill above the grid. The ticks are exact values; the box beside them is still substring text (`root|www-data` matches either), and the two narrow their column together. Every table works this way, including Findings and Timeline, and a saved view carries the ticks with it.
+
+**Rows are picked the way a file manager picks files.** `ctrl`-click a row to add it to the selection, `shift`-click for the run between it and the last one, `shift`-`j`/`k` to do the same from the keyboard; a plain click starts again and opens the row as it always did. A bar above the grid then says how many are held and marks all of them at once — key evidence, interesting, suspicious, benign, or unmarked — or copies them as TSV, header included, for the report you are writing. The selection is the rows themselves, not their positions, so sorting the grid, turning a page or narrowing a filter leaves the same evidence picked. Unmarking in bulk leaves any note you wrote against a row alone.
+
+`1`–`4` switch views, `/` focuses the row filter, `t` the time window, `j`/`k` walk the rows and `shift`-`j`/`k` picks them up on the way.
 
 One file, no server, no network: the payload is embedded and the CSS and JS are inline, because the box that reads a triage collection is routinely the box that is not allowed to fetch anything. Open it with a double click — there is nothing to serve it from.
 
@@ -197,14 +203,18 @@ python linsight.py uac1.tar disk2.dd disk3.E01 --serve
 `./case` is a normal export — one `csv/`, one `json/`, one `browser.html` —
 holding all three hosts. Nothing is chosen for you: with no filter you see
 every host's activity at once, which is the question three disks usually
-arrive with. Narrowing to one is a dropdown in the console header, a column
-filter in a spreadsheet, or `WHERE collection = 'disk2'` in the SQLite
-database `--db` writes.
+arrive with. Narrowing to one, or to two of the three, is a tick list in the
+console header, a column filter in a spreadsheet, or `WHERE collection IN
+('disk2', 'disk3')` in the SQLite database `--db` writes.
 
 The console's **collection** picker sits beside the severity chips and reaches
 as far as the time window does: every grid, both charts, the severity counts
-and the ATT&CK matrix. A table with no per-collection rows — `CROSS_IOCS` is
-about several collections by construction — says so on its face rather than
+and the ATT&CK matrix. It is a tick list rather than a dropdown, because
+"these two of the four" is a question a merged export is opened with as
+often as "this one" is — the button says what is picked, each collection
+gets its own pill above the grid, and ticking every one is the same as
+ticking none. A table with no per-collection rows — `CROSS_IOCS` is about
+several collections by construction — says so on its face rather than
 emptying itself.
 
 The column is called `collection`, not `host`, for a reason worth knowing:

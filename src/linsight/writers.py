@@ -428,6 +428,14 @@ def _emit_console(fh, esc, host, src, payload, packed, css=None, js=None):
                  "<div class='hf' id='hf'></div>"
                  "<div class='chips' id='chips'></div></header>"
                  "<div class='cal' id='cal'></div>"
+                 # the collection tick list, a popover like the
+                 # calendar and outside the header for the same
+                 # reason: it has to draw over the grid below it
+                 "<div class='hmenu' id='hmenu'></div>"
+                 # and the per-column value list, which is the same
+                 # popover again - opened from the filter row of
+                 # whichever grid is on the screen
+                 "<div class='hmenu' id='cmenu'></div>"
                  % (esc(str(host)), esc(str(src))))
         fh.write("<div class='layout'><nav id='nav'></nav>"
                  "<main id='main'></main></div>")

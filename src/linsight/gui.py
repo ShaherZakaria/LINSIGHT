@@ -253,10 +253,41 @@ font-variant-numeric:tabular-nums;user-select:none}
    that narrows every grid at once, rather than a per-table box. */
 .hf{display:flex;align-items:center;gap:5px;flex:0 0 auto}
 .hf .lb{color:var(--dim);font-size:10px;letter-spacing:.6px;text-transform:uppercase}
-.hf select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
-border-radius:4px;padding:2px 6px;font:11px/1.6 inherit;outline:none;max-width:190px}
-.hf select:focus{border-color:var(--accent)}
-.hf select.on{border-color:var(--gold);color:var(--gold)}
+.hf button.hpick{background:var(--panel2);color:var(--fg);cursor:pointer;
+border:1px solid var(--line);border-radius:4px;padding:2px 8px;
+font:11px/1.6 inherit;outline:none;max-width:190px;overflow:hidden;
+white-space:nowrap;text-overflow:ellipsis}
+.hf button.hpick:hover{border-color:var(--accent)}
+.hf button.hpick.on{border-color:var(--gold);color:var(--gold)}
+/* the tick list itself: a popover like the calendar, closed the same way */
+.hmenu{display:none;position:fixed;z-index:40;background:var(--panel);
+border:1px solid var(--line);border-radius:8px;padding:6px;width:230px;
+max-height:60vh;overflow:auto;box-shadow:0 10px 30px var(--shadow)}
+.hmenu.open{display:block}
+.hmenu .opt{display:flex;align-items:center;gap:7px;padding:4px 6px;
+border-radius:4px;cursor:pointer;font-size:12px;white-space:nowrap;
+overflow:hidden;text-overflow:ellipsis}
+.hmenu .opt:hover{background:var(--panel2)}
+.hmenu .opt.on{color:var(--gold)}
+.hmenu .opt .bx{flex:0 0 13px;width:13px;height:13px;border-radius:3px;
+border:1px solid var(--line);font-size:10px;line-height:12px;text-align:center}
+.hmenu .opt.on .bx{border-color:var(--gold)}
+.hmenu .ft{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px;
+border-top:1px solid var(--line);padding-top:7px}
+.hmenu .ft .dim{font-size:10.5px}
+/* the per-column value list: the same popover, a little wider because every
+   value carries the number of rows holding it */
+#cmenu{width:296px}
+#cmenu .hd{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;
+padding:1px 6px 6px;border-bottom:1px solid var(--line);margin-bottom:6px}
+#cmenu .dim{color:var(--dim);font-size:10.5px}
+#cmenu input.q{width:100%;box-sizing:border-box;background:var(--sunk);
+border:1px solid var(--line);color:var(--fg);border-radius:3px;
+padding:3px 6px;font:11px/1.5 inherit;margin-bottom:6px}
+#cmenu input.q:focus{outline:none;border-color:var(--accent)}
+#cmenu .opt .tx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#cmenu .opt .n{margin-left:auto;padding-left:9px;color:var(--dim);
+font-size:10.5px;font-variant-numeric:tabular-nums}
 /* the time window, beside the chips: the other filter that bites everywhere */
 .tf{display:flex;align-items:center;gap:4px;flex:0 0 auto}
 .tf input{width:104px;background:var(--panel2);color:var(--fg);border:1px solid var(--line);
@@ -333,6 +364,8 @@ border-top-width:3px;border-radius:6px;padding:11px 13px;cursor:pointer}
 .bars{display:flex;flex-direction:column;gap:5px}
 .bar{display:grid;grid-template-columns:1fr 46px;gap:9px;align-items:center;cursor:pointer}
 .bar:hover .lbl{color:var(--gold)}
+/* a bar or a matrix cell whose value is one of the ones being filtered on */
+.bar.on .lbl{color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold)}
 .bar .lbl{position:relative;padding:3px 7px;overflow:hidden;text-overflow:ellipsis;
 white-space:nowrap;border-radius:3px;background:var(--panel)}
 .bar .fill{position:absolute;left:0;top:0;bottom:0;background:var(--panel2);z-index:0}
@@ -376,6 +409,13 @@ font-size:17px;line-height:1}
 .pills{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 9px}
 .pills:empty{display:none}
 .tbl tbody tr.sel td{background:var(--selbg);box-shadow:inset 3px 0 0 var(--gold)}
+/* A picked row, which is not the same thing as the row being read: the
+   reading selection is one row and moves as you walk the grid, the picked set
+   is what a bulk mark or a copy will act on. Marked differently on purpose. */
+.tbl tbody tr.msel td{background:var(--selbg)}
+.tbl tbody tr.msel td.mkc{box-shadow:inset 3px 0 0 var(--accent)}
+.selbar:empty{display:none}
+.selbar .dim{font-size:11.5px}
 .detail h4{margin:0 0 6px;font-size:14px;font-weight:600}
 .detail .d{color:var(--dim);margin-bottom:12px}
 .detail pre{background:var(--bg);border:1px solid var(--line);border-radius:5px;
@@ -415,6 +455,7 @@ text-transform:none}
 .cell{margin:6px;padding:5px 7px;border-radius:4px;cursor:pointer;
 border-left:3px solid var(--line);background:var(--panel2)}
 .cell:hover{outline:1px solid var(--gold)}
+.cell.on{outline:1px solid var(--gold)}
 .cell .id{font-size:11px;font-variant-numeric:tabular-nums}
 .cell .nm{color:var(--dim);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;
 white-space:nowrap}
@@ -444,6 +485,7 @@ nav a.tbl span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:no
    right for an artifact grid and wrong for those. */
 .desc{color:var(--dim);margin:0 0 12px;font-size:12px}
 .controls{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.controls:empty{display:none}
 .badge{background:var(--sunk);border:1px solid var(--line);border-radius:11px;padding:2px 9px;
 color:var(--dim);font-size:11px;white-space:nowrap}
 .warn{color:var(--HIGH)}
@@ -480,6 +522,18 @@ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 border-radius:3px;padding:2px 5px;font:11px/1.5 inherit}
 .tbl tr.f input:focus{outline:none;border-color:var(--accent)}
 .tbl tr.f input.on{border-color:var(--accent);background:var(--onbg);color:var(--fg)}
+/* the box and its picker share the cell - the box is what is typed, the
+   button is what is ticked, and both narrow the one column */
+.tbl tr.f .fc{display:flex;gap:3px;align-items:center}
+.tbl tr.f .fc input{min-width:0}
+.tbl tr.f .fpick{flex:0 0 auto;background:var(--sunk);border:1px solid var(--line);
+color:var(--dim);border-radius:3px;padding:1px 4px;font:10px/1.5 inherit;
+cursor:pointer;font-variant-numeric:tabular-nums}
+.tbl tr.f .fpick:hover{color:var(--accent);border-color:var(--accent)}
+.tbl tr.f .fpick.on{color:var(--gold);border-color:var(--gold)}
+/* a picked value said in full above the grid, however far right its column */
+.pill.cv{max-width:270px;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap;vertical-align:bottom}
 button.clr{background:var(--sunk);border:1px solid var(--line);color:var(--dim);
 border-radius:11px;padding:2px 9px;font-size:11px;cursor:pointer}
 button.clr:hover{color:var(--accent);border-color:var(--accent)}
@@ -578,9 +632,68 @@ function crossTables(){
  return CROSS.filter(function(n){return TB[n]&&TB[n].row_count;});
 }
 function haveCross(){return crossTables().length>0;}
-var st={view:null,sev:{},cat:'',tech:'',sel:null,table:null,tq:'',gq:'',host:'',
-        t0:null,t1:null};   /* t0/t1: the time window, epoch seconds, inclusive */
+/* Every filter that names values holds a list of them rather than one value.
+   The question asked of a triage collection is rarely about a single thing -
+   "cron and systemd", "the two web hosts", "T1053 and T1543" - and a picker
+   that answers only the first of those makes the examiner run the pass twice
+   and hold the union in their own head. An empty list is no filter at all,
+   which stays the default: somebody who has chosen nothing is asking about
+   everything.
+
+   st.rows is the other kind of selection - the rows picked out of the grid in
+   front of you, to mark or to copy as one act - and st.anchor is where the
+   last one was picked, so shift knows which run to take. */
+var st={view:null,sev:{},cats:[],techs:[],sel:null,rows:[],anchor:-1,
+        table:null,tq:'',gq:'',hosts:[],t0:null,t1:null};
+        /* t0/t1: the time window, epoch seconds, inclusive */
 SEV.forEach(function(s){st.sev[s]=true;});
+/* One value in and out of a filter list. Never mutated in place: these lists
+   travel into saved views, and a view sharing its array with the live filter
+   would change every time the filter did. */
+function inList(l,v){return l.indexOf(v)>=0;}
+function without(l,v){return l.filter(function(x){return x!==v;});}
+function toggled(l,v){return inList(l,v)?without(l,v):l.concat([v]);}
+function anyIn(a,l){
+ for(var i=0;i<a.length;i++)if(inList(l,a[i]))return true;
+ return false;
+}
+function asList(v){
+ if(v===null||v===undefined||v==='')return [];
+ return (v instanceof Array)?v.slice():[v];
+}
+/* What clicking a value does, everywhere one is clickable: plain replaces the
+   selection, ctrl / meta / shift adds it to or takes it out of one, and a
+   plain click on the only thing already selected lets go. One rule for the
+   bars, the matrix cells, the severity cards and the collection list, because
+   a reader who learns it on one of them has learned all four. */
+function picked(l,v,ev){
+ if(ev&&(ev.ctrlKey||ev.metaKey||ev.shiftKey))return toggled(l,v);
+ if(l.length===1&&l[0]===v)return [];
+ return [v];
+}
+/* Filter text into the values it names. A pipe separates alternatives inside
+   one box - 'root|www-data' in the user column is either account - so a
+   filter box answers the same "more than one of these" question the pickers
+   do, while the boxes still AND with each other. A pipe that is part of the
+   value is written with a backslash in front of it, which is what a filter
+   over a shell command line needs. */
+function terms(v){
+ var s=String(v===null||v===undefined?'':v),out=[],cur='',i;
+ for(i=0;i<s.length;i++){
+  var c=s.charAt(i);
+  if(c==='\\\\'&&s.charAt(i+1)==='|'){cur+='|';i++;continue;}
+  if(c==='|'){out.push(cur);cur='';continue;}
+  cur+=c;}
+ out.push(cur);
+ var t=[];
+ out.forEach(function(x){x=x.trim().toLowerCase();if(x)t.push(x);});
+ return t;
+}
+function anyTerm(v,ts){
+ v=(v===null||v===undefined)?'':String(v).toLowerCase();
+ for(var i=0;i<ts.length;i++)if(v.indexOf(ts[i])>=0)return true;
+ return false;
+}
 var VIEWS=[['overview','Overview'],['findings','Findings'],['attack','ATT&CK'],
            ['timeline','Timeline'],['correlation','Correlation'],
            ['graph','Graph'],['entities','Relationships'],['context','Context'],
@@ -899,7 +1012,7 @@ function egLabels(){
  return EGLBL===null?(EG&&EG.edges.length<=34):EGLBL;
 }
 function egHubs(){
- return !!(EGHUBS&&HOSTS.length>1&&HOSTCOL&&!hostOn()&&EGKIND.collection);
+ return !!(EGHUBS&&HOSTS.length>1&&HOSTCOL&&scopeN()>1&&EGKIND.collection);
 }
 /* Rows the graph is allowed to draw from. The collection picker reaches here
    like it reaches every grid - a picture still drawn over three hosts while
@@ -1359,7 +1472,7 @@ function viewEntities(){
      (on?NODE_KIND[k[0]]:'var(--dim)')+(on?'':';opacity:.45')+
      '" title="show or hide '+esc(k[1])+' circles">'+esc(k[1])+'</span>';});
  h+='<span class="grow"></span>';
- if(HOSTS.length>1&&HOSTCOL&&!hostOn())
+ if(HOSTS.length>1&&HOSTCOL&&scopeN()>1)
   h+='<button class="mkbtn'+(EGHUBS?' on':'')+'" id="eg_hubs" '+
      'title="draw a circle per collection, joined to whatever was seen in '+
      'more than one of them">collections</button>';
@@ -1380,7 +1493,8 @@ function viewEntities(){
  h+='<div class="dim" style="margin-bottom:6px">'+EG.nodes.length+
    ' entities, '+EG.edges.length+' observed relation(s), drawn from '+
    EGSRC.rows.toLocaleString()+' row(s) in '+EGSRC.tables+' table(s)'+
-   (hostOn()?' of collection <b>'+esc(st.host)+'</b>'
+   (hostOn()?' of collection'+(st.hosts.length>1?'s':'')+' <b>'+
+     esc(st.hosts.join(', '))+'</b>'
     :HOSTS.length>1?' across all '+HOSTS.length+' collections':'')+
    '. Arrows point the way the activity went - an address to the account it '+
    'reached, an account to the one it became, a collection to the one an '+
@@ -1992,10 +2106,13 @@ function viewContext(){
    once and can return to, by name, and that somebody else can open. Saved
    into the case rather than the browser, so it travels with the marks. */
 function viewState(){
- return {view:st.view,table:st.table,tq:st.tq||'',cat:st.cat||'',
-         tech:st.tech||'',sev:JSON.parse(JSON.stringify(st.sev||{})),
+ return {view:st.view,table:st.table,tq:st.tq||'',cats:st.cats.slice(),
+         techs:st.techs.slice(),hosts:st.hosts.slice(),
+         sev:JSON.parse(JSON.stringify(st.sev||{})),
          t0:(el('t0')||{}).value||'',t1:(el('t1')||{}).value||'',
-         cols:(typeof colFilters!=='undefined')?colFilters.slice():[]};
+         cols:(typeof colFilters!=='undefined')?colFilters.slice():[],
+         picks:(typeof colPicks!=='undefined')
+               ?colPicks.map(function(p){return (p||[]).slice();}):[]};
 }
 function saveView(name){
  if(!name)return;
@@ -2010,9 +2127,22 @@ function loadView(name){
  if(!v)return;
  var q=v.state||{};
  st.view=q.view||'overview';st.table=q.table||st.table;
- st.tq=q.tq||'';st.cat=q.cat||'';st.tech=q.tech||'';
+ st.tq=q.tq||'';
+ /* A view saved before these filters took lists holds a single string in
+    `cat` / `tech`. Read either shape rather than dropping the old one: views
+    live in the case file, which outlives any one version of this page. */
+ st.cats=asList(q.cats!==undefined?q.cats:q.cat);
+ st.techs=asList(q.techs!==undefined?q.techs:q.tech);
+ st.hosts=asList(q.hosts);
+ hostRender();
  if(q.sev)st.sev=q.sev;
  if(typeof colFilters!=='undefined')colFilters=(q.cols||[]).slice();
+ /* A view saved before the columns took ticks has no `picks` at all, and one
+    saved with a gap in it - a column nothing was ticked in - reads back as a
+    null. Both are 'nothing ticked here'. */
+ if(typeof colPicks!=='undefined')
+  colPicks=(q.picks||[]).map(function(p){return p?p.slice():[];});
+ cmClose();
  if(el('t0'))el('t0').value=q.t0||'';
  if(el('t1'))el('t1').value=q.t1||'';
  if(typeof readWin==='function')readWin();
@@ -2199,20 +2329,25 @@ function winOn(){return st.t0!==null||st.t1!==null;}
    CROSS_IOCS is about several collections by construction and filtering it to
    one would be filtering out the answer. */
 var HOSTS=D.hosts||[],HOSTCOL=D.hostcol||'';
-function hostOn(){return !!(st.host&&HOSTCOL);}
+function hostOn(){return !!(st.hosts.length&&HOSTCOL);}
+/* How many collections the rest of the console is looking at. Nothing picked
+   is every collection, so the graph's hubs and the correlation tab ask this
+   rather than the picker: two of four chosen is still a question about more
+   than one host. */
+function scopeN(){return st.hosts.length||HOSTS.length;}
 function hostCol(t){
  if(t._hc===undefined)t._hc=HOSTCOL?ci(t,HOSTCOL):-1;
  return t._hc;
 }
 function inHost(t,r){
  var i=hostCol(t);
- return i<0||r[i]===st.host;
+ return i<0||inList(st.hosts,r[i]);
 }
 function hostFilter(rows,t){
  if(!hostOn())return rows;
  var i=hostCol(t);
  if(i<0)return rows;
- return rows.filter(function(r){return r[i]===st.host;});
+ return rows.filter(function(r){return inList(st.hosts,r[i]);});
 }
 /* Rows this collection contributed to a table, for the badge that says so. */
 function hostSkipped(t){
@@ -2220,26 +2355,70 @@ function hostSkipped(t){
  var i=hostCol(t);
  if(i<0)return 0;
  var n=0;
- t.rows.forEach(function(r){if(r[i]!==st.host)n++;});
+ t.rows.forEach(function(r){if(!inList(st.hosts,r[i]))n++;});
  return n;
 }
+/* The picker is a tick list behind a button rather than a dropdown. A
+   <select> can only say one thing, and "these two of the four" is a question
+   a merged export is opened with as often as "this one" is; the native
+   multiple select does say it, but costs four rows of header height and hides
+   the whole idea behind a modifier key nobody guesses. The button says what
+   is chosen, the list is where it is chosen, and one click of a name is
+   enough. */
 function hostRender(){
  var box=el('hf');
  if(!box)return;
- if(HOSTS.length<2||!HOSTCOL){box.innerHTML='';return;}
- var h='<span class="lb">collection</span><select id="hostsel" title="'+
-   'narrow every table to one of the collections in this export">'+
-   '<option value="">all '+HOSTS.length+'</option>';
- HOSTS.forEach(function(x){
-  h+='<option value="'+esc(x)+'"'+(st.host===x?' selected':'')+'>'+esc(x)+'</option>';});
- box.innerHTML=h+'</select>';
- var sel=el('hostsel');
- sel.className=hostOn()?'on':'';
- sel.onchange=function(){setHost(sel.value);};
+ if(HOSTS.length<2||!HOSTCOL){box.innerHTML='';hmClose();return;}
+ var n=st.hosts.length;
+ box.innerHTML='<span class="lb">collection</span>'+
+   '<button class="hpick'+(hostOn()?' on':'')+'" id="hostpick" title="'+
+   'narrow every table to the collections ticked here \u2014 more than one '+
+   'is allowed, and none means all of them">'+
+   esc(n===0?'all '+HOSTS.length:n===1?st.hosts[0]:n+' of '+HOSTS.length)+
+   ' \u25be</button>';
+ el('hostpick').onclick=function(ev){
+  (ev||window.event).stopPropagation();
+  if(hmIsOpen())hmClose(); else hmShow();};
+ if(hmIsOpen())hmDraw();
 }
-function setHost(v){
- if(st.host===v)return;
- st.host=v;
+function hmIsOpen(){var m=el('hmenu');return !!(m&&m.classList.contains('open'));}
+function hmClose(){var m=el('hmenu');if(m)m.classList.remove('open');}
+function hmShow(){
+ var m=el('hmenu'),b=el('hostpick');
+ if(!m||!b)return;
+ hmDraw();
+ m.classList.add('open');
+ var r=b.getBoundingClientRect(),w=window.innerWidth||900;
+ m.style.left=Math.max(6,Math.min(r.left,w-242))+'px';
+ m.style.top=(r.bottom+6)+'px';
+}
+function hmDraw(){
+ var m=el('hmenu');
+ if(!m)return;
+ var h='';
+ HOSTS.forEach(function(x){
+  var on=inList(st.hosts,x);
+  h+='<div class="opt'+(on?' on':'')+'" data-h="'+esc(x)+'" title="'+esc(x)+
+     '"><span class="bx">'+(on?'\u2713':'')+'</span>'+esc(x)+'</div>';});
+ h+='<div class="ft"><button class="mkbtn" data-hset="all">all</button>'+
+    '<button class="mkbtn" data-hset="none">none</button>'+
+    '<span class="dim">click a name to add it or drop it</span></div>';
+ m.innerHTML=h;
+ [].forEach.call(m.querySelectorAll('.opt'),function(o){
+  o.onclick=function(){setHosts(toggled(st.hosts,o.getAttribute('data-h')));};});
+ [].forEach.call(m.querySelectorAll('[data-hset]'),function(b){
+  b.onclick=function(){
+   setHosts(b.getAttribute('data-hset')==='all'?HOSTS.slice():[]);};});
+}
+/* Every collection ticked is the same statement as none ticked - both are the
+   whole export - so it is stored as none. Otherwise every grid would carry a
+   badge announcing a filter that takes nothing out. */
+function setHosts(list){
+ var next=HOSTS.filter(function(x){return inList(list,x);});
+ if(next.length===HOSTS.length)next=[];
+ var sep=String.fromCharCode(1);
+ if(next.join(sep)===st.hosts.join(sep))return;
+ st.hosts=next;
  /* the calendar shading and the '-24h' anchor are both read off the timeline,
     so a narrower set of rows is a different calendar and a different anchor */
  DAYN=null;DMAX=null;
@@ -2256,7 +2435,7 @@ function dataMax(){
  if(t){
   var tc=tcols(t),hi=hostOn()?hostCol(t):-1;
   t.rows.forEach(function(r){
-   if(hi>=0&&r[hi]!==st.host)return;
+   if(hi>=0&&!inList(st.hosts,r[hi]))return;
    var sp=rowSpan(tc,r);
    if(sp&&sp[1]>DMAX)DMAX=sp[1];});}
  return DMAX;
@@ -2330,7 +2509,8 @@ function hostBadge(t){
  if(hostCol(t)<0)return '<span class="badge">collection filter not applied '+
    '\u2014 '+esc(t.name)+' has no per-collection rows</span>';
  var n=hostSkipped(t);
- return '<span class="badge warn">collection '+esc(st.host)+
+ return '<span class="badge warn">collection'+(st.hosts.length>1?'s':'')+
+   ' '+esc(st.hosts.join(', '))+
    (n?' \u2014 '+n.toLocaleString()+' row(s) from the others hidden':'')+
    ' <span class="pill" data-hostclear="1">clear &times;</span></span>';
 }
@@ -2374,28 +2554,41 @@ function fc(){
    row search box is deliberately NOT applied here: it belongs to the grid
    being typed into, and the overview should not empty itself because a
    filter was left behind in another view. */
-function frows(){
+/* `skip` leaves one filter out - 'cats' or 'techs'. The panel that a filter
+   is chosen from has to keep drawing the values that have not been chosen
+   yet, exactly as the timeline chart keeps drawing the span the window was
+   picked out of: a matrix narrowed to the one technique already picked
+   offers nothing to add a second one from, and a picker that empties itself
+   on first use is a picker that can only ever say one thing. What is picked
+   is marked in the panel instead of being all that is left of it. */
+function frows(skip){
  var f=fc();
  if(!f)return [];
  var tc=winOn()?tcols(f.t):null;
  var hi=hostOn()?hostCol(f.t):-1;
  return f.t.rows.filter(function(r){
-  if(hi>=0&&r[hi]!==st.host)return false;
+  if(hi>=0&&!inList(st.hosts,r[hi]))return false;
   if(!st.sev[r[f.severity]])return false;
-  if(st.cat&&r[f.category]!==st.cat)return false;
-  if(st.tech&&techsOf(r[f.mitre]).indexOf(st.tech)<0)return false;
+  if(st.cats.length&&skip!=='cats'&&!inList(st.cats,r[f.category]))return false;
+  if(st.techs.length&&skip!=='techs'&&
+     !anyIn(techsOf(r[f.mitre]),st.techs))return false;
   if(tc&&tc.any&&!inWindow(tc,r))return false;
   return true;});
 }
 
 function setView(v,name){
  if(v==='table'){
-  if(name!==st.table){st.table=name;sortCol=-1;colFilters=[];st.tq='';}
+  if(name!==st.table){
+   st.table=name;sortCol=-1;colFilters=[];colPicks=[];st.tq='';
+   cmClose();selClear();}
  }else if(vt(v)){
   /* A console view is a table too, so switching to one carries the same
-     reset: its sort and its column filters are its own. */
+     reset: its sort, its column filters and the rows picked out of it are
+     its own. */
   var n=V[v];
-  if(n!==st.table){st.table=n;sortCol=-1;colFilters=[];st.tq='';}
+  if(n!==st.table){
+   st.table=n;sortCol=-1;colFilters=[];colPicks=[];st.tq='';
+   cmClose();selClear();}
  }
  st.view=v;
  location.hash=(v==='table')?'t/'+st.table:v;
@@ -2413,7 +2606,7 @@ function chips(){
  var n={};
  var hi=hostOn()?hostCol(f.t):-1;
  (f.t.rows||[]).forEach(function(r){
-  if(hi>=0&&r[hi]!==st.host)return;
+  if(hi>=0&&!inList(st.hosts,r[hi]))return;
   n[r[f.severity]]=(n[r[f.severity]]||0)+1;});
  var h='';
  SEV.forEach(function(s){
@@ -2530,7 +2723,12 @@ function barList(pairs,act,lab){
  pairs.forEach(function(p){if(p[1]>max)max=p[1];});
  pairs.forEach(function(p){
   var tint=p[2]?';background:var(--'+p[2]+');opacity:.32':'';
-  h+='<div class="bar" data-k="'+esc(p[0])+'" data-act="'+(act||'')+'">'+
+  /* a bar naming a value that is currently being filtered on says so - these
+     panels are read after the click at least as often as before it */
+  var on=(act==='cat'&&inList(st.cats,p[0]))||
+         (act==='tech'&&inList(st.techs,p[0]));
+  h+='<div class="bar'+(on?' on':'')+'" data-k="'+esc(p[0])+
+     '" data-act="'+(act||'')+'">'+
      '<div class="lbl"><div class="fill" style="width:'+
      Math.max(2,Math.round(p[1]*100/max))+'%'+tint+'"></div>'+
      '<div class="tx">'+esc((lab?lab(p[0]):p[0])||'(none)')+'</div></div>'+
@@ -2654,7 +2852,7 @@ function dayCounts(){
  if(!t)return DAYN;
  var tc=tcols(t),hi=hostOn()?hostCol(t):-1;
  t.rows.forEach(function(r){
-  if(hi>=0&&r[hi]!==st.host)return;
+  if(hi>=0&&!inList(st.hosts,r[hi]))return;
   var sp=rowSpan(tc,r);
   if(!sp)return;
   var d=new Date(sp[0]*1000);
@@ -2782,6 +2980,10 @@ function calPreset(kind){
 function viewOverview(){
  var f=fc(),fs=frows(),tl=vt('timeline'),tp=toolPairs();
  var techs=f?tally(fs,function(r){return techsOf(r[f.mitre]);}):[];
+ /* the two panels that are pickers as well as pictures, each drawn from
+    everything except its own filter - see frows() */
+ var catRows=f?frows('cats'):[],techRows=f?frows('techs'):[];
+ var techPick=f?tally(techRows,function(r){return techsOf(r[f.mitre]);}):[];
  var h='<h2>Overview</h2>'+(winOn()?'<div class="pills"><span class="pill" '+
    'data-winclear="1">time window: '+esc(fmtWin())+' &times;</span></div>':'')+
    '<div class="cards">';
@@ -2832,13 +3034,16 @@ function viewOverview(){
   h+='<tr><td>'+esc(kv[0])+'</td><td>'+esc(kv[1])+'</td></tr>';});
  h+='</table></div></div>';
 
- h+='<div class="grid2"><div><h3>Categories</h3>'+
-    barList(tally(fs,function(r){return r[f.category];}).slice(0,14),'cat')+'</div>';
- h+='<div><h3>Techniques</h3>'+
-    barList(techs.slice(0,14),'tech',techLabel)+'</div></div>';
+ h+='<div class="grid2"><div><h3>Categories <span class="count">&mdash; '+
+    'ctrl-click to pick several</span></h3>'+
+    barList(tally(catRows,function(r){return r[f.category];}).slice(0,14),'cat')+
+    '</div>';
+ h+='<div><h3>Techniques <span class="count">&mdash; ctrl-click to pick '+
+    'several</span></h3>'+
+    barList(techPick.slice(0,14),'tech',techLabel)+'</div></div>';
 
  h+='<div class="grid2"><div><h3>Tactics</h3>'+
-    barList(tally(fs,function(r){
+    barList(tally(techRows,function(r){
      return uniq(techsOf(r[f.mitre]).map(tacticOf));}).slice(0,14),'tac')+'</div>';
  h+='<div><h3>Loudest artifacts</h3>'+
     barList(tally(fs,function(r){return r[f.artifact];}).slice(0,14),'')+
@@ -2873,7 +3078,9 @@ function techLabel(t){
 
 /* ---------- attack ---------- */
 function viewAttack(){
- var f=fc(),fs=frows(),by={};
+ /* drawn from everything but the technique filter, so the matrix a technique
+    was picked out of is still the matrix the second one is picked from */
+ var f=fc(),fs=frows('techs'),by={};
  fs.forEach(function(r){
   techsOf(r[f.mitre]).forEach(function(t){
    var tac=tacticOf(t);
@@ -2886,7 +3093,8 @@ function viewAttack(){
  if(!order.length)return '<h2>ATT&amp;CK</h2><div class="empty">'+
    'no findings carry a technique at this filter</div>';
  var h='<h2>ATT&amp;CK <span class="count">&mdash; click a technique to filter '+
-   'the findings</span></h2><div class="matrix">';
+   'the findings, ctrl-click to filter on several at once</span></h2>'+
+   '<div class="matrix">';
  order.forEach(function(tac){
   var tsl=[],t;
   for(t in by[tac])tsl.push(t);
@@ -2897,7 +3105,8 @@ function viewAttack(){
      ' technique(s)</div>';
   tsl.forEach(function(t){
    var c=by[tac][t];
-   h+='<div class="cell" data-tech="'+esc(t)+'" style="border-left-color:var(--'+
+   h+='<div class="cell'+(inList(st.techs,t)?' on':'')+'" data-tech="'+esc(t)+
+      '" style="border-left-color:var(--'+
       c.sev+')"><div class="id">'+esc(t)+'<span class="n">'+c.n+'</span></div>'+
       (c.nm?'<div class="nm">'+esc(c.nm)+'</div>':'')+'</div>';});
   h+='</div>';});
@@ -2913,10 +3122,18 @@ function viewHead(){
  var h='';
  if(st.view==='findings'){
   h+='<div class="pills">';
-  if(st.cat)h+='<span class="pill" data-clear="cat">category: '+esc(st.cat)+
-    ' &times;</span>';
-  if(st.tech)h+='<span class="pill" data-clear="tech">'+esc(st.tech)+
-    ' &times;</span>';
+  /* One pill per value, each dropping only itself: a reader who narrowed to
+     three techniques and wants two of them back should not have to start
+     again. The last pill takes the whole set off at once. */
+  st.cats.forEach(function(c){
+   h+='<span class="pill" data-off="cats" data-v="'+esc(c)+'">category: '+
+      esc(c)+' &times;</span>';});
+  st.techs.forEach(function(x){
+   h+='<span class="pill" data-off="techs" data-v="'+esc(x)+'">'+esc(x)+
+      ' &times;</span>';});
+  if(st.cats.length+st.techs.length>1)
+   h+='<span class="pill" data-clear="1">clear '+
+      (st.cats.length+st.techs.length)+' filters &times;</span>';
   /* The finding's own row opens underneath it with the artifact rows it
      came from, which is the same information this panel carried and more of
      it - two previews of one row is one too many. */
@@ -2928,8 +3145,17 @@ function viewHead(){
      spike sits in. */
   h+=histo(tMatching(t,true),ci(t,'timestamp_utc'),ci(t,'severity'),80,132,true).html;
  }
- if(hostOn())h+='<div class="pills"><span class="pill" data-hostclear="1">'+
-   'collection: '+esc(st.host)+' &times;</span></div>';
+ if(hostOn()){
+  /* one pill per collection, each dropping only itself - an examiner who
+     narrowed to three and wants two of them back should not start again */
+  h+='<div class="pills">';
+  st.hosts.forEach(function(x){
+   h+='<span class="pill" data-hostoff="'+esc(x)+'">collection: '+esc(x)+
+      ' &times;</span>';});
+  if(st.hosts.length>1)h+='<span class="pill" data-hostclear="1">'+
+    'all collections &times;</span>';
+  h+='</div>';
+ }
  if(winOn())h+='<div class="pills"><span class="pill" data-winclear="1">'+
    'time window: '+esc(fmtWin())+' &times;</span></div>';
  return h;
@@ -3136,9 +3362,11 @@ function buildNav(){
    sample of it. That costs a pass over the payload, which is why it runs on a
    debounce rather than on every keystroke. */
 function searchAll(q){
- q=String(q||'').toLowerCase();
- var out=[];
- if(q.length<2)return out;
+ /* the same alternatives the grid filters take, so two addresses at once is
+    one pass over the export rather than two */
+ var ts=terms(q),out=[],longest=0;
+ ts.forEach(function(x){if(x.length>longest)longest=x.length;});
+ if(longest<2)return out;
  for(var i=0;i<IDX.length;i++){
   var name=IDX[i].name,t=TB[name];
   if(!t||!t.rows)continue;
@@ -3147,7 +3375,7 @@ function searchAll(q){
    var row=rows[r],hit=false;
    for(var c=0;c<row.length;c++){
     var v=row[c];
-    if(v&&String(v).toLowerCase().indexOf(q)>=0){hit=true;break;}
+    if(v&&anyTerm(v,ts)){hit=true;break;}
    }
    if(hit){n++;if(sample.length<3)sample.push(row);}
   }
@@ -3387,7 +3615,8 @@ function render(){
    table leaves the reader to retype the name they just clicked. */
 function goTable(name,q){
  if(!TB[name])return;
- st.table=name;sortCol=-1;colFilters=[];st.tq=q||'';
+ st.table=name;sortCol=-1;colFilters=[];colPicks=[];st.tq=q||'';
+ cmClose();selClear();
  st.view='table';
  location.hash='t/'+name;
  render();
@@ -3494,8 +3723,9 @@ function wire(){
                                        Number(tr.getAttribute('data-cxi')));
    d.hidden=false;};});
  [].forEach.call(document.querySelectorAll('[data-hostpick]'),function(b){
-  b.onclick=function(){setHost(b.getAttribute('data-hostpick'));
-                       setView('overview');};});
+  b.onclick=function(ev){
+   setHosts(picked(st.hosts,b.getAttribute('data-hostpick'),ev||window.event));
+   setView('overview');};});
  var gq=el('gq');
  if(gq){
   gq.oninput=function(){
@@ -3516,21 +3746,28 @@ function wire(){
    a.onclick=function(){goTable(a.getAttribute('data-t'),st.gq||'');};});
  }
  [].forEach.call(document.querySelectorAll('[data-tech]'),function(x){
-  x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
+  x.onclick=function(ev){
+   st.techs=picked(st.techs,x.getAttribute('data-tech'),ev||window.event);
+   setView('findings');};});
  [].forEach.call(document.querySelectorAll('.card[data-sev]'),function(cd){
-  cd.onclick=function(){
+  cd.onclick=function(ev){
+   ev=ev||window.event;
    var s=cd.getAttribute('data-sev');
-   SEV.forEach(function(x){st.sev[x]=(x===s);});
+   /* the same modifier as everywhere else: plain isolates this severity,
+      ctrl / meta / shift adds it to whatever is already showing */
+   if(ev&&(ev.ctrlKey||ev.metaKey||ev.shiftKey))st.sev[s]=!st.sev[s];
+   else SEV.forEach(function(x){st.sev[x]=(x===s);});
    chips();setView('findings');};});
  [].forEach.call(document.querySelectorAll('.card[data-go]'),function(cd){
   cd.onclick=function(){setView(cd.getAttribute('data-go'));};});
  [].forEach.call(document.querySelectorAll('.card[data-tbl]'),function(cd){
   cd.onclick=function(){goTable(cd.getAttribute('data-tbl'),'');};});
  [].forEach.call(document.querySelectorAll('.bar[data-act]'),function(b){
-  b.onclick=function(){
+  b.onclick=function(ev){
+   ev=ev||window.event;
    var a=b.getAttribute('data-act'),k=b.getAttribute('data-k');
-   if(a==='cat'){st.cat=k;setView('findings');}
-   else if(a==='tech'){st.tech=k;setView('findings');}
+   if(a==='cat'){st.cats=picked(st.cats,k,ev);setView('findings');}
+   else if(a==='tech'){st.techs=picked(st.techs,k,ev);setView('findings');}
    /* A tactic is not a findings filter - the matrix is the view that draws
       one, so the click lands there rather than on a filter that cannot be
       expressed. */
@@ -3564,9 +3801,15 @@ function start(){
     listener still runs on a node that has since been thrown away. */
  var cw=el('cal');
  if(cw)cw.onclick=function(ev){(ev||window.event).stopPropagation();};
+ var hw=el('hmenu');
+ if(hw)hw.onclick=function(ev){(ev||window.event).stopPropagation();};
+ var cw2=el('cmenu');
+ if(cw2)cw2.onclick=function(ev){(ev||window.event).stopPropagation();};
  document.addEventListener('click',function(){
   var c=el('cal');
-  if(c&&c.classList.contains('open'))calClose();});
+  if(c&&c.classList.contains('open'))calClose();
+  if(hmIsOpen())hmClose();
+  if(cmIsOpen())cmClose();});
  /* The severity chips count FINDINGS rows and the first view reads them,
     so the page waits for that one decode before it draws anything. It is
     the only wait the console makes on open: every other table is decoded
@@ -3595,6 +3838,7 @@ function start(){
   if(k==='/'){var q=el('q');if(q){q.focus();e.preventDefault();}}
   if(k==='t'){var tb=el('t0');if(tb){tb.focus();calOpen('t0');e.preventDefault();}}
   if(k==='Escape'&&CALFOR)calClose();
+  if(k==='Escape'){hmClose();cmClose();}
   if(k>='1'&&k<='4'&&fc())setView(['overview','findings','attack',
    'timeline'][+k-1]);
   /* j/k walk the rows of whichever grid is open, the way the console report
@@ -3604,13 +3848,64 @@ function start(){
    var i=TLAST.indexOf(st.sel);
    i=Math.max(0,Math.min(TLAST.length-1,i<0?0:i+(k==='j'?1:-1)));
    st.sel=TLAST[i];
+   /* shift walks a selection out of the keyboard the way it walks one out of
+      the mouse - the same run of rows, without leaving the home row */
+   if(e.shiftKey){
+    if(!selHas(TLAST[i]))st.rows=st.rows.concat([TLAST[i]]);
+    st.anchor=i;}
    if(st.view==='findings'){render();}
+   else if(e.shiftKey){selPaint();}
    var sel=document.querySelector('tbody tr.sel');
    if(sel&&sel.scrollIntoView)sel.scrollIntoView({block:'nearest'});}};
 }
 /* ---------- tables ---------- */
 var sortCol=-1,sortAsc=true;
 var colFilters=[],lay=null;   /* per-column filter text; measured column tLayout */
+/* ---------- the per-column value picker -------------------------------------
+   A filter box takes text, and text can only ever say "these letters". The
+   question a grid is actually read with is "these values" - sshd and sudo,
+   root and www-data, these three paths - and the values are already in the
+   column: they should be ticked, not typed out. So every column of every
+   table carries a list of what it holds, with the number of rows behind each
+   value, and as many of them ticked as the question needs.
+
+   The ticks are exact values; the box beside them is still substring text;
+   the two narrow their column together. 'ssh' typed with two accounts ticked
+   is those accounts, on the lines that mention ssh. Between columns it stays
+   AND, as it always did. */
+var colPicks=[];      /* per-column ticked values, parallel to colFilters */
+var CMFOR=-1;         /* the column whose list is open, -1 for none */
+var CMQ='';           /* what is typed into that list's own search box */
+var CMVALS=null;      /* its values and counts, computed once per opening */
+var CMSHOWN=[];       /* the values it is drawing, which is what a click hits */
+var CMCAP=400;        /* drawn at once; the rest are reached by searching */
+var CMLIM=20000;      /* distinct values counted in one pass; see cmValues */
+var CMCUT=false;      /* that pass stopped short of every value in the column */
+var CMQAT='';         /* the search text it was made under, '' for all of them */
+function picksOn(i){var p=colPicks[i];return !!(p&&p.length);}
+function picksN(){
+ var n=0,i;
+ for(i=0;i<colPicks.length;i++)n+=(colPicks[i]||[]).length;
+ return n;
+}
+/* Keys are prefixed because a column can hold the word 'constructor', and a
+   bare object would claim to have seen it before anything had. */
+function pkey(v){return '#'+v;}
+function pickSet(i){
+ var m={},p=colPicks[i]||[],k;
+ for(k=0;k<p.length;k++)m[pkey(p[k])]=1;
+ return m;
+}
+function cellText(r,i){
+ var v=r[i];
+ return (v===undefined||v===null)?'':String(v);
+}
+/* The button says how many values are held, so a filter set three columns
+   ago is still visible from the other end of a wide grid. */
+function fpickLbl(i){
+ var n=(colPicks[i]||[]).length;
+ return (n?n:'')+'▾';
+}
 
 
 
@@ -3678,17 +3973,39 @@ function tSortRows(rows){
 /* `raw` skips nothing any more except the caller's own reason for asking:
    the timeline chart passes it so that it draws the shape the window was
    picked out of rather than only the window. */
-function tMatching(t,raw){
- var q=(st.tq||'').toLowerCase();
+/* `skip` leaves one column's ticked values out of the answer, and is passed
+   only by the list those ticks are made in: a list narrowed by what has been
+   picked from it offers nothing to pick second, which is the whole point of
+   the thing. The same reason the ATT&CK matrix keeps drawing every technique
+   while one of them is chosen. */
+function tMatching(t,raw,skip){
+ /* Every box - the row filter and each column's - holds one value or several,
+    separated by a pipe. Within a box they are OR, so 'root|www-data' in the
+    user column is either account; between boxes they stay AND, which is what
+    made them worth having separately in the first place. Every column works
+    the same way, because a reader who learns it on `user` should not have to
+    wonder whether `process` is different. */
+ var q=terms(st.tq);
  var rows=t.rows;
- if(q){rows=rows.filter(function(r){return r.join(' ').toLowerCase().indexOf(q)>=0;});}
+ if(q.length){rows=rows.filter(function(r){return anyTerm(r.join(' '),q);});}
  var act=[];
  for(var i=0;i<colFilters.length;i++){
-  if(colFilters[i]){act.push([i,colFilters[i].toLowerCase()]);}}
+  var ts=terms(colFilters[i]);
+  if(ts.length)act.push([i,ts]);}
  if(act.length){rows=rows.filter(function(r){
   for(var k=0;k<act.length;k++){
-   var v=r[act[k][0]];v=(v===undefined||v===null)?'':String(v);
-   if(v.toLowerCase().indexOf(act[k][1])<0){return false;}}
+   if(!anyTerm(r[act[k][0]],act[k][1]))return false;}
+  return true;});}
+ /* The ticked values, which are exact rather than substrings: ticking `root`
+    in the user column is the root account and not `rootkit`. Several in one
+    column are OR - that is what ticking more than one means - and the
+    columns are AND with each other, like their boxes. */
+ var pks=[];
+ for(var pi=0;pi<colPicks.length;pi++){
+  if(pi!==skip&&picksOn(pi))pks.push([pi,pickSet(pi)]);}
+ if(pks.length){rows=rows.filter(function(r){
+  for(var k=0;k<pks.length;k++){
+   if(!pks[k][1][pkey(cellText(r,pks[k][0]))])return false;}
   return true;});}
  /* The header chips, the category / technique pills and the timeline bucket
     are filters too, and they have to bite here rather than in a second pass:
@@ -3714,12 +4031,18 @@ function tMatching(t,raw){
   if(si>=0)rows=rows.filter(function(r){return st.sev[r[si]]!==false;});
   if(v==='findings'){
    var f=fc();
-   if(st.cat)rows=rows.filter(function(r){return r[f.category]===st.cat;});
-   if(st.tech)rows=rows.filter(function(r){
-    return techsOf(r[f.mitre]).indexOf(st.tech)>=0;});}
+   /* several of either is an OR within that filter and an AND between the
+      two: 'persistence or execution, and T1053' is one question. */
+   if(st.cats.length)rows=rows.filter(function(r){
+    return inList(st.cats,r[f.category]);});
+   if(st.techs.length)rows=rows.filter(function(r){
+    return anyIn(techsOf(r[f.mitre]),st.techs);});}
   }
- if(sortCol>=0){rows=tSortRows(rows);}
- TLAST=rows;
+ /* Not for the value list: it is asking what a column holds, not drawing
+    the grid, and the rows on screen are still the ones on screen. */
+ if(skip===undefined){
+  if(sortCol>=0){rows=tSortRows(rows);}
+  TLAST=rows;}
  return rows;
 }
 var TLAST=[];   /* the rows on screen, in the order they are on screen */
@@ -3737,11 +4060,198 @@ function tOptions(t,j){
   if(!seen[v]){seen[v]=1;n++;if(n>60){return null;}}}
  return n>1?Object.keys(seen).sort():null;
 }
+/* ---------- the list a column's values are ticked in ---------------------- */
+function cmIsOpen(){var m=el('cmenu');return !!(m&&m.classList.contains('open'));}
+function cmClose(){
+ var m=el('cmenu');
+ if(m){m.classList.remove('open');m.innerHTML='';}
+ CMFOR=-1;CMQ='';CMVALS=null;CMSHOWN=[];
+}
+/* What this column holds among the rows every other filter leaves, each with
+   the number of rows behind it - the count is half the reason to open the
+   list at all, because "which of these is the noisy one" is answered before
+   anything is ticked. */
+function cmValues(t,i,q){
+ /* `q` is the search box, and it is applied here rather than only to the
+    drawn list because of what these tables are: a million lines of VAR_LOG
+    whose message column is a million distinct values. Counting every one of
+    them to draw four hundred is a second of frozen page and an array nobody
+    asked for, so the pass stops at CMLIM - and when it has stopped short,
+    typing recounts, restricted to what was typed. A value past the cap is
+    still reachable; it just has to be asked for. */
+ var rows=tMatching(t,false,i),m={},out=[],k,cut=false;
+ q=String(q||'').trim().toLowerCase();
+ for(k=0;k<rows.length;k++){
+  var v=cellText(rows[k],i);
+  if(q&&v.toLowerCase().indexOf(q)<0)continue;
+  var key=pkey(v),at=m[key];
+  if(at===undefined){
+   if(out.length>=CMLIM){cut=true;continue;}
+   at=m[key]=out.length;out.push([v,0]);}
+  out[at][1]++;}
+ /* A ticked value that the other filters leave no row of is still listed, or
+    the filter that emptied the grid could not be undone from the list that
+    set it. */
+ (colPicks[i]||[]).forEach(function(v){
+  if(m[pkey(v)]===undefined){m[pkey(v)]=out.length;out.push([v,0]);}});
+ /* Loudest first: a column is opened to find out what is in it, and the
+    value with four thousand rows behind it is usually the one being looked
+    for. Ties fall back to the value, so the order is the same every time the
+    list is opened. */
+ out.sort(function(a,b){
+  return b[1]-a[1]||(a[0]<b[0]?-1:(a[0]>b[0]?1:0));});
+ CMCUT=cut;CMQAT=q;
+ return out;
+}
+function cmOpen(i,btn){
+ var m=el('cmenu'),t=TB[st.table];
+ if(!m||!t)return;
+ CMFOR=i;CMQ='';CMVALS=null;
+ m.innerHTML='<div class="hd"><b>'+esc(t.columns[i])+'</b>'+
+   '<span class="dim" id="cmn"></span></div>'+
+   '<input class="q" id="cmq" type="search" placeholder="find a value…">'+
+   '<div id="cmbody"></div>';
+ cmBody();
+ m.classList.add('open');
+ /* Anchored under its own button and kept on the screen: the picker for the
+    last column of a wide grid opens hard against the right edge of it. */
+ var r=btn.getBoundingClientRect(),w=window.innerWidth||900;
+ m.style.left=Math.max(6,Math.min(r.left,w-306))+'px';
+ m.style.top=(r.bottom+5)+'px';
+ var q=el('cmq');
+ if(q){
+  q.oninput=function(){
+   CMQ=q.value;
+   /* A list that was counted whole can be narrowed in place; one that stopped
+      at the cap, or was already narrowed by earlier typing, is counted again
+      for what is being asked for now. */
+   if(CMCUT||CMQAT)CMVALS=null;
+   cmBody();};
+  /* The page's own key handler stands aside for anything being typed into,
+     so Escape has to be answered here - otherwise the list could not be
+     dismissed from the keyboard while its search box holds the caret. */
+  q.onkeydown=function(e){if((e||window.event).key==='Escape')cmClose();};
+  q.focus();}
+}
+/* Redrawn from #cmbody down rather than whole: the search box above it is
+   where the caret is, and rebuilding it would take the caret with it - the
+   same reason tRefresh leaves the column boxes alone. */
+function cmBody(){
+ var b=el('cmbody'),t=TB[st.table];
+ if(!b||!t||CMFOR<0)return;
+ if(!CMVALS)CMVALS=cmValues(t,CMFOR,CMQ);
+ var picks=colPicks[CMFOR]||[],q=CMQ.trim().toLowerCase();
+ var on=[],off=[],i;
+ for(i=0;i<CMVALS.length;i++){
+  var v=CMVALS[i];
+  /* A ticked value is listed whatever is typed above it. A tick that cannot
+     be reached cannot be undone, and the box is a way to find a value, not a
+     second filter on top of the one being built. */
+  if(inList(picks,v[0])){on.push(v);continue;}
+  if(q&&v[0].toLowerCase().indexOf(q)<0)continue;
+  off.push(v);}
+ CMSHOWN=on.concat(off.slice(0,CMCAP));
+ var h='';
+ CMSHOWN.forEach(function(x,k){
+  var lit=inList(picks,x[0]),lbl=(x[0]===''?'(empty)':x[0]);
+  h+='<div class="opt'+(lit?' on':'')+'" data-s="'+k+'" title="'+esc(lbl)+
+     ' — '+x[1].toLocaleString()+' row(s)"><span class="bx">'+
+     (lit?'✓':'')+'</span><span class="tx">'+esc(lbl)+
+     '</span><span class="n">'+x[1].toLocaleString()+'</span></div>';});
+ if(!CMSHOWN.length)
+  h+='<div class="dim" style="padding:5px 6px">nothing here matches that</div>';
+ h+='<div class="ft"><button class="mkbtn" data-cset="all">tick listed</button>'+
+    '<button class="mkbtn" data-cset="none">none</button>';
+ var hid=Math.max(0,off.length-CMCAP);
+ var more=hid?(hid.toLocaleString()+(CMCUT?'+':'')+' more')
+             :(CMCUT?'more than this can list':'');
+ h+='<span class="dim">'+(more?more+' — type above to reach them'
+   :'click a value to add it or drop it')+'</span></div>';
+ b.innerHTML=h;
+ var cnt=el('cmn');
+ if(cnt)cnt.textContent=CMVALS.length.toLocaleString()+(CMCUT?'+':'')+
+   ' value(s)'+(picks.length?', '+picks.length+' picked':'');
+ /* The value is read out of CMSHOWN by position rather than off the element:
+    a cell can hold a newline or four thousand characters of log line, and an
+    attribute is no place to keep either. */
+ [].forEach.call(b.querySelectorAll('.opt'),function(o){
+  o.onclick=function(){
+   var x=CMSHOWN[+o.getAttribute('data-s')];
+   if(x)setPicks(CMFOR,toggled(colPicks[CMFOR]||[],x[0]));};});
+ [].forEach.call(b.querySelectorAll('[data-cset]'),function(x){
+  x.onclick=function(){
+   if(x.getAttribute('data-cset')==='none'){setPicks(CMFOR,[]);return;}
+   /* What the search left, not every value in the column: ticking all of
+      them says exactly what ticking none says, and the sense of the button
+      worth having is 'everything I just searched for'. */
+   var add=colPicks[CMFOR]||[];
+   CMSHOWN.forEach(function(v){if(!inList(add,v[0]))add=add.concat([v[0]]);});
+   setPicks(CMFOR,add.length>=CMVALS.length?[]:add);};});
+}
+/* Every value in a column ticked is the same statement as none of them
+   ticked, exactly as it is for the collections - so it is stored as none,
+   and no filter is announced that takes nothing out. */
+function setPicks(i,list){
+ colPicks[i]=list.slice();
+ tRefresh();
+ cmBody();
+}
+function clearPicks(){
+ colPicks=[];
+ cmClose();
+ tRefresh();
+}
+/* One pill per picked value above the grid, each dropping only itself: the
+   filter row scrolls sideways with the table, so what is ticked out there is
+   said once where it cannot be scrolled away from. A column holding more
+   than three of them says how many instead, and drops the lot. */
+function colBarHtml(){
+ var t=TB[st.table];
+ if(!t||!picksN())return '';
+ var h='',i;
+ for(i=0;i<colPicks.length;i++){
+  var p=colPicks[i]||[];
+  if(!p.length)continue;
+  if(p.length>3){
+   h+='<span class="pill" data-coff="'+i+'">'+esc(t.columns[i])+': '+
+      p.length+' values &times;</span>';
+   continue;}
+  p.forEach(function(v,k){
+   var lbl=(v===''?'(empty)':v);
+   h+='<span class="pill cv" data-coff="'+i+'" data-cv="'+k+'" title="'+
+      esc(lbl)+'">'+esc(t.columns[i])+': '+esc(lbl)+' &times;</span>';});}
+ if(picksN()>1)h+='<span class="pill" data-cclear="1">clear '+picksN()+
+   ' picked values &times;</span>';
+ return '<div class="pills">'+h+'</div>';
+}
+function wireCols(){
+ [].forEach.call(document.querySelectorAll('#colbar [data-coff]'),function(x){
+  x.onclick=function(){
+   var i=+x.getAttribute('data-coff'),k=x.getAttribute('data-cv');
+   colPicks[i]=(k===null)?[]:without(colPicks[i]||[],(colPicks[i]||[])[+k]);
+   /* the open list counts the rows the other filters leave, and this was one
+      of those filters - so it is recomputed rather than redrawn */
+   if(CMFOR===i)CMVALS=null;
+   tRefresh();
+   cmBody();};});
+ [].forEach.call(document.querySelectorAll('#colbar [data-cclear]'),function(x){
+  x.onclick=function(){clearPicks();};});
+}
+/* The buttons in the filter row, after anything that changes what is ticked.
+   Repainted rather than re-rendered, because that row holds the boxes being
+   typed into. */
+function fpickSync(){
+ [].forEach.call(document.querySelectorAll('tr.f .fpick'),function(b){
+  var i=+b.getAttribute('data-p');
+  b.classList.toggle('on',picksOn(i));
+  b.textContent=fpickLbl(i);});
+}
 function tBodyHtml(t,rows,cap){
  var sevIdx=t.columns.indexOf('severity'),h='';
  for(var i=0;i<cap;i++){
   var r=rows[i];var _m=mkGet(t.name,r);
-  h+='<tr data-r="'+i+'" class="'+(r===st.sel?'sel':'')+mkClass(_m)+'">';
+  h+='<tr data-r="'+i+'" class="'+(r===st.sel?'sel':'')+
+     (selHas(r)?' msel':'')+mkClass(_m)+'">';
   var _st=_m&&_m.state?_m.state:'';
   var _note=_m&&_m.note?_m.note:'';
   h+='<td class="mkc" data-mk="'+i+'" title="'+
@@ -3846,6 +4356,10 @@ function tRefresh(){
  var none=document.getElementById('none');
  if(none){none.style.display=rows.length?'none':'block';
   if(!rows.length){none.innerHTML=emptyNote(t);wireEmpty();}}
+ /* the selection survives a filter - it is rows, not offsets - so the bar is
+    redrawn rather than dropped, and still says how many are held */
+ var sb=document.getElementById('selbar');
+ if(sb){sb.innerHTML=selBarHtml();wireSel();}
  /* The chart follows the filter, but the box being typed into must not be
     rebuilt - so the head is replaced and re-wired while the input above it
     is left exactly where it is, caret included. */
@@ -3853,6 +4367,9 @@ function tRefresh(){
  if(vh){vh.innerHTML=viewHead();wireHead();}
  [].forEach.call(document.querySelectorAll('tr.f input'),function(inp){
   inp.classList.toggle('on',!!inp.value);});
+ fpickSync();
+ var cb=document.getElementById('colbar');
+ if(cb){cb.innerHTML=colBarHtml();wireCols();}
 }
 function tRender(){
  var t=TB[st.table];if(!t){return;}
@@ -3865,7 +4382,9 @@ function tRender(){
  if(t.sources&&t.sources.length){h+='<br>sources: '+esc(t.sources.join(', '));}
  h+='</p>';
  h+='<div class="controls"><input type="search" id="q" placeholder="filter rows '+
-    'in this table..." value="'+esc(st.tq||'')+'"><span class="badge">'+t.row_count.toLocaleString()+
+    'in this table \u2014 a|b matches either..." title="text anywhere in the '+
+    'row; several values separated by a pipe match any of them" value="'+
+    esc(st.tq||'')+'"><span class="badge">'+t.row_count.toLocaleString()+
     ' rows total</span><span class="badge" id="matchn">'+rows.length.toLocaleString()+
     ' matching</span><button class="clr" id="clr">clear filters</button>'+
     hostBadge(t)+winBadge(t);
@@ -3877,6 +4396,12 @@ function tRender(){
  else if(t.row_count>t.rows.length){h+='<span class="badge warn">HTML capped at '+
    t.rows.length.toLocaleString()+' \\u2014 full data in the CSV / JSON export</span>';}
  h+='</div>';
+ /* What is picked, and what can be done to all of it at once. Empty until a
+    row is picked, and it takes up no room until then. */
+ h+='<div class="controls selbar" id="selbar">'+selBarHtml()+'</div>';
+ /* What is ticked in the columns, said where it cannot be scrolled away
+    from. Empty until something is, and then it takes up no room. */
+ h+='<div class="controls" id="colbar">'+colBarHtml()+'</div>';
  h+='<div id="vhead">'+viewHead()+'</div>';
  /* the layout is measured once per table, not per keystroke - columns that
     resize while you are typing into them are worse than columns that do not */
@@ -3922,9 +4447,13 @@ function tRender(){
    lists+='<datalist id="'+lid+'">';
    opts.forEach(function(o){lists+='<option value="'+esc(o).replace(/"/g,'&quot;')+'">';});
    lists+='</datalist>';}
-  h+='<th><input data-i="'+i+'" placeholder="filter '+esc(c)+'"'+
+  h+='<th><div class="fc"><input data-i="'+i+'" placeholder="filter '+esc(c)+
+     '" title="'+esc(c)+' \u2014 text to match; more than one value with a '+
+     'pipe, as in root|www-data"'+
      (lid?' list="'+lid+'"':'')+' value="'+esc(colFilters[i]||'').replace(/"/g,'&quot;')+
-     '"></th>';});
+     '"><button class="fpick'+(picksOn(i)?' on':'')+'" data-p="'+i+'" title="'+
+     esc(c)+' \u2014 tick the values to keep, as many of them as the '+
+     'question needs">'+fpickLbl(i)+'</button></div></th>';});
  h+='</tr></thead><tbody id="tb">'+tBodyHtml(t,page,cap)+'</tbody></table>'+lists;
  h+='<div class="empty" id="none"'+(rows.length?' style="display:none"':'')+
     '>'+(rows.length?'No rows match.':emptyNote(t))+'</div>';
@@ -3958,7 +4487,10 @@ function wireHisto(){
 /* Every 'clear the window' control, wherever it was drawn. */
 function wireWin(){
  [].forEach.call(document.querySelectorAll('[data-hostclear]'),function(x){
-  x.onclick=function(){setHost('');};});
+  x.onclick=function(){setHosts([]);};});
+ [].forEach.call(document.querySelectorAll('[data-hostoff]'),function(x){
+  x.onclick=function(){
+   setHosts(without(st.hosts,x.getAttribute('data-hostoff')));};});
  [].forEach.call(document.querySelectorAll('[data-winclear]'),function(x){
   x.onclick=function(){setWin(null,null);};});
 }
@@ -3974,11 +4506,15 @@ function wireEmpty(){
 function wireHead(){
  wireHisto();
  wireWin();
+ [].forEach.call(document.querySelectorAll('#vhead [data-off]'),function(x){
+  var k=x.getAttribute('data-off'),v=x.getAttribute('data-v');
+  x.onclick=function(){st[k]=without(st[k],v);tRender();};});
  [].forEach.call(document.querySelectorAll('#vhead [data-clear]'),function(x){
-  var k=x.getAttribute('data-clear');
-  x.onclick=function(){st[k]=(k==='bucket'||k==='sel')?null:'';tRender();};});
+  x.onclick=function(){st.cats=[];st.techs=[];tRender();};});
  [].forEach.call(document.querySelectorAll('#vhead [data-tech]'),function(x){
-  x.onclick=function(){st.tech=x.getAttribute('data-tech');setView('findings');};});
+  x.onclick=function(ev){
+   st.techs=picked(st.techs,x.getAttribute('data-tech'),ev||window.event);
+   setView('findings');};});
 }
 /* A findings row opens itself in the detail pane; every other grid is read in
    place, so a click there would only take the row out from under you.
@@ -4463,7 +4999,138 @@ function evToggle(tr,t,row,src){
  if(rb)rb.onclick=function(e){e.stopPropagation();
   goTable(t.name,rb.getAttribute('data-evrule'));};
 }
+/* ---------- picking more than one row out of a grid ----------
+   A mark is one row's, but a decision rarely is: forty rows of a filtered
+   grid are one judgement - "these are all the attacker's" - and making it
+   forty times through a cycle of four states is exactly the work a console
+   exists to take away. So a grid selects the way a file manager does: ctrl or
+   meta adds a row, shift takes the run between the last one and this one, and
+   a plain click starts again from nothing.
+
+   The selection holds the rows themselves, not their offsets. Sorting the
+   grid, turning a page or narrowing a filter therefore leaves the same
+   evidence picked rather than the same positions - which is what an examiner
+   who picked five rows and then sorted by time meant. */
+function selHas(row){return st.rows.indexOf(row)>=0;}
+function selClear(){st.rows=[];st.anchor=-1;}
+/* True when the click was about the selection and nothing else should act on
+   it: the evidence pane must not open on a ctrl-click meant to add a row. */
+function selClick(tr,ev){
+ var i=+tr.getAttribute('data-r'),row=TLAST[i];
+ if(!row)return false;
+ if(ev&&(ev.ctrlKey||ev.metaKey)){
+  st.rows=selHas(row)?without(st.rows,row):st.rows.concat([row]);
+  st.anchor=i;selPaint();return true;}
+ if(ev&&ev.shiftKey&&st.anchor>=0){
+  /* the browser's own text selection follows a shift-click, and would paint
+     the same run a second time in a colour of its own */
+  if(window.getSelection)try{window.getSelection().removeAllRanges();}catch(e){}
+  var a=Math.min(st.anchor,i),b=Math.max(st.anchor,i);
+  for(var j=a;j<=b;j++)if(TLAST[j]&&!selHas(TLAST[j]))st.rows.push(TLAST[j]);
+  selPaint();return true;}
+ if(st.rows.length){selClear();selPaint();}
+ st.anchor=i;
+ return false;
+}
+/* Repaint what the selection changed and nothing else: rebuilding the body
+   here would take the row out from under the cursor mid-shift-click. */
+function selPaint(){
+ [].forEach.call(document.querySelectorAll('#tb tr[data-r]'),function(tr){
+  var row=TLAST[+tr.getAttribute('data-r')];
+  if(tr.classList)tr.classList.toggle('msel',!!row&&selHas(row));});
+ var bar=el('selbar');
+ if(bar){bar.innerHTML=selBarHtml();wireSel();}
+}
+function selBarHtml(){
+ var n=st.rows.length;
+ if(!n)return '';
+ var h='<span class="badge">'+n.toLocaleString()+' row(s) selected</span>'+
+   '<span class="dim">mark them all</span>';
+ MK_STATES.forEach(function(x){
+  h+='<button class="mkbtn" data-selmk="'+x[0]+'">'+esc(x[1])+'</button>';});
+ h+='<button class="mkbtn" data-selmk="">unmark</button>'+
+    '<button class="mkbtn" data-selcopy="1">copy</button>'+
+    '<button class="mkbtn" data-selnone="1">clear selection</button>'+
+    '<span class="dim" id="selmsg"></span>';
+ return h;
+}
+function wireSel(){
+ [].forEach.call(document.querySelectorAll('#selbar [data-selmk]'),function(b){
+  b.onclick=function(){selMark(b.getAttribute('data-selmk'));};});
+ [].forEach.call(document.querySelectorAll('#selbar [data-selcopy]'),function(b){
+  b.onclick=function(){selCopy();};});
+ [].forEach.call(document.querySelectorAll('#selbar [data-selnone]'),function(b){
+  b.onclick=function(){selClear();tRefresh();};});
+}
+/* One state onto every picked row at once. The whole row still travels into
+   the case with each mark, exactly as it does for a single one - a bulk mark
+   is not a cheaper mark, only a faster one to make. */
+function selMark(state){
+ var t=TB[st.table];
+ if(!t||t.rows===undefined||!st.rows.length)return;
+ var tc=tcols(t);
+ st.rows.forEach(function(row){
+  var key=mkKey(t.name,row),cur=marks[key],entry;
+  var sp=tc.any?rowSpan(tc,row):null;
+  if(state)entry={state:state,note:cur?cur.note||'':'',
+                  labels:cur?cur.labels||[]:[]};
+  /* unmarking keeps a note that was written against the row: the note is the
+     examiner's own words, and no bulk action gets to throw those away */
+  else entry=(cur&&((cur.note||'')||(cur.labels||[]).length))
+    ?{state:'',note:cur.note||'',labels:cur.labels||[]}:null;
+  mkSave(key,entry,rowRef(t,row,sp?fmtT(sp[0]):''));});
+ tRefresh();
+}
+/* The selection out of the page and into whatever the report is being written
+   in. Tab-separated under its header, so it pastes into a spreadsheet as
+   columns and into a ticket as text. execCommand rather than the async
+   clipboard: this page is routinely opened from a file:// path, where the
+   clipboard API is not available at all. */
+function selCopy(){
+ var t=TB[st.table];
+ if(!t||t.rows===undefined||!st.rows.length)return;
+ var lines=[t.columns.join('\\t')];
+ st.rows.forEach(function(r){
+  var out=[];
+  for(var i=0;i<t.columns.length;i++){
+   var v=r[i];v=(v===undefined||v===null)?'':String(v);
+   out.push(v.replace(/[\\t\\r\\n]+/g,' '));}
+  lines.push(out.join('\\t'));});
+ var ta=document.createElement('textarea');
+ ta.value=lines.join('\\n');
+ ta.style.position='fixed';ta.style.left='-3000px';ta.style.top='0';
+ document.body.appendChild(ta);
+ ta.focus();ta.select();
+ var ok=false;
+ try{ok=document.execCommand('copy');}catch(e){ok=false;}
+ document.body.removeChild(ta);
+ var m=el('selmsg');
+ if(m)m.textContent=ok?st.rows.length+' row(s) copied'
+   :'the browser refused the clipboard \u2014 use the CSV export';
+}
 function wireRows(){
+ /* Picking rows is live on every grid, and it runs before anything else a
+    click on a row does. One handler on the body rather than one per row: the
+    body is rebuilt on every keystroke in a filter, and five hundred handlers
+    are five hundred things to reattach. It is attached in the capture phase
+    so that it sees the click before the evidence pane does, and only once -
+    tRefresh replaces the body's contents but not the body itself, so a
+    second listener here would be a second listener on every keystroke. */
+ (function(){
+  var body=document.getElementById('tb');
+  if(!body||body.selwired)return;
+  body.selwired=true;
+  body.addEventListener('click',function(ev){
+   var n=ev.target,tr=null;
+   while(n&&n!==body){
+    /* the marker and the note pencil own their own clicks */
+    if(n.className==='mkc'||n.className==='ntc')return;
+    if(n.tagName==='TR'&&n.getAttribute('data-r')!==null)tr=n;
+    n=n.parentNode;}
+   if(!tr)return;
+   if(selClick(tr,ev)){ev.stopPropagation();ev.preventDefault();}
+  },true);
+ })();
  /* The marker is live on every grid, not only the findings: an artifact row
     is exactly the thing an examiner wants to flag, and restricting marking to
     the findings would mean the tool decides what is interesting. */
@@ -4557,6 +5224,7 @@ function wireRows(){
 function tWire(){
  wireHead();
  wireRows();
+ wireSel();
  [].forEach.call(document.querySelectorAll('#hdr th'),function(th){
   th.onclick=function(){var i=+th.getAttribute('data-i');
    if(sortCol===i){sortAsc=!sortAsc;}else{sortCol=i;sortAsc=true;}
@@ -4572,13 +5240,25 @@ function tWire(){
   inp.oninput=function(){colFilters[i]=inp.value;tRefresh();};
   /* the input lives inside a th whose click handler sorts - without this,
      clicking into a filter box would reorder the table under the cursor */
-  inp.onclick=function(e){e.stopPropagation();};});
+  inp.onclick=function(e){cmClose();e.stopPropagation();};});
+ /* The picker beside each box. Clicking the open one closes it, the way the
+    calendar and the collection list close; clicking another column's swaps
+    to it rather than leaving two lists open over the same grid. */
+ [].forEach.call(document.querySelectorAll('tr.f .fpick'),function(b){
+  b.onclick=function(ev){
+   ev=ev||window.event;
+   ev.stopPropagation();
+   var i=+b.getAttribute('data-p'),was=(cmIsOpen()&&CMFOR===i);
+   cmClose();
+   if(!was)cmOpen(i,b);};});
+ wireCols();
  var q=el('q');
  if(q)q.oninput=function(){st.tq=q.value;tRefresh();};
  var clr=document.getElementById('clr');
  if(clr){clr.onclick=function(){
-  colFilters=[];st.tq='';var qq=el('q');if(qq)qq.value='';
+  colFilters=[];colPicks=[];st.tq='';var qq=el('q');if(qq)qq.value='';
   [].forEach.call(document.querySelectorAll('tr.f input'),function(i){i.value='';});
+  cmClose();
   tRefresh();};}
  /* glue the filter row to the bottom of the label row, measured rather than
     assumed - the label height moves with the font and the zoom level */
