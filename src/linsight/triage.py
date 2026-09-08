@@ -16,7 +16,7 @@ from .term import Progress, status, trunc
 from .common import (
     trie_pattern,
     ACCEPTED_LOGIN_RE, BASELINE_SUID, BENIGN_HIDDEN, COMPILED_CMD_PATTERNS,
-    DANGEROUS_SUID_NAMES, PRIVILEGED_GROUPS, PRIV_HINT_RE, ROOTKIT_NAMES,
+    DANGEROUS_SUID_NAMES, PRIVILEGED_GROUPS, PRIV_HINT_RE, ROOTKIT_RE,
     SUSPICIOUS_PORTS, SYSTEM_BIN_DIRS, SYSTEM_CFG_DIRS, TMPFS_DIRS,
     _TS_SYSLOG_RE, _ts_text, epoch, hexip_to_str, human_size, is_private_ip,
     match_failed_login, norm_ip, norm_log_ts, parse_lstart, span_add, span_of,
@@ -2630,8 +2630,8 @@ class Triage:
                          "behaviour.",
                          ghost, source=src, mitre="T1014 Rootkit")
 
-        named = [m for m in lsmod if any(r in m.lower() for r in ROOTKIT_NAMES)]
-        named += [d for d in sys_modules if any(r in d.lower() for r in ROOTKIT_NAMES)]
+        named = [m for m in lsmod if ROOTKIT_RE.search(m)]
+        named += [d for d in sys_modules if ROOTKIT_RE.search(d)]
         if named:
             self.add("CRITICAL", "Rootkit", "Module name matching a known Linux rootkit",
                      evidence=sorted(set(named)), source=src, mitre="T1014 Rootkit")
@@ -2653,7 +2653,7 @@ class Triage:
                 body = [l.strip() for l in self.col.lines(rel)
                         if l.strip() and not l.strip().startswith("#")]
                 sus = [b for b in body if re.search(r"install\s+\S+\s+/", b) or
-                       any(r in b.lower() for r in ROOTKIT_NAMES)]
+                       ROOTKIT_RE.search(b)]
                 if sus:
                     self.add("HIGH", "Persistence", "Module configuration executes a command",
                              evidence=["%s: %s" % (self.col.host_path(rel), s) for s in sus],
