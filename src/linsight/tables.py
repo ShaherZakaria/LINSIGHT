@@ -27,8 +27,7 @@ from .common import (
     HACKTOOL_VARIANT_OTHER, NDJSON_TIME_COLUMNS, PRIVILEGED_GROUPS,
     PRIV_HINT_RE, TMPFS_DIRS, _printable, _ts_text, _tz_delta, clean_addr,
     _trie_alt,
-    benign_filename,
-    epoch, executable_position, in_library_dir, match_token,
+    epoch, executable_position, in_library_dir, match_token, program_suffix,
     hexip_to_str, human_size, ioc_mitre, ioc_type, match_failed_login,
     norm_ip, norm_log_ts, span_add, split_hostport, variant_add)
 from .decode import (
@@ -7833,7 +7832,11 @@ class TableBuilder:
                                 if "/" in tok and (tok.startswith(self.DISTRO_PATHS)
                                                    or in_library_dir(tok)):
                                     continue
-                                if benign_filename(tool, tok):
+                                # a library, a config or a document that
+                                # happens to carry the name: engines/gost.so
+                                # is the GOST cipher, cdk.json is an AWS
+                                # project, quasar.conf.js is a Vue build
+                                if not program_suffix(tok):
                                     continue
                                 # The home directory itself, and not what is
                                 # inside it: /home/john is the account, and
